@@ -1,0 +1,11 @@
+{
+  "drives": [
+    {
+      "name": "alist.jar",
+      "search": true,
+      "searchable": true,
+      "server": "http://39.106.78.229:5678/"
+    }
+  ],
+  "danmu":true
+}
