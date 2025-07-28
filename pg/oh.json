@@ -620,7 +620,7 @@
             "name": "💓‍苹果|影视",
             "type": 3,
             "api": "csp_LiteApple",
-            "jar": "./jar/spider.jar",
+            "jar": "https://raw.githubusercontent.com/yyuu4/oh/refs/heads/main/pg/jar/spider.jar",
             "searchable": 1,
             "quickSearch": 1,
             "filterable": 1
@@ -630,7 +630,7 @@
             "name": "💓‍至臻|4K弹幕",
             "type": 3,
             "api": "csp_PanWebShare",
-            "jar": "./jar/spider.jar",
+            "jar": "https://raw.githubusercontent.com/yyuu4/oh/refs/heads/main/pg/jar/spider.jar",
             "searchable": 1,
             "quickSearch": 1,
             "filterable": 1,
