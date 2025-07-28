@@ -623,6 +623,7 @@
             "jar": "./jar/spider.jar",
             "searchable": 1,
             "quickSearch": 1,
+		"timeout": 60,
             "filterable": 1
         },
         {
@@ -635,6 +636,7 @@
             "quickSearch": 1,
             "filterable": 1,
             "changeable": 1,
+		"timeout": 60,
             "ext": "./lib/zz.json"
         },
         {
