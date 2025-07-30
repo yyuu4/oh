@@ -93,7 +93,7 @@
         {
       "name": "1111",
       "type": 0,
-      "url": "https://10238.kstore.space/hyzy.m3u",
+      "url": "",
       "ua": "okhttp/3.15",
       "epg": "http://127.0.0.1:10079/p/0/proxy/http://epg.112114.xyz/?ch={name}&date={date}",
       "logo": "http://127.0.0.1:10079/p/0/proxy/https://epg.112114.xyz/logo/{name}.png",
