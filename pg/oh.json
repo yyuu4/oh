@@ -537,7 +537,7 @@
       "timeout": 60,
       "ext": "./lib/tokenm.json$$$http://149.88.87.18:6688/$$$proxy$$$1$$$./lib/wogg.json$$$DAWO"
     },
-		{"key":"Hmxz","name":"🌾海绵|网盘","type":3,"api":"csp_Hmxz","quickSearch":1, "changeable":1, "filterable":1, "timeout":60, "ext":"./lib/tokenm.json$$$https://haimian.eu.org/$$$noproxy$$$1$$$./lib/hmxz.txt$$$HMXZ",
+		{"key":"Hmxz","name":"🌾海绵|网盘","type":3,"api":"csp_Hmxz","quickSearch":1, "changeable":1, "filterable":1, "timeout":60, "ext":"./lib/tokenm.json$$$https://www.hmxz.org/$$$noproxy$$$1$$$./lib/hmxz.txt$$$HMXZ",
 			"style": {
 				"type": "list",
 				"ratio": 1.1
