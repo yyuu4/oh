@@ -103,6 +103,8 @@ CCTV-15 音乐,https://smart.pendy.dpdns.org/Smart.php?id=cctv15
 四川卫视,https://smart.pendy.dpdns.org/Smart.php?id=sichuan_twn
 东方卫视,https://smart.pendy.dpdns.org/Smart.php?id=dongfangweishi_twn
 CGTN,https://smart.pendy.dpdns.org/Smart.php?id=CGTN
+河南都市,http://zzssw01.55555.io:9901/tsfile/live/1002_1.m3u8
+河南民生,http://61.163.181.78:85/tsfile/live/1005_1.m3u8?key=txiptv&playlive=1&authid=0
 
 体育频道,#genre# 
 Astro Premier League 1,https://smart.pendy.dpdns.org/Smart.php?id=go_assp1
