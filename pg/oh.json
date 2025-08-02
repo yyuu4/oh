@@ -453,7 +453,7 @@
 		"name":"🌾大盘|p g","type":3,"api":"csp_DaPanSo","quickSearch":1, "changeable":1, "filterable":1, "timeout":60, 
 		"ext":"./lib/tokenm.json$$$https://dapanso.com$$$proxy$$$1"
 		},
-		{"key":"Hdhive","name":"🌾鸟窝|p g","type":3,"api":"csp_Hdh","quickSearch":1, "changeable":1, "filterable":1, "timeout":120, "ext":"./lib/tokenm.json$$$https://hdhive.online$$$noproxy$$$1$$$./lib/hdhive.txt"},
+		{"key":"Hdhive","name":"🌾鸟窝|p g","type":3,"api":"csp_Hdh","quickSearch":1, "changeable":1, "filterable":1, "timeout":120, "ext":"./lib/tokenm.json$$$https://hdhive.com/$$$noproxy$$$1$$$./lib/hdhive.txt"},
 		{"key":"YunPanOne","name":"🌾云one|p g",
 		"type":3,"api":"csp_YunPanOne","quickSearch":1, "changeable":1, "filterable":1, "timeout":60,
 		"ext":"./lib/tokenm.json$$$null$$$proxy$$$1"},
