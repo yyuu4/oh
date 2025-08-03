@@ -91,9 +91,9 @@
             "epg": "https://epg.112114.xyz/?ch={name}&date={date}"
         },
         {
-     "name": "潇洒Guovin",
+      "name": "日后",
       "type": 0,
-      "url": "https://gitee.com/mytv-android/iptv-api/raw/master/output/result.m3u",//https://github.3x25.com/https://raw.githubusercontent.com/PizazzGY/TV/master/output/user_result.txt
+      "url": "http://rihou.cc:567/gggg.nzk",
       "ua": "okhttp/3.15",
       "epg": "http://127.0.0.1:10079/p/0/proxy/http://epg.112114.xyz/?ch={name}&date={date}",
       "logo": "http://127.0.0.1:10079/p/0/proxy/https://epg.112114.xyz/logo/{name}.png",
