@@ -189,12 +189,6 @@
             "epg": "https://epg.112114.xyz/?ch={name}&date={date}"
         },
         {
-            "name": "央卫0715",
-            "type": 0,
-            "url": "https://live.catvod.com/catvod.php",
-            "epg": "https://epg.112114.xyz/?ch={name}&date={date}"
-        },
-        {
             "name": "范明明v6",
             "type": 0,
             "url": "https://fanmingming.com/txt?url=https://raw.githubusercontent.com/fanmingming/live/main/tv/m3u/ipv6.m3u",
