@@ -505,6 +505,7 @@
 				"ratio": 1.1
 			}
 		},
+		{"key":"LIBVIO","name":"🌾LIBVIO|p g","type":3,"api":"csp_Libvio","quickSearch":1, "changeable":1, "filterable":1, "timeout":60, "ext":"./lib/tokenm.json$$$http://www.libvio.mov/$$$noproxy$$$1"},
 		{
 			"key": "二小|网盘",
 			"name": "🌾二小|网盘",
