@@ -605,6 +605,16 @@
             "quickSearch": 1,
             "filterable": 1
         },
+		{
+            "key": "音海",
+            "name": "💓‍音海|搜索",
+            "type": 3,
+            "api": "csp_YinHai",
+            "jar": "./jar/spider.jar",
+            "searchable": 1,
+            "quickSearch": 1,
+            "filterable": 1
+        },
         {
             "key": "苹果影视",
             "name": "💓‍苹果|影视",
