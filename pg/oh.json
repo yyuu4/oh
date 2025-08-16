@@ -596,6 +596,16 @@
             "changeable": 0
         },
 		{
+            "key": "盘搜",
+            "name": "💓‍盘搜|搜索",
+            "type": 3,
+            "api": "csp_PanSou",
+            "jar": "./jar/spider.jar",
+            "searchable": 1,
+            "quickSearch": 1,
+            "filterable": 1
+        },
+		{
             "key": "音海",
             "name": "💓‍音海|搜索",
             "type": 3,
