@@ -580,6 +580,23 @@
             "changeable": 1,
             "ext": "推薦#4k電影#PL4k劇集#PL動作片#體育#紀錄片#PL小說#影视解說#新聞直播#PL動物#PL风光#放松#短劇#经典音樂#PL海洋#太空"
         },
+		{
+            "key": "py_emby2",
+            "name": "Emby2",
+            "type": 3,
+            "api": "./lib/py_emby.py",
+            "searchable": 1,
+            "quickSearch": 1,
+            "filterable": 1,
+            "ext": {
+                "server": "http://ap-cn01.emby.bangumi.ca:8096",
+                "username": "jueshi",
+                "password": "",
+                "thread": 0,
+                "proxy": "127.0.0.1:10172"
+            },
+            "changeable": 1
+        },
         {
             "key": "团长",
             "name": "💓‍团长|4K弹幕",
