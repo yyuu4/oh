@@ -1,10 +1,22 @@
 {
   "drives": [
     {
-      "name": "alist.jar",
+      "name": "alist.jar1",
       "search": true,
       "searchable": true,
       "server": "http://122.242.151.57:60016/"
+    },
+    {
+      "name": "alist.jar2",
+      "search": true,
+      "searchable": true,
+      "server": "http://123.234.95.235:5234/"
+    },
+{
+      "name": "alist.jar3",
+      "search": true,
+      "searchable": true,
+      "server": "http://221.232.101.26:5678/"
     }
   ],
   "danmu":true
