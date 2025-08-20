@@ -263,6 +263,22 @@
             }
         },
 		{
+            "api": "csp_MyDriveGuard",
+            "jar": "./jar/TYY.jar",
+            "changeable": 0,
+            "ext": {
+                "Cloud-drive": "./lib/Cloud-drive.txt","123Host":"https://www.123pan.com/"
+            },
+            "indexs": 0,
+            "key": "csp_MyDrive",
+            "name": "🗂MY盘|率",
+			"style": {
+                "type": "oval"
+            },
+            "searchable": 1,
+            "type": 3
+        },
+		{
 			"key":"Youtube",
 			"name":"🌾Youtube",
 			"type":3,
