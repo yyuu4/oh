@@ -597,6 +597,52 @@
             },
             "changeable": 1
         },
+		{
+            "api": "csp_SeedhubGuard",
+            "jar": "./jar/TYY.jar",
+            "changeable": 0,
+            "ext": {
+                "siteUrl": "https://seedhub.pro/",
+				"magnet":true
+            },
+            "filterable": 1,
+            "indexs": 0,
+            "key": "csp_seedhub",
+            "name": "🌻SeedHub",
+            "searchable": 1,
+            "style": {
+                "type": "list"
+            },
+            "type": 3,
+            "说明": "该源 style键值（支持OK,FM壳）其他壳自行测试"
+        },
+        {
+            "api": "csp_S_zpsGuard",
+            "jar": "./jar/TYY.jar",
+            "ext": {
+                "siteUrl": "http://guodiedie.fun:5555/api/search?kw=@&res=merge&src=all",
+                "123Host": "https://www.123pan.com/"
+            },
+            "key": "聚搜",
+            "name": "🌻聚盘|搜索",
+            "searchable": 1,
+            "type": 3
+        },
+        {
+            "api": "csp_S_zpsGuard",
+            "jar": "./jar/TYY.jar",
+            "changeable": 0,
+            "ext": {
+                "siteUrl": "https://so.252035.xyz/api/search?kw=@&res=merge&src=all",
+                "123Host": "https://www.123pan.com/"
+            },
+            "indexs": 0,
+            "key": "鱼盘",
+            "name": "🌻鱼盘|搜索",
+            "quickSearch": 1,
+            "searchable": 1,
+            "type": 3
+        },
         {
             "key": "团长",
             "name": "💓‍团长|4K弹幕",
