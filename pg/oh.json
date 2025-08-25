@@ -636,7 +636,7 @@
             "api": "csp_S_zpsGuard",
             "jar": "./jar/TYY.jar",
             "ext": {
-                "siteUrl": "http://guodiedie.fun:5555/api/search?kw=@&res=merge&src=all",
+                "siteUrl": "http://60.221.51.207:8085/api/search?kw=@&res=merge&src=all",
                 "123Host": "https://www.123pan.com/"
             },
             "key": "聚搜",
