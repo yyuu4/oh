@@ -275,7 +275,7 @@
 			"style": {
                 "type": "oval"
             },
-            "searchable": 1,
+            "searchable": 0,
             "type": 3
         },
 		{
