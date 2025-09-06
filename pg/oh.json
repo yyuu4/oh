@@ -766,7 +766,7 @@
       "key": "电影天堂资源",
       "name": "电影天堂-采集",
       "type": 1,
-      "api": "http://caiji.dyttzyapi.com/api.php/provide/vod",
+      "api": "http://caiji.dyttzyapi.com/api.php/provide/vod/?ac=list",
       "searchable": 1,
       "changeable": 1,
       "categories": [
