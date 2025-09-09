@@ -649,7 +649,7 @@
             "jar": "./jar/TYY.jar",
             "changeable": 0,
             "ext": {
-                "siteUrl": "https://so.252035.xyz/api/search?kw=@&res=merge&src=all",
+                "siteUrl": "http://192.168.1.9:8800/search?kw=@&res=merge&src=all",
                 "123Host": "https://www.123pan.com/"
             },
             "indexs": 0,
