@@ -634,28 +634,27 @@
         },
         {
             "api": "csp_S_zpsGuard",
-            "jar": "./jar/TYY.jar",
+            "changeable": 0,
             "ext": {
-                "siteUrl": "http://192.168.1.9:8800/api/search?kw=@&res=merge&src=all",
-                "123Host": "https://www.123pan.com/"
+                "siteUrl": "http://192.168.1.9:8800/api/search?kw=@&res=merge&src=all","123Host":"https://www.123pan.com/"
             },
+            "indexs": 0,
             "key": "聚盘搜",
             "name": "🌻聚盘搜",
             "searchable": 1,
-            "type": 3
+            "type": 3,
+            "说明": "该源（支持OK,FM壳）其他壳自行测试"
         },
         {
             "api": "csp_S_zpsGuard",
-            "jar": "./jar/TYY.jar",
             "changeable": 0,
             "ext": {
-                "siteUrl": "https://so.252035.xyz/search?kw=@&res=merge&src=all",
+                "siteUrl": "https://so.252035.xyz/api/search?kw=@&res=merge&src=all",
                 "123Host": "https://www.123pan.com/"
             },
             "indexs": 0,
             "key": "no搜",
             "name": "🌻no搜",
-            "quickSearch": 1,
             "searchable": 1,
             "type": 3
         },
