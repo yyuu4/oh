@@ -637,7 +637,7 @@
             "jar": "./jar/TYY.jar",
             "changeable": 0,
             "ext": {
-                "siteUrl": "http://192.168.1.9:8800/api/search?kw=@&res=merge&src=all","123Host":"https://www.123pan.com/"
+                "siteUrl": "http://192.168.1.8:8800/api/search?kw=@&res=merge&src=all","123Host":"https://www.123pan.com/"
             },
             "indexs": 0,
             "key": "聚盘搜",
