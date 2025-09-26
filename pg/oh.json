@@ -249,36 +249,6 @@
 			}
 		},
 		{
-            "key": "配置中心",
-            "name": "配置|潇洒",
-            "type": 3,
-            "api": "csp_Config",
-            "jar": "./jar/spider.jar",
-            "searchable": 0,
-            "changeable": 0,
-            "indexs": 0,
-            "style": {
-                "type": "rect",
-                "ratio": 1.597
-            }
-        },
-		{
-            "api": "csp_MyDriveGuard",
-            "jar": "./jar/TYY.jar",
-            "changeable": 0,
-            "ext": {
-                "Cloud-drive": "./lib/Cloud-drive.txt","123Host":"https://www.123pan.com/"
-            },
-            "indexs": 0,
-            "key": "csp_MyDrive",
-            "name": "🗂MY盘|率",
-			"style": {
-                "type": "oval"
-            },
-            "searchable": 0,
-            "type": 3
-        },
-		{
 			"key":"Youtube",
 			"name":"🌾Youtube",
 			"type":3,
@@ -333,50 +303,6 @@
 				"ratio": 1.77
 			}
 		},
-		{
-            "key": "TGYunPanLocal1",
-            "name": "🉑3TG频道|涩涩",
-            "type": 3,
-            "api": "csp_TGYunPanLocal",
-            "timeout": 120,
-            "ext":{
-				"token":"./lib/tokenm.json",
-				"json":"./lib/tgsearch.json",
-				"keywords":"名称,片名,推荐",
-				"tgsearch_url":"http://127.0.0.1:10199",
-				"tgsearch_media_url":"http://127.0.0.1:10199",
-				
-                "channellist": "AVNVP,vn666hh,avab01,CosMM18,rihan2,kkw1390,pikpakziyuan,avpush,avgc5200,cctav,javdb91,zyfx_0315,ribenseyuge1,cilitu,SeseAnime,AVWUMAYUANPIAN",
-                "proxy": "proxy",
-                "danmu":true
-			},
-			"style": {
-				"type": "rect",
-				"ratio": 1.77
-			}
-		},
-        {
-            "key": "TGYunPan1",
-            "name": "🉑4TG群组|磁力",
-            "type": 3,
-            "api": "csp_TGYunPan",
-            "timeout": 120,
-            "ext":{
-				"token":"./lib/tokenm.json",
-				"json":"./lib/tgsearch.json",
-				"keywords":"名称,片名,推荐",
-				"tgsearch_url":"http://127.0.0.1:10199",
-				"tgsearch_media_url":"http://127.0.0.1:10199",
-				
-                "channellist": "AVNVP|1000,IPX_AV|1000,kc0102|1000,ppg1314|1000,cctav|1000,vn666hh|1000,avab01|1000,pikpakziyuan|1000,avpush|1000,avgc5200|1000,ribenseyuge1|1000,cilitu|1000,javdb91|1000,SeseAnime|1000,rihan881|1000,Seeyellow|1000",
-                "proxy": "proxy",
-                "danmu":true
-			},
-			"style": {
-				"type": "rect",
-				"ratio": 1.77
-			}
-		},
 		{"key":"Local",
 		"name":"🌾本地|p g",
 		"type":3,
@@ -418,19 +344,19 @@
 				"ratio": 1.1
 			}
 		},
-		{"key":"123Share","name":"123云盘分享","type":3,"api":"csp_P123Share","searchable":1,"quickSearch":1, "changeable":0, "filterable":0, "timeout":120, "ext":"./lib/tokenm.json$$$./lib/123share.txt$$$db$$$1",
+		{"key":"123Share","name":"🌾123云盘分享","type":3,"api":"csp_P123Share","searchable":1,"quickSearch":1, "changeable":0, "filterable":0, "timeout":120, "ext":"./lib/tokenm.json$$$./lib/123share.txt$$$db$$$1",
 			"style": {
 				"type": "list",
 				"ratio": 1.1
 			}
 		},
-		{"key":"189Share","name":"189云盘分享","type":3,"api":"csp_P189Share","searchable":1,"quickSearch":1, "changeable":0, "filterable":0, "timeout":120, "ext":"./lib/tokenm.json$$$./lib/189share.txt$$$db$$$1",
+		{"key":"189Share","name":"🌾189云盘分享","type":3,"api":"csp_P189Share","searchable":1,"quickSearch":1, "changeable":0, "filterable":0, "timeout":120, "ext":"./lib/tokenm.json$$$./lib/189share.txt$$$db$$$1",
 			"style": {
 				"type": "list",
 				"ratio": 1.1
 			}
 		},
-		{"key":"UCShare","name":"UC云盘分享","type":3,"api":"csp_UCShare","searchable":1,"quickSearch":0, "changeable":0, "filterable":0, "timeout":60, "ext":"./lib/tokenm.json$$$./lib/ucshare.txt$$$db$$$1",
+		{"key":"UCShare","name":"🌾UC云盘分享","type":3,"api":"csp_UCShare","searchable":1,"quickSearch":0, "changeable":0, "filterable":0, "timeout":60, "ext":"./lib/tokenm.json$$$./lib/ucshare.txt$$$db$$$1",
 			"style": {
 				"type": "list",
 				"ratio": 1.1
@@ -558,44 +484,7 @@
 		{"key":"AList","name":"🌾Alist[jar]|网盘","type":3,"api":"csp_AList","searchable":1,"filterable":1,"changeable":1,"timeout":60,
 			"playerType": 2,
 			"ext":"./lib/alistjar.json"},
-	
-	
-	{
-            "key": "文件播放",
-            "name": "文件播放",
-            "type": 4,
-            "api": "http://zhangqun66.com/zh/2242.php",
-            "style": {
-                "type": "list",
-                "ratio": 1.1
-            },
-            "searchable": 1,
-            "changeable": 0
-        },
-        {
-            "key": "油管清单播放",
-            "name": "油管清单播放",
-            "type": 4,
-            "api": "http://zhangqun66.com/zh/yt/2243.php",
-            "style": {
-                "type": "rect",
-                "ratio": 1.33
-            },
-            "changeable": 1
-        },
-        {
-            "key": "服务器油管",
-            "name": "服务器油管",
-            "type": 4,
-            "api": "http://zhangqun66.xyz/yt/yt0022.php",
-            "style": {
-                "type": "rect",
-                "ratio": 1.33
-            },
-            "searchable": 1,
-            "changeable": 1,
-            "ext": "推薦#4k電影#PL4k劇集#PL動作片#體育#紀錄片#PL小說#影视解說#新聞直播#PL動物#PL风光#放松#短劇#经典音樂#PL海洋#太空"
-        },
+		
 		{
             "key": "py_emby2",
             "name": "Emby2",
@@ -612,147 +501,6 @@
                 "proxy": "127.0.0.1:10172"
             },
             "changeable": 1
-        },
-		{
-            "api": "csp_SeedhubGuard",
-            "jar": "./jar/TYY.jar",
-            "changeable": 0,
-            "ext": {
-                "siteUrl": "https://seedhub.pro/",
-				"magnet":true
-            },
-            "filterable": 1,
-            "indexs": 0,
-            "key": "csp_seedhub",
-            "name": "🌻SeedHub",
-            "searchable": 1,
-            "style": {
-                "type": "list"
-            },
-            "type": 3,
-            "说明": "该源 style键值（支持OK,FM壳）其他壳自行测试"
-        },
-        {
-            "api": "csp_S_zpsGuard",
-            "jar": "./jar/TYY.jar",
-            "changeable": 0,
-            "ext": {
-                "siteUrl": "http://192.168.1.8:8800/api/search?kw=@&res=merge&src=all","123Host":"https://www.123pan.com/"
-            },
-            "indexs": 0,
-            "key": "聚盘搜",
-            "name": "🌻聚盘搜",
-            "searchable": 1,
-            "type": 3,
-            "说明": "该源（支持OK,FM壳）其他壳自行测试"
-        },
-        {
-            "api": "csp_S_zpsGuard",
-            "jar": "./jar/TYY.jar",
-            "changeable": 0,
-            "ext": {
-                "siteUrl": "https://so.252035.xyz/api/search?kw=@&res=merge&src=all",
-                "123Host": "https://www.123pan.com/"
-            },
-            "indexs": 0,
-            "key": "no搜",
-            "name": "🌻no搜",
-            "quickSearch": 1,
-            "searchable": 1,
-            "type": 3
-        },
-        {
-            "key": "团长",
-            "name": "💓‍团长|4K弹幕",
-            "type": 3,
-            "api": "csp_PanWebTz",
-            "jar": "./jar/spider.jar",
-            "searchable": 1,
-            "quickSearch": 1,
-            "filterable": 1,
-            "changeable": 1
-        },
-        {
-            "key": "米搜",
-            "name": "💓‍米搜|搜索",
-            "type": 3,
-            "jar": "./jar/spider.jar",
-            "api": "csp_MiSou"
-        },
-        {
-            "key": "糖果",
-            "name": "💓‍糖果|搜索",
-            "type": 3,
-            "api": "csp_TGSou",
-            "jar": "./jar/spider.jar",
-            "searchable": 1,
-            "changeable": 0
-        },
-		{
-            "key": "盘搜",
-            "name": "💓‍盘搜|搜索",
-            "type": 3,
-            "api": "csp_PanSou",
-            "jar": "./jar/spider.jar",
-            "searchable": 1,
-            "quickSearch": 1,
-            "filterable": 1
-        },
-        {
-            "key": "苹果影视",
-            "name": "💓‍苹果|影视",
-            "type": 3,
-            "api": "csp_LiteApple",
-            "jar": "./jar/spider.jar",
-            "searchable": 1,
-            "quickSearch": 1,
-            "filterable": 1
-        },
-        {
-            "key": "至臻",
-            "name": "💓‍至臻|4K弹幕",
-            "type": 3,
-            "api": "csp_PanWebShare",
-            "jar": "./jar/spider.jar",
-            "searchable": 1,
-            "quickSearch": 1,
-            "filterable": 1,
-            "changeable": 1,
-            "ext": "./lib/zz.json"
-        },
-        {
-            "key": "欧哥",
-            "name": "💓‍欧哥|4K弹幕",
-            "type": 3,
-            "api": "csp_PanWebShare",
-            "jar": "./jar/spider.jar",
-            "searchable": 1,
-            "quickSearch": 1,
-            "filterable": 1,
-            "changeable": 1,
-            "ext": "./lib/og.json"
-        },
-        {
-            "key": "二小",
-            "name": "💓‍二小|4K弹幕",
-            "type": 3,
-            "api": "csp_PanWebShare",
-            "jar": "./jar/spider.jar",
-            "searchable": 1,
-            "quickSearch": 1,
-            "filterable": 1,
-            "changeable": 1,
-            "ext": "./lib/ex.json"
-        },
-        {
-            "key": "1905",
-            "name": "💓‍1905|影视",
-            "type": 3,
-            "api": "csp_Web1905",
-            "jar": "./jar/spider.jar",
-            "searchable": 1,
-            "quickSearch": 0,
-            "filterable": 0
         },
         {
       "key": "电影天堂资源",
