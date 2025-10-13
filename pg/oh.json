@@ -96,9 +96,9 @@
 				"logo": "http://127.0.0.1:10079/p/0/proxy/https://epg.112114.xyz/logo/{name}.png"
 			},
 			{
-            "name": "肥羊",
+            "name": "冰茶",
             "type": 0,
-            "url": "http://zjzcf.synology.me:35455/tv.m3u",
+            "url": "https://fy.188766.xyz/?ip=&mima=mianfeidehaimaiqian",
             "epg": "https://epg.112114.xyz/?ch={name}&date={date}"
         },
         {
