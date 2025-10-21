@@ -248,6 +248,18 @@
 			}
 		},
 		{
+      "name": "嗷呜┃弹幕",
+      "key": "嗷呜弹幕",
+      "type": 3,
+      "api": "csp_GoConfigAmns",
+      "searchable": 1,
+      "filterable": 0,
+      "quickSearch": 0,
+      "changeable": 0,
+      "jar": "https://aw.0890.dpdns.org/wnqiwnquidwiunddneudne/custom_spider.jar",
+      "indexs": 1
+    },
+		{
 			"key":"Youtube",
 			"name":"🌾Youtube",
 			"type":3,
