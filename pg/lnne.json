@@ -4,7 +4,9 @@
 
 { "urls": 
 [
-{"url": "http://www.饭太硬.com/tv","name": "💫饭太硬1"},  
+{"url": "http://www.饭太硬.com/tv","name": "💫饭太硬1"},
+
+{"url": "http://192.168.1.8:7123/api/tvbox/subscription?token=1","name": "💫omnibox"},
   
 {"url": "https://gitee.com/raae/oh/raw/master/pg/oh.json","name": "💫ohgitee"},
   
