@@ -395,12 +395,6 @@
 		{"key":"yydsys","name":"🌾玩你|p g","type":3,"api":"csp_Wobg","quickSearch":1, "changeable":1, "filterable":1, "timeout":60, "ext":"./lib/tokenm.json$$$https://tv.yydsys.top/$$$noproxy$$$1$$$./lib/wogg.json$$$WNLG"},
 		{"key":"YingSo","name":"🌾影搜|p g","type":3,"api":"csp_YingSo","timeout":60, "ext":"./lib/tokenm.json"},
 		{"key":"YunPan","name":"🌾云盘|p g","type":3,"api":"csp_YunPan","timeout":60, "ext":"./lib/tokenm.json$$$null$$$proxy$$$1"},
-		{"key":"Funletu","name":"🌾趣盘|p g","type":3,"api":"csp_Funletu","quickSearch":1, "changeable":1, "filterable":1, "timeout":60, "ext":"./lib/tokenm.json",
-			"style": {
-				"type": "list",
-				"ratio": 1.1
-			}
-		},
 		{"key":"校长影视",
 		"name":"🌾校长|p g","type":3,"api":"csp_XiaoZhang", "quickSearch":1, "changeable":1, "filterable":1, "timeout":60,"ext":"./lib/tokenm.json$$$https://xzyshd.com$$$proxy$$$1"},
 		{"key":"Panta","name":"🌾盘Ta|网盘","type":3,"api":"csp_Panta","quickSearch":1, "changeable":1, "filterable":1, "timeout":60, "ext":"./lib/tokenm.json$$$https://www.91panta.cn/$$$null$$$1$$$./lib/panta.txt$$$PANTA",
