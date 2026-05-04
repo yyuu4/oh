@@ -44,7 +44,7 @@
     "ext": {
         "class": "YoutubeSpider",
         "ext": {
-            "youtube_txt": "http://127.0.0.1:9978/file/youtube.txt"
+            "youtube_txt": "./youtube.txt"
         }
         }
         },
