@@ -4,15 +4,15 @@
 
 { "urls": 
 [
-{"url": "http://www.饭太硬.com/tv","name": "💫饭太硬1"},
+{"url": "http://www.饭太硬.cc/tv","name": "💫饭太硬1"},
+
+{"url": "http://192.168.1.8:4567/sub/at","name": "💫at线路"},
 
 {"url": "http://192.168.1.8:7123/api/subscription/2037489090118553600/tvbox?token=1","name": "💫omnibox"},
 
 {"url": "http://192.168.1.8:4567/sub/aowu","name": "💫嗷呜弹弹"},
 
 {"url": "https://gitee.com/raae/oh/raw/master/pg/oh.json","name": "💫ohgitee"},
-  
-{"url": "https://git.acwing.com/oh/oh/-/raw/main/pg/oh.json?inline=false","name": "💫ohacw"},
 
 {"url": "https://gh-proxy.com/raw.githubusercontent.com/yyuu4/oh/refs/heads/main/pg/oh.json","name": "💫ohgithub"},
 
@@ -36,45 +36,23 @@
 
 {"url": "https://zhangqun1818.serv00.net/zq/api.json","name": "💫张全服务"},
 
-{"url": "https://9877.kstore.space/AnotherD/api.json","name": "💫潇洒线路"},
+{"url": "https://9877.kstore.space/ONE/one.json","name": "💫潇洒线路"},
   
-{"url": "http://肥猫.com","name": "💫肥猫线路"},  
- 
-{"url": "http://www.mpanso.com/小米/DEMO.json","name": "💫小米线路"},  
+{"url": "http://肥猫.net/tv","name": "💫肥猫线路"},  
   
-{"url": "https://raw.githubusercontent.com/yoursmile66/TVBox/main/XC.json","name": "💫南风线路"},
-  
-{"url": "https://tv.youdu.fan:666/毒盒影视/","name": "💫毒盒线路"},
-  
-{"url": "https://hb.xyyh.online/tvbox/","name": "💫小虎斑线路"},
-  
-{"url":"http://ttkx.cc:55/天天开心","name":"💫天天开心"},  
+{"url": "http://hb.小虎斑.site:25252/仅供测试","name": "💫小虎斑线路"},
   
 {"url":"http://tvbox.王二小放牛娃.top","name":"💫放牛娃"},  
   
-{"url":"http://我不是.摸鱼儿.com","name":"💫摸鱼线路"},
-  
-{"url": "http://47.99.102.252/xc.json","name": "💫星辰线路"},
+{"url":"http://我不是.摸鱼儿.top","name":"💫摸鱼线路"},
 
 {"url": "https://xn--affa-hb9fk23emp3ge8a.v.nxog.top/m/111.php?ou=公众号欧歌app&mz=index&jar=index&123&b=af非凡影音fa","name": "💫非凡影音"},  
   
   
 {"url":"https://gitlab.com/lzc1021lzc/hjfggzs.hjys/-/raw/main/hjys.free.json","name":"💫黄金分割"},
 {"url":"http://xn--esc-mf3g9f.v.nxog.top/m/333.php?ou=公众号欧歌app&mz=index&jar=index&321231231&b=欧歌esc","name":"💫欧歌线路"},
-{"url":"https://d.kstore.dev/download/7337/tw/%E8%87%AA%E7%94%A8%E5%8B%BF%E4%BC%A0.txt","name":"💫天微线路"},
-{"url":"http://yuhuavip1.top/育华学堂/斧头帮.php","name":"💫恒星线路"},
-{"url":"https://2912.kstore.space/0506.json","name":"💫西夏线路"},
-{"url": "http://kv.netsite.cc/tv.json","name": "💫饭太硬2"},
-{"url": "http://www.fish2018.ip-ddns.com/p/jsm.json","name": "💫pg线路"},
-{"url": "https://github.moeyy.xyz/https://raw.githubusercontent.com/xyq254245/xyqonlinerule/main/XYQTVBox.json","name": "💫香雅情"}, 
-{"url":"https://szyyds.cn/tv/x.json","name":"💫小马线路"},
-{"url":"https://notabug.org/qizhen15800/My9394/raw/master/%e4%b8%8d%e8%89%af%e5%b8%85.json","name":"💫不良帅"},
-{"url":"http://home.jundie.top:81/top98.json","name":"💫俊宇线路"},
 {"url":"http://tv.999888987.xyz/","name":"💫放牛备用"},
-{"url": "https://100km.top/0","name": "💫零线路"},
-{"url": "http://ok213.top/tv","name": "💫OK线路"},
-{"url": "http://home.jundie.top:81/TVBox/yosakoi.json","name": "💫军碟线路"},
-{"url": "http://cdn.qiaoji8.com/tvbox.json","name": "💫巧技线路"},
+{"url":"http://www.饭太硬.net/tv","name":"💫饭太硬备用"},
 {"url": "http://9xi4o.tk/0725.json","name": "💫4K云盘"}
 ]
 }
