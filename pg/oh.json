@@ -387,7 +387,7 @@
 				"cookie":""
 			}
 		},
-		{"key":"Guanying","name":"🌾观影|网磁","type":3,"api":"csp_Guanying","quickSearch":1, "changeable":1, "filterable":1, "timeout":60, "ext":"./lib/tokenm.json$$$https://www.xn--dpqv20e8ug6r8a.com/$$$proxy$$$1$$$./lib/guanying.txt$$$GUANYING"},
+		{"key":"Guanying","name":"🌾观影|网磁","type":3,"api":"csp_Guanying","quickSearch":1, "changeable":1, "filterable":1, "timeout":60, "ext":"./lib/tokenm.json$$$https://www.xn--74qz10cqsltibh40akss.com/$$$proxy$$$1$$$./lib/guanying.txt$$$GUANYING$$$raae$$$kisser123"},
 		{"key":"FourKZN","name":"🌾指南|网磁","type":3,"api":"csp_FourKZN","quickSearch":1, "changeable":1, "filterable":1, "timeout":60, "ext":"./lib/tokenm.json$$$https://4kzn.com/$$$noproxy$$$1$$$./lib/4kzn.txt$$$4KZN"},
 		{"key":"FourKFox","name":"🌾4KFox|网磁","type":3,"api":"csp_FourKFox","quickSearch":1, "changeable":1, "filterable":1, "timeout":60, "ext":"./lib/tokenm.json$$$http://4kfox.com/$$$noproxy$$$1$$$./lib/4kfox.txt$$$4KFOX"},
 		{"key":"FourKFM","name":"🌾4K影库|网磁","type":3,"api":"csp_FourKFM","quickSearch":1, "changeable":1, "filterable":1, "timeout":60, "ext":"./lib/tokenm.json$$$http://4kfm.com/$$$noproxy$$$1$$$./lib/4kfm.txt$$$4KFM"},
