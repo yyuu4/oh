@@ -429,7 +429,7 @@
 		{"key":"蜡笔网盘",
 		"name":"🌾蜡笔|p g",
 		"type":3,"api":"csp_Wobg","quickSearch":1, "changeable":1, "filterable":1, "timeout":60,
-		"ext":"./lib/tokenm.json$$$http://fmao.shop$$$noproxy$$$1$$$./lib/wogg.json$$$LABI"},
+		"ext":"./lib/tokenm.json$$$"http://xiaocgege.shop$$$noproxy$$$1$$$./lib/wogg.json$$$LABI"},
 		{"key":"Moli",
 		"name":"🌾moli|p g",
 		"type":3,
@@ -444,7 +444,7 @@
 			"ext": "./lib/tokenm.json$$$http://103.45.162.207:20720/$$$noproxy$$$1$$$./lib/wogg.json$$$U_HUBAN"
 		},
 		{"key":"小傻样","name":"🌾傻样|XHB","type":3,"api":"csp_Wobg","quickSearch":1, "changeable":1, "filterable":1, "timeout":60,
-			"ext": "./lib/tokenm.json$$$http://xsayang.fun:12512/$$$noproxy$$$1$$$./lib/wogg.json$$$U_HUBAN"
+			"ext": "./lib/tokenm.json$$$http://38.76.197.172:12521$$$noproxy$$$1$$$./lib/wogg.json$$$U_HUBAN"
 		},
 		{
 			"key": "至臻|网盘",
