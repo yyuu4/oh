@@ -441,7 +441,7 @@
 		"ext":"./lib/tokenm.json$$$null$$$proxy"},
 		{"key":"Mogg","name":"🌾木偶|p g","type":3,"api":"csp_Wobg","quickSearch":1, "changeable":1, "filterable":1, "timeout":60, "ext":"./lib/tokenm.json$$$https://www.muou.asia/$$$noproxy$$$1$$$./lib/wogg.json$$$MOGG"},
 		{"key":"Huban","name":"🌾虎斑|p g","type":3,"api":"csp_Wobg","quickSearch":1, "changeable":1, "filterable":1, "timeout":60,
-			"ext": "./lib/tokenm.json$$$http://103.45.162.207:20720/$$$noproxy$$$1$$$./lib/wogg.json$$$U_HUBAN"
+			"ext": "./lib/tokenm.json$$$http://38.76.197.172:16969$$$noproxy$$$1$$$./lib/wogg.json$$$U_HUBAN"
 		},
 		{"key":"小傻样","name":"🌾傻样|XHB","type":3,"api":"csp_Wobg","quickSearch":1, "changeable":1, "filterable":1, "timeout":60,
 			"ext": "./lib/tokenm.json$$$http://38.76.197.172:12521$$$noproxy$$$1$$$./lib/wogg.json$$$U_HUBAN"
