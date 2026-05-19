@@ -62,7 +62,7 @@
 				}
 			},
 			{
-				"name": "BIPTV(IPV6,可回看)"，
+				"name": "BIPTV(IPV6,可回看)",
 				"type": 0,
 				"url": "./lib/biptv.txt",
 				"ua": "okhttp/3.15",
