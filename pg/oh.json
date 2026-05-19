@@ -63,7 +63,7 @@
 			},
 			{
 				"name": "BIPTV(IPV6,可回看)",
-				"type": 0,
+				"type": 0，
 				"url": "./lib/biptv.txt",
 				"ua": "okhttp/3.15",
 				"epg": "http://127.0.0.1:10079/p/0/proxy/http://epg.112114.xyz/?ch={name}&date={date}",
@@ -430,11 +430,6 @@
 		"name":"🌾蜡笔|p g",
 		"type":3,"api":"csp_Wobg","quickSearch":1, "changeable":1, "filterable":1, "timeout":60,
 		"ext":"./lib/tokenm.json$$$http://xiaocgege.shop$$$noproxy$$$1$$$./lib/wogg.json$$$LABI"},
-		{"key":"Moli",
-		"name":"🌾moli|p g",
-		"type":3,
-		"api":"csp_Moli"，"quickSearch":1, "changeable":1, "filterable":1, "timeout":60,
-		"ext":"./lib/tokenm.json$$$https://www.hdmoli.pro/$$$proxy$$$1$$$./lib/moli.json"},
 		{"key":"PanSearch","name":"🌾PanSearch|p g",
 		"type":3,
 		"api":"csp_PanSearch","quickSearch":1, "changeable":1, "filterable":1, "timeout":60,
