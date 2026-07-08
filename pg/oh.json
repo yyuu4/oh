@@ -259,7 +259,7 @@
       "jar": "https://zl.wpscdn.cn/2026/05/31/space_img/f0dc4e16-54eb-47d9-9b99-e0a9-41c3-a558-ff3d515d591f",
       "indexs": 1
     },
-		{"key":"PanSouGo","name":"🌾PanSouGo|网盘","type":3,"api":"csp_PanSouGo","quickSearch":1, "changeable":1, "filterable":1, "timeout":60, "ext":"./lib/tokenm.json$$$http://192.168.1.8:1566|http://api2:8001$$$noproxy$$$1$$$PANSOUGO$$$user$$$pass"},
+		{"key":"PanSouGo","name":"🌾PanSouGo|网盘","type":3,"api":"csp_PanSouGo","quickSearch":1, "changeable":1, "filterable":1, "timeout":60, "ext":"./lib/tokenm.json$$$http://192.168.1.8:8800|http://api2:8001$$$noproxy$$$1$$$PANSOUGO$$$user$$$pass"},
 		{
 			"key":"Youtube",
 			"name":"🌾Youtube",
