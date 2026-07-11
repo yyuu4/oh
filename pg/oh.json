@@ -416,6 +416,23 @@
 			}
 		},
 		{
+    "key": "光鸭社区",
+    "name": "🌾光鸭|网盘",
+    "type": 3,
+    "api": "csp_GuangYaShequ",
+    "searchable": 1,
+    "quickSearch": 1,
+    "filterable": 0,
+    "ext": {
+        "token": "./lib/tokenm.json",
+        "page_size": 40,
+        "tmdb_key": "2894d9a1baf7812b451de03c801b0281",
+        "tmdb_api": "https://api.tmdb.org",
+        "tmdb_img": "https://images.tmdb.org/t/p",
+        "cache_file": "/storage/emulated/0/TV/gy_tmdb_pic_cache.json"
+    }
+},
+		{
 		"key":"秒搜",
 		"name":"🌾秒搜|p g",               "type":3,
 		"api":"csp_MiaoSou",                "timeout":60,
