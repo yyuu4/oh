@@ -322,7 +322,7 @@
             "key": "youtube.py",
             "name": "点播ytb(py)",
             "type": 3,
-            "api": "./py/0712youtube.py",
+            "api": "./py/youtube.py",
             "searchable": 1,
             "quickSearch": 1,
             "filterable": 1,
