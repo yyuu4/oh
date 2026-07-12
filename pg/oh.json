@@ -302,6 +302,38 @@
 				"ratio": 1.77
 			}
 		},
+		{
+            "key": "ytblive.py",
+            "name": "直播ytb(py) ",
+            "type": 3,
+            "api": "./py/youtubelive.py",
+            "searchable": 1,
+            "quickSearch": 1,
+            "filterable": 1,
+            "order_num": 0,
+            "ext": {
+                "proxy": {
+                    "http": "http://127.0.0.1:10172",
+                    "https": "http://127.0.0.1:10172"
+                }
+            }
+        },
+        {
+            "key": "youtube.py",
+            "name": "点播ytb(py)",
+            "type": 3,
+            "api": "./py/0712youtube.py",
+            "searchable": 1,
+            "quickSearch": 1,
+            "filterable": 1,
+            "order_num": 0,
+            "ext": {
+                "proxy": {
+                    "http": "http://127.0.0.1:10172",
+                    "https": "http://127.0.0.1:10172"
+                }
+            }
+        },
 		//{"key":"TGYunPanLocal","name":"🉑1TG频道搜索","type":3,"api":"csp_TGYunPanLocal","timeout":120, 
 			//"ext":{
 				//"token":"./lib/tokenm.json",
