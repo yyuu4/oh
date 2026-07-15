@@ -4,7 +4,7 @@
       "name": "webdav.router",
       "search": true,
       "searchable": true,
-      "server": "http://192.168.1.8:5344/",
+      "server": "http://192.168.1.8:4567/",
       "path": "/dav",
       "user": "45Scdho",
       "pass": "eJDEk@RYJ5A0"
