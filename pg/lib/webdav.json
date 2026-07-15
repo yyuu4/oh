@@ -5,9 +5,9 @@
       "search": true,
       "searchable": true,
       "server": "http://192.168.1.8:4567/",
-      "path": "http://localhost:5344",
-      "user": "",
-      "pass": ""
+      "path": "/dav",
+      "user": "45Scdho",
+      "pass": "eJDEk@RYJ5A0"
     }
   ]
 }
