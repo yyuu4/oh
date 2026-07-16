@@ -96,10 +96,11 @@
 				"logo": "http://127.0.0.1:10079/p/0/proxy/https://epg.112114.xyz/logo/{name}.png"
 			},
 			{
-            "name": "冰茶",
+            "name": "库佬永久",
             "type": 0,
-            "url": "https://fy.188766.xyz/?ip=&mima=mianfeidehaimaiqian",
-            "epg": "https://epg.112114.xyz/?ch={name}&date={date}"
+            "url": "https://live.445569.xyz/live.m3u",
+            "logo": "http://127.0.0.1:10079/p/0/proxy/https://epg.112114.xyz/logo/{name}.png",
+            "epg": "http://127.0.0.1:10079/p/0/proxy/https://epg.112114.xyz/?ch={name}&date={date}"
         },
         {
       "name": "日后",
