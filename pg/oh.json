@@ -482,7 +482,7 @@
     "api": "csp_PingLian",
     "searchable": 1,
     "timeout": 60,
-    "ext": "./lib/tokenm.json$$$https://pinglian.lol$$$proxy$$$0$$$$$PANLIAN$$$raae$$$kisser123"
+    "ext": "./lib/tokenm.json$$$https://pinglian.lol$$$noproxy$$$0$$$$$PANLIAN$$$raae$$$kisser123"
 },
 {
     "key": "csp_Qwmp4",
