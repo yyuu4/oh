@@ -476,6 +476,26 @@
 		{"key":"HuamuCangShare","name":"🌾花木藏|网盘","type":3,"api":"csp_HuamuCangShare","quickSearch":1, "changeable":1, "filterable":1, "timeout":60, "ext":"./lib/token.json$$$https://share.huamucang.top/$$$noproxy$$$1$$$./lib/huamucang.txt$$$HUAMUCANG$$$USER$$$PASS"},
 		{"key":"Hema4k","name":"🌾盒马|网磁","type":3,"api":"csp_Hema4k","quickSearch":1, "changeable":1, "filterable":1, "timeout":60, "ext":"./lib/tokenm.json$$$https://www.hema4k.com/$$$proxy$$$1$$$./lib/hema4k.txt$$$HEMA4K"},
 		{
+    "key": "盘链",
+    "name": "🌾盘链|网盘",
+    "type": 3,
+    "api": "csp_PingLian",
+    "searchable": 1,
+    "timeout": 60,
+    "ext": "./lib/tokenm.json$$$https://pinglian.lol$$$noproxy$$$0$$$PANLIAN$$$raae$$$kisser123"
+},
+{
+    "key": "csp_Qwmp4",
+    "name": "🌾七味|网磁",
+    "type": 3,
+    "api": "csp_Qwmp4",
+    "searchable": 1,
+    "quickSearch": 1,
+    "filterable": 0,
+    "timeout": 60,
+    "ext": "./lib/tokenm.json$$$https://www.qwmp4.com/$$$noproxy$$$0$$$QIWEI"
+},
+		{
 		"key":"秒搜",
 		"name":"🌾秒搜|p g",               "type":3,
 		"api":"csp_MiaoSou",                "timeout":60,
