@@ -286,7 +286,7 @@
       "switchable": 0,
       "ext": {
         "commonConfig": "./json/peizhi.json",
-        "share": "https://d.kstore.dev/download/9267/zhenxin/%E7%BD%91%E7%9B%98%E9%9B%86%E5%90%88.json"
+        "share": "./json/网盘集合.json"
       }
     },
     {
@@ -512,7 +512,7 @@
       },
       "ext": {
         "commonConfig": "./json/peizhi.json",
-        "json": "https://d.kstore.dev/download/9267/zhenxin/youtube.json",
+        "json": "./json/youtube.json",
         "cookie": "CgtzV1B0RjFqR1pkQSjOupjSBjIKCgJVUxIEGgAgPmLfAgrcAjE5LllUPWltbEQxZ19hSGtaNmxjSkp3VWlRenN4cnpHbUI4dld0NlNCMmxLTXZmblZWeGlINGc0Q0psNTNMNjdOa1ZlZElhN2JlM2d0N0Z1QnMxYW1sY1M4QzZsY0FLOE0zNTJiSk5QVGhDTS1JSGNKNHIwZU5wbU14aU4tc3Vkd1JwVDh3MG1XUktjbXJHWFlsVk50MmVFOWs4dS1GRkpiZDhhT1kybGpMTlU2ZWFKR2V5VENDMGQxZ3pfLXhiaWVDQ2tqWUxLaW04bzJwMXllaU9NYTlPTzJfRUZXbWFyb1BpRU9US3B0ZHUyMWtLSzhvWnByMUthMk8wS2tCdERTLWhUaGt1OGxlbVk1QnhsNXg0RVEyOVNlX1NXdmhCS2ZlNzhVVUpFOHJManZCcEkyRDIySEo4d005TmlMS3ZKeVZuRm5Wc3VETWQ3RnA1dlBCVm40dGdMV3dVQQ%3D%3D"
       }
     },
