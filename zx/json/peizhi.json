@@ -1,0 +1,18 @@
+{
+  "panOrder": "dp|uc|p123|quark|ali|yd|ty|115|guangya##原畫",
+  "mudan":"true",
+  "aliToken": "",
+  "baiduCookie": "",
+  "quarkCookie": "",
+  "ucCookie": "",
+  "ucToken": "",
+  "ucUt": "",
+  "115Cookie": "",
+  "pwdRb115": "666888",//115 删除码
+  "goServerUrl": "http://127.0.0.1:9966",
+  "ydAuth": "cGM6MTM4Mzc0NTE2Njk6eFB5ak9ReWd8MXxSQ1N8MTc3ODQzMTg1NjM3NnxZekNYOU1GQUV2cExENEhxNDYwbS5nc1Jnc2pxUDVnLlJYVFcuVHJiVXBBbXFLUDlSRGlycnBMdjJWU1NDTS5KeEZkTHhSQzlIbE1zTGZra0hzVlhfZnZRSktvQkxGbHA0TkhXZ1owcDlIRGp4VlJvTFhpcVhRRjNkTDJ4SURJMkVWM09zbTRmZUROMXdhMnU4aTVaWW1xX3BQdTBGQ1BKLlFNWWtOT0Z2dEUt",//请求头中authorization 取basic 后面的值
+  "tyAuth": "13383748905|Xhz1357@@",//账号|密码
+  "p123Auth":"13837451669|123456aabb",//账号|密码
+  "proxy": "http://127.0.0.1:1072",//默认代理端口 留空则使用外置代理:socks5://12345678:12345678@47.236.191.222:1080
+  "tgPic": "true"//tgsou 图片显示与否
+}
