@@ -246,7 +246,7 @@ class Spider(BaseSpider):
 
     def searchContent(self, key, quick=False, pg="1"):
         """
-        使用豆瓣网页版搜索，支持分页。
+        使用豆瓣移动端 API 搜索，稳定可靠。
         """
         if not key or not str(key).strip():
             return {"list": []}
@@ -256,18 +256,63 @@ class Spider(BaseSpider):
             page = 1
         limit = 30
         start = (page - 1) * limit
+
+        # 先尝试移动端 API
+        try:
+            url = self.API + "/search"
+            params = {
+                "q": key,
+                "start": start,
+                "count": limit,
+                "for_mobile": 1,
+            }
+            data = self._get_json(url, params=params, ttl=self.list_cache_ttl)
+            items = data.get("items", [])
+            result_list = []
+            for item in items:
+                # 数据可能嵌套在 target 中
+                target = item.get("target") or item
+                subject_id = target.get("id")
+                if not subject_id:
+                    continue
+                title = target.get("title", "")
+                pic = target.get("pic", {}).get("normal", "") or target.get("cover", "")
+                rating = target.get("rating")
+                if isinstance(rating, dict):
+                    score = rating.get("value")
+                else:
+                    score = target.get("rate")
+                score = str(score).strip()
+                remark = score + "分" if score and score != "" and score != "0" else "暂无评分"
+                result_list.append({
+                    "vod_id": subject_id,
+                    "vod_name": title,
+                    "vod_pic": self._image(pic),
+                    "vod_remarks": remark,
+                })
+            total = data.get("total", 0)
+            pagecount = (total + limit - 1) // limit if total else page
+            return self._page_result(result_list, page, pagecount, total, limit)
+        except Exception:
+            # 如果 API 失败，回退到网页版搜索
+            return self._search_by_web(key, page)
+
+    def _search_by_web(self, key, page):
+        """
+        网页版搜索，作为备用方案。
+        """
+        limit = 30
+        start = (page - 1) * limit
         url = "https://movie.douban.com/subject_search"
         params = {"search_text": key, "start": start}
         try:
             text = self._get_text(url, params=params, ttl=self.list_cache_ttl)
             doc = html.fromstring(text)
             items = []
-            # 搜索结果的条目，通常有两种结构：<div class="item"> 或 <div class="result">
             nodes = doc.xpath("//div[contains(@class,'item')]")
             if not nodes:
                 nodes = doc.xpath("//div[contains(@class,'result')]")
             for node in nodes:
-                # 提取链接
                 a = node.xpath(".//a[contains(@href,'/subject/')]")
                 if not a:
                     continue
@@ -278,28 +323,20 @@ class Spider(BaseSpider):
                 title = a[0].xpath("string(.)").strip()
                 if not title:
                     continue
-                # 图片
                 img = node.xpath(".//img/@src")
                 pic = img[0] if img else ""
-                # 评分
                 rating_node = node.xpath(".//span[contains(@class,'rating')]")
-                if rating_node:
-                    rating_text = rating_node[0].xpath("string(.)").strip()
-                else:
-                    rating_text = ""
-                card = {
+                rating_text = rating_node[0].xpath("string(.)").strip() if rating_node else ""
+                items.append({
                     "vod_id": subject_id,
                     "vod_name": title,
                     "vod_pic": self._image(pic),
                     "vod_remarks": rating_text if rating_text else "暂无评分"
-                }
-                items.append(card)
+                })
                 if len(items) >= limit:
                     break
-            # 检查是否有下一页
-            next_page = doc.xpath("//a[contains(@href,'start=') and (contains(text(),'后页') or contains(text(),'下一页'))]")
-            has_next = bool(next_page)
-            total = len(items)  # 简化处理，不计算总条数
+            has_next = bool(doc.xpath("//a[contains(@href,'start=') and (contains(text(),'后页') or contains(text(),'下一页'))]"))
+            total = len(items)  # 简化
             pagecount = page + 1 if has_next else page
             return self._page_result(items, page, pagecount, total, limit)
         except Exception as exc:
