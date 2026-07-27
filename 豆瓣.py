@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-# //@name:豆瓣资料收藏
+# //@name:豆瓣导航
 # //@id:douban_meta_wish
-# //@version:1
+# //@version:2
 
 import json
 import math
@@ -20,17 +20,17 @@ from base.spider import Spider as BaseSpider
 
 
 class Spider(BaseSpider):
-    name = "豆瓣资料收藏"
+    name = "豆瓣导航"
     host = "https://m.douban.com"
-    backend_parse = True
-    category_mode = True
-    categoryMode = True
+    backend_parse = False
+    category_mode = False
+    categoryMode = False
 
     API = "https://m.douban.com/rexxar/api/v2"
     MOVIE = "https://movie.douban.com"
     ACTION_PREFIX = "douban-wish:add:"
     ERROR_PREFIX = "douban-error:"
-    FILTER_CACHE_KEY = "douban_meta_wish_filters_v3"
+    FILTER_CACHE_KEY = "douban_meta_wish_filters_v4_navigation"
 
     CATEGORIES = (
         ("hotmovie", "热门电影"),
@@ -173,9 +173,18 @@ class Spider(BaseSpider):
         try:
             params = {"start": 0, "count": 30, "updated_at": "", "items_only": 1, "for_mobile": 1}
             data = self._get_json(self.API + "/subject_collection/subject_real_time_hotest/items", params=params, ttl=self.list_cache_ttl)
-            return {"list": self._parse_collection_items(data)}
-        except Exception as exc:
-            return {"list": [self._error_card("首页载入失败", exc)]}
+            items = self._parse_collection_items(data)
+            if items:
+                return {"list": items}
+            raise RuntimeError("实时热门列表为空")
+        except Exception as primary:
+            try:
+                fallback = self._category_media("movie", 1, {"sort": "U"})
+                if fallback.get("list"):
+                    return {"list": fallback["list"]}
+            except Exception:
+                pass
+            return {"list": [self._error_card("首页载入失败", primary)]}
 
     def categoryContent(self, tid, pg, filter=False, extend=None):
         page = self._positive_int(pg, 1)
@@ -245,102 +254,7 @@ class Spider(BaseSpider):
             return {"list": [self._error_card("详情载入失败", exc, subject_id)]}
 
     def searchContent(self, key, quick=False, pg="1"):
-        """
-        使用豆瓣移动端 API 搜索，稳定可靠。
-        """
-        if not key or not str(key).strip():
-            return {"list": []}
-        key = str(key).strip()
-        page = self._positive_int(pg, 1)
-        if page < 1:
-            page = 1
-        limit = 30
-        start = (page - 1) * limit
-
-        # 先尝试移动端 API
-        try:
-            url = self.API + "/search"
-            params = {
-                "q": key,
-                "start": start,
-                "count": limit,
-                "for_mobile": 1,
-            }
-            data = self._get_json(url, params=params, ttl=self.list_cache_ttl)
-            items = data.get("items", [])
-            result_list = []
-            for item in items:
-                # 数据可能嵌套在 target 中
-                target = item.get("target") or item
-                subject_id = target.get("id")
-                if not subject_id:
-                    continue
-                title = target.get("title", "")
-                pic = target.get("pic", {}).get("normal", "") or target.get("cover", "")
-                rating = target.get("rating")
-                if isinstance(rating, dict):
-                    score = rating.get("value")
-                else:
-                    score = target.get("rate")
-                score = str(score).strip()
-                remark = score + "分" if score and score != "" and score != "0" else "暂无评分"
-                result_list.append({
-                    "vod_id": subject_id,
-                    "vod_name": title,
-                    "vod_pic": self._image(pic),
-                    "vod_remarks": remark,
-                })
-            total = data.get("total", 0)
-            pagecount = (total + limit - 1) // limit if total else page
-            return self._page_result(result_list, page, pagecount, total, limit)
-        except Exception:
-            # 如果 API 失败，回退到网页版搜索
-            return self._search_by_web(key, page)
-
-    def _search_by_web(self, key, page):
-        """
-        网页版搜索，作为备用方案。
-        """
-        limit = 30
-        start = (page - 1) * limit
-        url = "https://movie.douban.com/subject_search"
-        params = {"search_text": key, "start": start}
-        try:
-            text = self._get_text(url, params=params, ttl=self.list_cache_ttl)
-            doc = html.fromstring(text)
-            items = []
-            nodes = doc.xpath("//div[contains(@class,'item')]")
-            if not nodes:
-                nodes = doc.xpath("//div[contains(@class,'result')]")
-            for node in nodes:
-                a = node.xpath(".//a[contains(@href,'/subject/')]")
-                if not a:
-                    continue
-                href = a[0].get("href")
-                subject_id = self._subject_id(href)
-                if not subject_id:
-                    continue
-                title = a[0].xpath("string(.)").strip()
-                if not title:
-                    continue
-                img = node.xpath(".//img/@src")
-                pic = img[0] if img else ""
-                rating_node = node.xpath(".//span[contains(@class,'rating')]")
-                rating_text = rating_node[0].xpath("string(.)").strip() if rating_node else ""
-                items.append({
-                    "vod_id": subject_id,
-                    "vod_name": title,
-                    "vod_pic": self._image(pic),
-                    "vod_remarks": rating_text if rating_text else "暂无评分"
-                })
-                if len(items) >= limit:
-                    break
-            has_next = bool(doc.xpath("//a[contains(@href,'start=') and (contains(text(),'后页') or contains(text(),'下一页'))]"))
-            total = len(items)  # 简化
-            pagecount = page + 1 if has_next else page
-            return self._page_result(items, page, pagecount, total, limit)
-        except Exception as exc:
-            return {"list": [self._error_card("搜索失败", exc)]}
+        return {"list": []}
 
     def playerContent(self, flag, id, vipFlags=None):
         return {
@@ -481,7 +395,6 @@ class Spider(BaseSpider):
             pic = self._xpath_text(node, ".//div[contains(@class,'pic')]//img/@src")
             score = self._xpath_text(node, ".//span[contains(@class,'rating_num')]")
             card = {"vod_id": subject_id, "vod_name": title, "vod_pic": self._image(pic), "vod_remarks": (score + "分") if score else "Top250"}
-            self._apply_click_action(card, ext)
             items.append(card)
         return self._page_result(items, page, 10, 250, limit)
 
@@ -597,7 +510,6 @@ class Spider(BaseSpider):
             "vod_pic": self._image(str(raw.get("cover") or "")),
             "vod_remarks": (score + "分") if score and score != "0" else "暂无评分",
         }
-        self._apply_click_action(card, ext)
         return card
 
     def _collection_card(self, raw, ext):
@@ -612,12 +524,7 @@ class Spider(BaseSpider):
             "vod_pic": self._image(self._pic(raw)),
             "vod_remarks": remark,
         }
-        self._apply_click_action(card, ext)
         return card
-
-    def _apply_click_action(self, card, ext):
-        if self._value(ext, "click", "detail") == "add_wish" and card.get("vod_id"):
-            card["action"] = self.ACTION_PREFIX + str(card["vod_id"])
 
     def _get_filters(self):
         now = time.time()
@@ -672,14 +579,12 @@ class Spider(BaseSpider):
 
     def _base_filters(self):
         years = [str(year) for year in range(time.localtime().tm_year, 1979, -1)]
-        click = self._filter("click", "点击行为", (("查看详情", "detail"), ("加入豆瓣想看", "add_wish")))
         hot_movie = [
             self._filter("sort", "排序", self.ANIME_SORTS),
             self._filter("type", "类型", [("全部类型", "")] + [(v, v) for v in self.MOVIE_TYPES]),
             self._filter("area", "地区", [("全部地区", "")] + [(v, v) for v in self.AREAS]),
             self._filter("year", "年代", [("全部年代", "")] + [(v, v) for v in years]),
             self._filter("tag", "标签", [("全部标签", "")] + [(v, v) for v in self.TAGS]),
-            click,
         ]
         hot_tv = [
             self._filter("sort", "排序", self.ANIME_SORTS),
@@ -688,7 +593,6 @@ class Spider(BaseSpider):
             self._filter("year", "年代", [("全部年代", "")] + [(v, v) for v in years]),
             self._filter("platform", "平台", [("全部平台", "")] + [(v, v) for v in self.PLATFORMS]),
             self._filter("tag", "标签", [("全部标签", "")] + [(v, v) for v in self.TAGS]),
-            click,
         ]
         hot_show = [
             self._filter("sort", "排序", self.ANIME_SORTS),
@@ -696,21 +600,19 @@ class Spider(BaseSpider):
             self._filter("area", "地区", [("全部地区", "")] + [(v, v) for v in self.AREAS]),
             self._filter("year", "年代", [("全部年代", "")] + [(v, v) for v in years]),
             self._filter("platform", "平台", [("全部平台", "")] + [(v, v) for v in self.PLATFORMS]),
-            click,
         ]
         return {
             "hotmovie": hot_movie,
             "hottv": hot_tv,
             "hotzy": hot_show,
-            "movielist": [self._filter("1", "榜单", self.MOVIE_LISTS), click],
-            "tvlist": [self._filter("1", "榜单", self.TV_LISTS), click],
+            "movielist": [self._filter("1", "榜单", self.MOVIE_LISTS)],
+            "tvlist": [self._filter("1", "榜单", self.TV_LISTS)],
             "moviefilter": [
                 self._filter("5", "排序", self.SORTS),
                 self._filter("1", "类型", [("全部类型", "")] + [(v, v) for v in self.MOVIE_TYPES]),
                 self._filter("2", "地区", [("全部地区", "")] + [(v, v) for v in self.AREAS]),
                 self._filter("3", "年代", [("全部年代", "")] + [(v, v) for v in years]),
                 self._filter("4", "标签", [("全部标签", "")] + [(v, v) for v in self.TAGS]),
-                click,
             ],
             "tvfilter": [
                 self._filter("8", "排序", self.SORTS),
@@ -721,13 +623,12 @@ class Spider(BaseSpider):
                 self._filter("5", "年代", [("全部年代", "")] + [(v, v) for v in years]),
                 self._filter("6", "平台", [("全部平台", "")] + [(v, v) for v in self.PLATFORMS]),
                 self._filter("7", "标签", [("全部标签", "")] + [(v, v) for v in self.TAGS]),
-                click,
             ],
-            "anime": self._anime_filters(years, click),
+            "anime": self._anime_filters(years),
             "wishlist": [],
         }
 
-    def _anime_filters(self, years, click):
+    def _anime_filters(self, years):
         return [
             self._filter("sort", "排序", self.ANIME_SORTS),
             self._filter("region", "地区", (("国漫", "cn"), ("日漫", "jp"), ("韩漫", "kr"), ("美漫", "us"))),
@@ -735,7 +636,6 @@ class Spider(BaseSpider):
             self._filter("year", "年代", [("全部年代", "")] + [(v, v) for v in years]),
             self._filter("genre", "题材", [("全部题材", "")] + [(v, v) for v in self.ANIME_GENRES]),
             self._filter("format", "形式", [("全部形式", "")] + [(v, v) for v in self.ANIME_FORMATS]),
-            click,
         ]
 
     def _merge_dynamic_filters(self, filters):
