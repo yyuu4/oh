@@ -245,7 +245,83 @@ class Spider(BaseSpider):
             return {"list": [self._error_card("详情载入失败", exc, subject_id)]}
 
     def searchContent(self, key, quick=False, pg="1"):
-        return {"list": []}
+        """
+        实现搜索功能，支持电影、电视剧、综艺。
+        长按图标搜索时调用此方法。
+        """
+        if not key or not str(key).strip():
+            return {"list": []}
+        key = str(key).strip()
+        page = self._positive_int(pg, 1)
+        if page < 1:
+            page = 1
+        limit = 30  # 每页数量
+        start = (page - 1) * limit
+
+        # 搜索类型列表：movie, tv, show
+        types = ["movie", "tv", "show"]
+        all_items = []
+        seen_ids = set()
+
+        for t in types:
+            params = {
+                "q": key,
+                "type": t,
+                "start": start,
+                "count": limit,
+                "for_mobile": 1,
+            }
+            try:
+                data = self._get_json(
+                    self.API + "/search",
+                    params=params,
+                    ttl=self.list_cache_ttl
+                )
+                # 解析可能的返回结构
+                subjects = []
+                if isinstance(data, dict):
+                    if "subjects" in data:
+                        subjects = data.get("subjects", [])
+                    elif "data" in data and isinstance(data["data"], dict):
+                        subjects = data["data"].get("subjects", [])
+                    elif "items" in data:
+                        subjects = data.get("items", [])
+                for raw in subjects:
+                    subject_id = str(raw.get("id", ""))
+                    if not subject_id or subject_id in seen_ids:
+                        continue
+                    seen_ids.add(subject_id)
+                    # 提取评分
+                    rating_val = raw.get("rating")
+                    if isinstance(rating_val, dict):
+                        score = str(rating_val.get("value", ""))
+                    else:
+                        score = str(raw.get("rate", ""))
+                    score = score.strip()
+                    # 提取封面
+                    pic = raw.get("cover") or raw.get("cover_url") or ""
+                    if not pic and isinstance(raw.get("pic"), dict):
+                        pic = raw.get("pic", {}).get("normal", "")
+                    card = {
+                        "vod_id": subject_id,
+                        "vod_name": str(raw.get("title", "")),
+                        "vod_pic": self._image(pic),
+                        "vod_remarks": (score + "分") if score and score != "0" and score != "" else "暂无评分",
+                    }
+                    all_items.append(card)
+                    if len(all_items) >= limit:
+                        break
+            except Exception:
+                # 单个类型搜索失败不影响其他类型
+                continue
+            if len(all_items) >= limit:
+                break
+
+        total = len(all_items)
+        items = all_items[:limit]
+        # 计算页数，简单处理
+        pagecount = page if total <= limit else page + 1
+        return self._page_result(items, page, pagecount, total, limit)
 
     def playerContent(self, flag, id, vipFlags=None):
         return {
