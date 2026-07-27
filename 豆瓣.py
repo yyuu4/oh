@@ -246,7 +246,7 @@ class Spider(BaseSpider):
 
     def searchContent(self, key, quick=False, pg="1"):
         """
-        搜索电影、电视剧、综艺，合并三种类型的结果去重返回。
+        使用豆瓣网页版搜索，支持分页。
         """
         if not key or not str(key).strip():
             return {"list": []}
@@ -255,28 +255,55 @@ class Spider(BaseSpider):
         if page < 1:
             page = 1
         limit = 30
-        all_items = []
-        seen_ids = set()
-        # 遍历三种类型
-        for kind in ["movie", "tv", "show"]:
-            try:
-                # 调用已有的分类搜索方法，它会返回 page_result
-                result = self._category_search_subjects(kind, page, key, {})
-                items = result.get("list", [])
-                for item in items:
-                    vid = item.get("vod_id", "")
-                    if vid and vid not in seen_ids:
-                        seen_ids.add(vid)
-                        all_items.append(item)
-            except Exception:
-                continue
-            if len(all_items) >= limit * 2:  # 提前终止避免过多请求
-                break
-        # 截断到每页数量
-        items = all_items[:limit]
-        total = len(all_items)
-        pagecount = page if total <= limit else page + 1
-        return self._page_result(items, page, pagecount, total, limit)
+        start = (page - 1) * limit
+        url = "https://movie.douban.com/subject_search"
+        params = {"search_text": key, "start": start}
+        try:
+            text = self._get_text(url, params=params, ttl=self.list_cache_ttl)
+            doc = html.fromstring(text)
+            items = []
+            # 搜索结果的条目，通常有两种结构：<div class="item"> 或 <div class="result">
+            nodes = doc.xpath("//div[contains(@class,'item')]")
+            if not nodes:
+                nodes = doc.xpath("//div[contains(@class,'result')]")
+            for node in nodes:
+                # 提取链接
+                a = node.xpath(".//a[contains(@href,'/subject/')]")
+                if not a:
+                    continue
+                href = a[0].get("href")
+                subject_id = self._subject_id(href)
+                if not subject_id:
+                    continue
+                title = a[0].xpath("string(.)").strip()
+                if not title:
+                    continue
+                # 图片
+                img = node.xpath(".//img/@src")
+                pic = img[0] if img else ""
+                # 评分
+                rating_node = node.xpath(".//span[contains(@class,'rating')]")
+                if rating_node:
+                    rating_text = rating_node[0].xpath("string(.)").strip()
+                else:
+                    rating_text = ""
+                card = {
+                    "vod_id": subject_id,
+                    "vod_name": title,
+                    "vod_pic": self._image(pic),
+                    "vod_remarks": rating_text if rating_text else "暂无评分"
+                }
+                items.append(card)
+                if len(items) >= limit:
+                    break
+            # 检查是否有下一页
+            next_page = doc.xpath("//a[contains(@href,'start=') and (contains(text(),'后页') or contains(text(),'下一页'))]")
+            has_next = bool(next_page)
+            total = len(items)  # 简化处理，不计算总条数
+            pagecount = page + 1 if has_next else page
+            return self._page_result(items, page, pagecount, total, limit)
+        except Exception as exc:
+            return {"list": [self._error_card("搜索失败", exc)]}
 
     def playerContent(self, flag, id, vipFlags=None):
         return {
