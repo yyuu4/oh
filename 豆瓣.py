@@ -246,8 +246,7 @@ class Spider(BaseSpider):
 
     def searchContent(self, key, quick=False, pg="1"):
         """
-        实现搜索功能，支持电影、电视剧、综艺。
-        长按图标搜索时调用此方法。
+        搜索电影、电视剧、综艺，合并三种类型的结果去重返回。
         """
         if not key or not str(key).strip():
             return {"list": []}
@@ -255,71 +254,27 @@ class Spider(BaseSpider):
         page = self._positive_int(pg, 1)
         if page < 1:
             page = 1
-        limit = 30  # 每页数量
-        start = (page - 1) * limit
-
-        # 搜索类型列表：movie, tv, show
-        types = ["movie", "tv", "show"]
+        limit = 30
         all_items = []
         seen_ids = set()
-
-        for t in types:
-            params = {
-                "q": key,
-                "type": t,
-                "start": start,
-                "count": limit,
-                "for_mobile": 1,
-            }
+        # 遍历三种类型
+        for kind in ["movie", "tv", "show"]:
             try:
-                data = self._get_json(
-                    self.API + "/search",
-                    params=params,
-                    ttl=self.list_cache_ttl
-                )
-                # 解析可能的返回结构
-                subjects = []
-                if isinstance(data, dict):
-                    if "subjects" in data:
-                        subjects = data.get("subjects", [])
-                    elif "data" in data and isinstance(data["data"], dict):
-                        subjects = data["data"].get("subjects", [])
-                    elif "items" in data:
-                        subjects = data.get("items", [])
-                for raw in subjects:
-                    subject_id = str(raw.get("id", ""))
-                    if not subject_id or subject_id in seen_ids:
-                        continue
-                    seen_ids.add(subject_id)
-                    # 提取评分
-                    rating_val = raw.get("rating")
-                    if isinstance(rating_val, dict):
-                        score = str(rating_val.get("value", ""))
-                    else:
-                        score = str(raw.get("rate", ""))
-                    score = score.strip()
-                    # 提取封面
-                    pic = raw.get("cover") or raw.get("cover_url") or ""
-                    if not pic and isinstance(raw.get("pic"), dict):
-                        pic = raw.get("pic", {}).get("normal", "")
-                    card = {
-                        "vod_id": subject_id,
-                        "vod_name": str(raw.get("title", "")),
-                        "vod_pic": self._image(pic),
-                        "vod_remarks": (score + "分") if score and score != "0" and score != "" else "暂无评分",
-                    }
-                    all_items.append(card)
-                    if len(all_items) >= limit:
-                        break
+                # 调用已有的分类搜索方法，它会返回 page_result
+                result = self._category_search_subjects(kind, page, key, {})
+                items = result.get("list", [])
+                for item in items:
+                    vid = item.get("vod_id", "")
+                    if vid and vid not in seen_ids:
+                        seen_ids.add(vid)
+                        all_items.append(item)
             except Exception:
-                # 单个类型搜索失败不影响其他类型
                 continue
-            if len(all_items) >= limit:
+            if len(all_items) >= limit * 2:  # 提前终止避免过多请求
                 break
-
-        total = len(all_items)
+        # 截断到每页数量
         items = all_items[:limit]
-        # 计算页数，简单处理
+        total = len(all_items)
         pagecount = page if total <= limit else page + 1
         return self._page_result(items, page, pagecount, total, limit)
 
