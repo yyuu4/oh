@@ -254,54 +254,7 @@ class Spider(BaseSpider):
             return {"list": [self._error_card("详情载入失败", exc, subject_id)]}
 
     def searchContent(self, key, quick=False, pg="1"):
-        keyword = str(key or "").strip()
-        if not keyword:
-            return {"list": []}
-        page = self._positive_int(pg, 1)
-        limit = 50
-        subjects = []
-        kinds = ["movie", "tv", "variety"]
-        for kind in kinds:
-            params = {
-                "type": kind,
-                "tag": "",
-                "page_limit": limit,
-                "page_start": (page - 1) * limit,
-                "q": keyword,
-            }
-            try:
-                url = self.MOVIE + "/j/search_subjects"
-                data = self._get_json(url, params=params, ttl=self.list_cache_ttl)
-                subjects.extend(data.get("subjects") or [])
-            except Exception as e:
-                pass
-        if not subjects:
-            try:
-                params = {
-                    "q": keyword,
-                    "start": (page - 1) * limit,
-                    "count": limit,
-                    "for_mobile": 1,
-                }
-                data = self._get_json(self.API + "/search", params=params, ttl=self.list_cache_ttl)
-                subjects.extend(data.get("items") or data.get("subjects") or [])
-            except Exception as e:
-                pass
-        items = []
-        seen = set()
-        for raw in subjects:
-            sid = str(raw.get("id") or "")
-            if sid in seen:
-                continue
-            seen.add(sid)
-            raw_type = str(raw.get("type") or "")
-            if raw_type and raw_type in ("movie", "tv", "show", "variety"):
-                items.append(self._collection_card(raw, {}))
-            else:
-                items.append(self._subject_card(raw, {}))
-        total = len(subjects)
-        pagecount = page + (1 if len(items) >= limit else 0)
-        return self._page_result(items, page, max(page, pagecount), total or pagecount * limit, limit)
+        return {"list": []}
 
     def playerContent(self, flag, id, vipFlags=None):
         return {
