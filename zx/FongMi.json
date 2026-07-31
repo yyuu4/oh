@@ -5,7 +5,7 @@
     {
       "name": "直播优选",
       "type": 0,
-      "url": "https://d.kstore.dev/download/9267/zhibo/zbxl.txt",
+      "url": "./json/zbxl.txt",
       "ua": "okhttp/3.15",
       "epg": "http://127.0.0.1:9966/api/proxy/http://epg.112114.xyz/?ch={name}&date={date}",
       "logo": "http://127.0.0.1:9966/api/proxy/https://epg.112114.xyz/logo/{name}.png",
