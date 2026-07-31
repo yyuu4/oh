@@ -521,7 +521,7 @@
 		{"key":"蜡笔网盘",
 		"name":"🌾蜡笔|p g",
 		"type":3,"api":"csp_Wobg","quickSearch":1, "changeable":1, "filterable":1, "timeout":60,
-		"ext":"./lib/tokenm.json$$$http://xiaocgege.shop$$$noproxy$$$1$$$./lib/wogg.json$$$LABI"},
+		"ext":"./lib/tokenm.json$$$http://tvpanpan.site$$$noproxy$$$1$$$./lib/wogg.json$$$LABI"},
 		{"key":"Moli","name":"🌾HDmoli|网盘","type":3,"api":"csp_Moli","quickSearch":1, "changeable":1, "filterable":1, "timeout":60, "ext":"./lib/tokenm.json$$$https://www.hdmoli.com/$$$noproxy$$$1$$$./lib/moli.json"},
 		{"key":"PanSearch","name":"🌾PanSearch|p g",
 		"type":3,
