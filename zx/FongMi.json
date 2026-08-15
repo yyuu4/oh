@@ -249,6 +249,20 @@
         "siteUrl": "https://4kzn.cc"
       }
     },
+	{
+      "key": "盘链",
+      "name": "网盘‖盘链",
+      "type": 3,
+      "api": "csp_PanLian",
+      "searchable": 1,
+      "changeable": 0,
+      "ext": {
+        "siteUrl": "https://pinglian.lol/",
+        "username": "raae",
+        "password": "kisser123",
+        "commonConfig": "./json/peizhi.json"
+      }
+    },
     {
       "key": "观影",
       "name": "网盘‖观影",
