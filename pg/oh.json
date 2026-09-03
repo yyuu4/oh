@@ -636,6 +636,7 @@
 		},
 		{"key":"Guazi","name":"🌾瓜子|App","type":3,"api":"csp_Guazi","quickSearch":1, "changeable":1, "filterable":1, "timeout":60, "ext":""},
 		{"key":"HongGuo","name":"🌾红果|短剧","type":3,"api":"csp_HongGuo","quickSearch":1, "changeable":1, "filterable":1, "timeout":60, "ext":""},
+		{"key":"HuangGuo","name":"🌾黄果|短剧","type":3,"api":"csp_HuangGuo","quickSearch":1, "changeable":1, "filterable":1, "timeout":60, "ext":""},
 		{"key":"WebDAV","name":"🌾WebDAV[jar]","type":3,"api":"csp_WebDAV","searchable":1,"filterable":1,"changeable":1,"timeout":60,
 			"playerType": 2,
 			"ext":"./lib/webdav.json"},
