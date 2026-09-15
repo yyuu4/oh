@@ -41,7 +41,7 @@
             {
             "name": "库佬永久",
             "type": 0,
-            "url": "https://live.445569.xyz/live.m3u",
+            "url": "https://iptv.445569.xyz/iptv.m3u",
             "logo": "http://127.0.0.1:9966/api/proxy/https://epg.112114.xyz/logo/{name}.png",
             "epg": "http://127.0.0.1:9966/api/proxyhttps://epg.112114.xyz/?ch={name}&date={date}"
         },
