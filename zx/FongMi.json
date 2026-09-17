@@ -351,7 +351,7 @@
       "changeable": 0,
       "ext": {
         "commonConfig": "./json/peizhi.json",
-        "siteUrl": "http://tv.yydsys.top/",
+        "siteUrl": "https://yydsys.de5.net",
         "filter": "./json/wogg.json"
       }
     },
@@ -380,7 +380,7 @@
       "changeable": 0,
       "ext": {
         "commonConfig": "./json/peizhi.json",
-        "siteUrl": "https://www.muou.asia/",
+        "siteUrl": "http://www.muoua.top/",
         "filter": "./json/wogg.json"
       }
     },
