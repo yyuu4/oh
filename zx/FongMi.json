@@ -365,8 +365,8 @@
         "ext": {
 	     "commonConfig": "./json/peizhi.json",
 		 "siteUrl": [
-	     "http://tvpanpan.site",
-	     "http://feimo.fun"
+	     "http://127.0.0.1:9966/api/proxy/http://xiaocgege.shop",
+	     "http://127.0.0.1:9966/api/proxy/http://feimo.fun"
 	   ], 
         "filter": "./json/wogg.json"
       }
