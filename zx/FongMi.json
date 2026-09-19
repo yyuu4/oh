@@ -384,6 +384,19 @@
         "filter": "./json/wogg.json"
       }
     },
+	  {
+      "key": "玩偶‖表哥",
+      "name": "玩偶‖表哥",
+      "type": 3,
+      "api": "csp_kongbai",
+      "searchable": 1,
+      "changeable": 0,
+      "ext": {
+        "commonConfig": "./json/peizhi.json",
+        "siteUrl": "http://xn--4yqy17f.xn--yi7aa.vip:3155",
+        "filter": "./json/wogg.json"
+      }
+    },
     {
       "key": "玩偶‖虎斑",
       "name": "玩偶‖虎斑",
