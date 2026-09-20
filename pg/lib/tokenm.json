@@ -94,5 +94,11 @@
 "pan189_password":"",
 "pan189_flags":"4kz",
 "baidu_cookie":"",
+"baidu_vod_flags":"1080P|720P|480P",
+"baidu_thread_limit":32,
+"guangya_access_token":"",
+"guangya_refresh_token":"",
+"guangya_vod_flags":"origin",
+"guangya_thread_limit":22,
 "uc_ut":""
 }
