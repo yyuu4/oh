@@ -432,7 +432,7 @@
       "changeable": 0,
       "ext": {
         "commonConfig": "./json/peizhi.json",
-        "siteUrl": ["https://woggpan.xxooo.cf","https://www.wogg.net","https://woggpan.888484.xyz","https://wogg.xxooo.cf"],
+        "siteUrl": ["https://www.wogg.live","https://www.wogg.net","https://woggpan.888484.xyz","https://wogg.xxooo.cf"],
         "filter": "./json/wogg.json"
       }
     },
