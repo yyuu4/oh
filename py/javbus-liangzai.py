@@ -1,4 +1,4 @@
-VERSION = "1.1.11"
+VERSION = "1.1.13"
 # -*- coding: utf-8 -*-
 import re
 import json
@@ -1251,13 +1251,16 @@ class Spider:
             if nm:
                 name = _clean_text(nm.group(1))
 
+            # 体积在第 2 列，形如「2.62GB」（数字和单位之间没空格），外面还包着 <a>
             size = ""
             sm = re.search(
-                r"<td[^>]*>([^<]*?(?:GB|MB|TB|KB)[^<]*?)</td>",
+                r"<td[^>]*>\s*<a[^>]*>\s*([\d]+(?:\.\d+)?)\s*(TB|GB|MB|KB)\s*</a>",
                 block, re.I
             )
+            if not sm:
+                sm = re.search(r"([\d]+(?:\.\d+)?)\s*(TB|GB|MB|KB)\b", block, re.I)
             if sm:
-                size = _clean_text(sm.group(1))
+                size = "%s %s" % (sm.group(1), sm.group(2).upper())
 
             out.append({
                 "name": name,
@@ -1265,20 +1268,7 @@ class Spider:
                 "magnet": magnet,
             })
 
-        def _size_key(g):
-            s = g.get("size") or ""
-            mm = re.search(r"([\d.]+)\s*(GB|MB|TB|KB)", s, re.I)
-            if not mm:
-                return 0
-            try:
-                n = float(mm.group(1))
-            except Exception:
-                return 0
-            unit = mm.group(2).upper()
-            mult = {"KB": 1.0 / 1024, "MB": 1.0, "GB": 1024.0, "TB": 1024.0 * 1024}.get(unit, 1.0)
-            return n * mult
-
-        out.sort(key=_size_key, reverse=True)
+        # 保持站点原始顺序（体积只是显示在标签里，用户自己挑）
         return out
 
     @staticmethod
