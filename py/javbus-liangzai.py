@@ -1,3 +1,4 @@
+VERSION = "1.1.11"
 # -*- coding: utf-8 -*-
 import re
 import json
@@ -19,27 +20,37 @@ except Exception:
     pass
 
 
-# 版本号
-VERSION = "1.1.6"
-
-# ↓↓↓ 代理开关（直连不通时改这里）↓↓↓
-#   ""            = 直连
-#   "7890"        = http://127.0.0.1:7890
-#   "http://1.2.3.4:7890" = 指定代理
-#   "off"         = 直连
-# 也可不改这里，改用站点 ext：{"proxy":"http://1.2.3.4:7890"}
+# ===========================================================================
+# 配置区 —— 一般只动下面两项
+# ===========================================================================
+# (1) 网页代理：只管「爬虫抓网页」，图片和播放地址由 App 自己去取，不受它影响
+#     ""                        = 直连
+#     "7890"                    = 自动补成 http://127.0.0.1:7890
+#     "http://1.2.3.4:7890"     = 指定代理（支持 http://user:pass@host:port）
+#     "off" / "none" / "直连"   = 直连
 PROXY = ""
-# ↑↑↑ 代理开关（直连不通时改这里）↑↑↑
 
-# 站点扩展参数示例（TVBox ext / init(extend) 传 JSON）：
+# (2) 图片反代：图片显示不出来时再开（默认关闭，直连能看图就不需要）
+#     实测：images.weserv.nl / wsrv.nl 已把本站域名拉黑
+#           （400 "Domain or TLD blocked by policy"，开了一张图都出不来）
+#           serveproxy.com 能取到，但只回 image/avif，TVBox 未必认
+#     所以要走反代就填自己的，两种写法都支持：
+#       "https://my-nginx/?u={url}"   ← {url} 模板（推荐）
+#       "https://my-nginx/?u="        ← 前缀式，原图 URL 会自动整体编码
+#     英文逗号分隔多个 → 不同图片分散到不同反代（同一张图始终走同一个，保证可缓存）
+IMG_PROXY = ""
+
+# 站点 ext（TVBox 源里 ext 字段传 JSON）可覆盖上面两项及其它开关：
 #   {
-#     "proxy": "7890",              # 直连不通时填代理端口，或 "127.0.0.1:7890" / "http://1.2.3.4:7890"；"" 或 "off" = 直连
-#     "host": "https://www.javbus.com",  # 固定域名（固定后不再自动探测）
-#     "existmag": "mag",            # all=全部影片 mag=已有磁力 online=僅線上
-#     "img": "https://img.example.com/?url=",  # 图片反代
+#     "proxy": "7890",                        # 同 PROXY
+#     "img":   "https://images.weserv.nl/?url=",  # 同 IMG_PROXY
+#     "host":  "https://www.javbus.com",      # 固定域名，不再自动探测
+#     "noProbe": true,                        # 不探测域名
+#     "existmag": "all",                      # all=全部影片 mag=已有磁力 online=僅線上
 #     "cookie": "", "lang": "zh",
 #     "enableMagnet": true, "enableUncensored": true
 #   }
+# 优先级：ext > 顶部 PROXY / IMG_PROXY
 
 # 候选域名：运行时自动探测，优先直连（不走代理），其次按延迟排序
 HOST_CANDIDATES = [
@@ -55,6 +66,15 @@ HOST = HOST_CANDIDATES[0]
 PAGE_SIZE = 30
 SEARCH_LIMIT = 30
 PROBE_TIMEOUT = 6
+
+# 网络抖动 / 临时 5xx 的重试
+HTTP_RETRY = 1
+HTTP_RETRY_DELAY = 0.5
+HTTP_RETRY_STATUS = (429, 500, 502, 503, 504)
+
+# 域名探测结果缓存时长（到期自动重测，避免首次没网就永远卡住）
+PROBE_TTL = 60
+PROBE_CACHE_MAX = 32
 
 WEB_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
           "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
@@ -324,6 +344,27 @@ def _norm_proxy(v):
 _HOST_PROBE_CACHE = {}
 
 
+def _stable_bucket(s, n):
+    """跨进程稳定的分桶。Python 内置 hash() 对字符串每次进程都不同，不能用于这里。"""
+    if n <= 1:
+        return 0
+    h = 0
+    for ch in _to_text(s):
+        h = (h * 131 + ord(ch)) & 0xFFFFFFFF
+    return h % n
+
+
+def _sanitize_play(v):
+    """TVBox 播放串用 # 分隔条目、$ 分隔「名称与地址」，值里出现这两个字符会被截断"""
+    if not v:
+        return v
+    return (_to_text(v)
+            .replace("#", "%23")
+            .replace("$", "%24")
+            .replace("\r", " ")
+            .replace("\n", " "))
+
+
 def _probe_host(base, use_env, timeout=PROBE_TIMEOUT, proxy=""):
     """探测单个域名。proxy 优先；use_env=False 表示不走系统/环境代理（直连）。"""
     if not requests:
@@ -357,11 +398,14 @@ def _probe_host(base, use_env, timeout=PROBE_TIMEOUT, proxy=""):
 
 
 def pick_host(candidates=None, proxy=""):
-    """选域名：配置了代理就全走代理；否则免代理 > 最快。"""
+    """选域名：配置了代理就全走代理；否则免代理 > 最快。结果缓存 PROBE_TTL 秒。"""
     cands = [c.rstrip("/") for c in (candidates or HOST_CANDIDATES)]
     key = (tuple(cands), proxy)
-    if key in _HOST_PROBE_CACHE:
-        return _HOST_PROBE_CACHE[key]
+    hit = _HOST_PROBE_CACHE.get(key)
+    if hit:
+        host, ts = hit
+        if time.time() - ts < PROBE_TTL:
+            return host
     if not cands or not requests:
         return None
 
@@ -386,8 +430,11 @@ def pick_host(candidates=None, proxy=""):
     except Exception:
         best = None
 
+    # 失败（None）也缓存，但靠 TTL 自动重试，不会一次没网就永久卡死
     host = best[2] if best else None
-    _HOST_PROBE_CACHE[key] = host
+    if len(_HOST_PROBE_CACHE) >= PROBE_CACHE_MAX:
+        _HOST_PROBE_CACHE.clear()
+    _HOST_PROBE_CACHE[key] = (host, time.time())
     return host
 
 
@@ -404,7 +451,8 @@ class Spider:
         # 默认全部影片；可切「已有磁力」
         self.existmag = EXISTMAG_ALL
         self.cookie = ""
-        self.img_proxy = ""
+        # 图片反代：默认取顶部 IMG_PROXY，也可用站点 ext 覆盖（见文件顶部注释）
+        self.img_proxy = IMG_PROXY
         # 代理：默认取顶部 PROXY，也可用站点 ext 覆盖（见文件顶部注释）
         self.proxy = PROXY
         self.lang = "zh"
@@ -418,6 +466,8 @@ class Spider:
         if requests:
             self.s = requests.Session()
             self.s.headers.update(LIST_HEADERS)
+            # 立即应用顶部 PROXY，只填第 31 行即可生效
+            self._apply_proxy()
 
     def getDependence(self):
         return []
@@ -463,6 +513,9 @@ class Spider:
         elif "proxyPort" in extend or "proxy_port" in extend:
             self.set_proxy(extend.get("proxyPort") or extend.get("proxy_port"))
 
+        # 无论 ext 是否带 proxy，都把当前代理挂到会话（顶部 PROXY 也在此生效）
+        self._apply_proxy()
+
         # 自动选域名：配置了代理全走代理，否则免代理 > 最快
         self._ensure_host()
 
@@ -494,10 +547,12 @@ class Spider:
         """探测候选域名并选一个：有代理走代理，否则免代理 > 最快"""
         if self._host_locked or self._probed:
             return
-        self._probed = True
+        # 只有真的选到域名才算「探测过」；失败靠 pick_host 的 TTL 缓存自愈，
+        # 否则一次没网就会把这个实例永远锁死在默认域名上
         host = pick_host(proxy=self.proxy)
         if host:
             self.host = host
+            self._probed = True
 
     # ========== 首页分类 ==========
     def homeContent(self, filter=None):
@@ -676,7 +731,9 @@ class Spider:
         return gid
 
     def homeVideoContent(self):
-        return {"list": []}
+        # 首页直接展示有碼最新影片（App 调到才发请求）
+        self._ensure_host()
+        return self._list_page(self.host + "/", 1, None)
 
     # ========== 分类内容 ==========
     def categoryContent(self, tid, pg=1, filter=None, extend=None):
@@ -1179,7 +1236,7 @@ class Spider:
             am = re.search(r'href="(magnet:[^"]+)"', block)
             if not am:
                 continue
-            magnet = am.group(1).replace("&amp;", "&")
+            magnet = _sanitize_play(am.group(1).replace("&amp;", "&"))
 
             hm = re.search(r"btih:([0-9a-fA-F]{40}|[0-9a-zA-Z]{32})", magnet)
             if not hm:
@@ -1229,20 +1286,29 @@ class Spider:
         raw = _to_text(g.get("name")) or num or ("资源%d" % (i + 1))
         safe = re.sub(r"[$#&\n\r\t]", " ", raw).strip()[:40]
         parts = [safe]
-        if g.get("size"):
-            parts.append(g["size"])
+        size = g.get("size")
+        if size:
+            parts.append(_sanitize_play(size))
         return " ".join(parts) or ("资源%d" % (i + 1))
 
     def _proxy_pic(self, url):
+        """图片反代：支持前缀式 和 {url} 模板式，多个用逗号分隔时按图片稳定分散"""
         if not url:
             return ""
-        p = (self.img_proxy or "").strip()
-        if not p:
+        raw = (self.img_proxy or "").strip()
+        if not raw:
+            return url
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        if not parts:
             return url
         try:
-            return p + quote(url, safe="")
+            enc = quote(url, safe="")
         except Exception:
             return url
+        p = parts[0] if len(parts) == 1 else parts[_stable_bucket(url, len(parts))]
+        if "{url}" in p:
+            return p.replace("{url}", enc)
+        return p + enc
 
     # ========== 搜索 ==========
     def searchContent(self, key, quick=False, pg="1"):
@@ -1255,15 +1321,18 @@ class Spider:
         seen = set()
         out = []
         has_next = False
-        urls = [
-            "%s/search/%s&type=&parent=ce" % (self.host, quote(keyword)),
+        # 分页格式：/search/KEY/2（Wayback 存档已确认）；页码拼在整条路径后面
+        bases = [
+            "%s/search/%s&type=&parent=ce" % (self.host, quote(keyword, safe="")),
         ]
         if self.enable_uncensored:
-            urls.append(
-                "%s/uncensored/search/%s&type=0&parent=uc" % (self.host, quote(keyword))
+            bases.append(
+                "%s/uncensored/search/%s&type=0&parent=uc"
+                % (self.host, quote(keyword, safe=""))
             )
 
-        for u in urls:
+        for base in bases:
+            u = base if page <= 1 else "%s/%d" % (base, page)
             try:
                 text = self._get_html(u)
             except Exception:
@@ -1280,7 +1349,7 @@ class Spider:
             "list": out,
             "page": page,
             "pagecount": page + 1 if has_next else page,
-            "limit": self.search_limit,
+            "limit": len(out) or self.search_limit,
             "total": len(out),
         }
 
@@ -1343,6 +1412,11 @@ class Spider:
         return {}
 
     def destroy(self):
+        try:
+            if self.s is not None:
+                self.s.close()
+        except Exception:
+            pass
         return None
 
     def _headers(self, extra=None):
@@ -1360,7 +1434,13 @@ class Spider:
 
     @staticmethod
     def _is_age_gate(text):
-        return bool(text) and "我已經成年" in text and 'id="ageVerify"' in text
+        if not text:
+            return False
+        # 任一标识命中即视为年龄墙（站点改文案/改属性顺序时仍能识别）
+        if "我已經成年" not in text and "ageVerify" not in text:
+            return False
+        # 年龄墙是整页弹窗；正常页面即使残留同名节点也必带影片内容
+        return "movie-box" not in text
 
     def _pass_age_verify(self, resp, url, headers=None):
         """年龄验证是一个 POST 表单（name=Submit value=確認），自动提交通过"""
@@ -1389,10 +1469,24 @@ class Spider:
     def _get_html(self, url, headers=None, _age=True):
         if not requests or self.s is None:
             raise RuntimeError("requests 不可用")
-        r = self.s.get(url, headers=self._headers(headers),
-                       timeout=self.timeout, verify=self.verify)
-        r.encoding = "utf-8"
-        text = r.text or ""
-        if _age and self._is_age_gate(text) and self._pass_age_verify(r, url, headers):
-            return self._get_html(url, headers=headers, _age=False)
-        return text
+        last_err = None
+        for attempt in range(HTTP_RETRY + 1):
+            if attempt:
+                time.sleep(HTTP_RETRY_DELAY * attempt)
+            try:
+                r = self.s.get(url, headers=self._headers(headers),
+                               timeout=self.timeout, verify=self.verify)
+            except Exception as e:
+                last_err = e
+                continue
+            # 临时性错误码重试；重试用尽后仍返回正文，交给上层解析
+            if r.status_code in HTTP_RETRY_STATUS and attempt < HTTP_RETRY:
+                continue
+            r.encoding = "utf-8"
+            text = r.text or ""
+            if _age and self._is_age_gate(text) and self._pass_age_verify(r, url, headers):
+                return self._get_html(url, headers=headers, _age=False)
+            return text
+        if last_err is not None:
+            raise last_err
+        return ""
