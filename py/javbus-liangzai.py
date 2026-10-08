@@ -20,7 +20,16 @@ except Exception:
 
 
 # 版本号
-VERSION = "1.1.5"
+VERSION = "1.1.6"
+
+# ↓↓↓ 代理开关（直连不通时改这里）↓↓↓
+#   ""            = 直连
+#   "7890"        = http://127.0.0.1:7890
+#   "http://1.2.3.4:7890" = 指定代理
+#   "off"         = 直连
+# 也可不改这里，改用站点 ext：{"proxy":"http://1.2.3.4:7890"}
+PROXY = ""
+# ↑↑↑ 代理开关（直连不通时改这里）↑↑↑
 
 # 站点扩展参数示例（TVBox ext / init(extend) 传 JSON）：
 #   {
@@ -396,8 +405,8 @@ class Spider:
         self.existmag = EXISTMAG_ALL
         self.cookie = ""
         self.img_proxy = ""
-        # 代理（直连不通时填端口/地址），例："7890"、"127.0.0.1:7890"、"http://127.0.0.1:7890"
-        self.proxy = ""
+        # 代理：默认取顶部 PROXY，也可用站点 ext 覆盖（见文件顶部注释）
+        self.proxy = PROXY
         self.lang = "zh"
         self.verify = False
 
