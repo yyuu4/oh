@@ -1,23 +1,38 @@
 # -*- coding: utf-8 -*-
-import os
 import re
 import json
 import time
 import html as _html
-from urllib.parse import quote, unquote, urljoin
+import warnings
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import quote, urljoin
 
 try:
     import requests
 except ImportError:
     requests = None
 
+try:
+    from urllib3.exceptions import InsecureRequestWarning
+    warnings.simplefilter("ignore", InsecureRequestWarning)
+except Exception:
+    pass
 
-HOST = "https://www.buscdn.casa"
-HOST_UC = HOST + "/uncensored"
-IMG_HOST = HOST
+
+# 候选域名：运行时自动探测，优先直连（不走代理），其次按延迟排序
+HOST_CANDIDATES = [
+    "https://www.javbus.com",
+    "https://www.busfan.casa",
+    "https://www.javbus.casa",
+    "https://www.cdnbus.casa",
+    "https://www.buscdn.casa",
+]
+
+HOST = HOST_CANDIDATES[0]
 
 PAGE_SIZE = 30
 SEARCH_LIMIT = 30
+PROBE_TIMEOUT = 6
 
 WEB_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
           "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
@@ -30,12 +45,14 @@ LIST_HEADERS = {
 }
 
 AJAX_HEADERS = {
-    "User-Agent": WEB_UA,
     "Accept": "text/html, */*; q=0.01",
-    "Accept-Language": "zh-CN,zh;q=0.9,ja;q=0.8,en;q=0.7",
     "X-Requested-With": "XMLHttpRequest",
-    "Referer": HOST + "/",
 }
+
+# 站点「已有磁力 / 全部影片」开关（cookie: existmag），默认全部影片
+EXISTMAG_ALL = "all"
+EXISTMAG_MAG = "mag"
+EXISTMAG_ONLINE = "online"
 
 JAVBUS_CLASSES = [
     {"type_id": "jav_home",               "type_name": "有碼"},
@@ -205,22 +222,8 @@ BUILTIN_GENRE_GROUPS = {
 STAR_FILTER_LIMIT = 50
 
 
-def _env(name, default=""):
-    try:
-        return os.environ.get(name, default) or default
-    except Exception:
-        return default
-
-
 def _to_text(v):
     return str(v or "").strip()
-
-
-def _safe_json(text, fallback=None):
-    try:
-        return json.loads(str(text or ""))
-    except Exception:
-        return fallback if fallback is not None else {}
 
 
 def _safe_int(v, default=0):
@@ -268,27 +271,107 @@ def _extract_id(url):
     return m.group(1) if m else ""
 
 
+def _mag_filter():
+    """磁力筛选：默认全部影片"""
+    return {
+        "key": "existmag",
+        "name": "磁力",
+        "init": EXISTMAG_ALL,
+        "value": [
+            {"n": "全部影片", "v": EXISTMAG_ALL},
+            {"n": "已有磁力", "v": EXISTMAG_MAG},
+            {"n": "僅線上", "v": EXISTMAG_ONLINE},
+        ],
+    }
+
+
+_HOST_PROBE_CACHE = {}
+
+
+def _probe_host(base, use_env, timeout=PROBE_TIMEOUT):
+    """探测单个域名。use_env=False 表示不走系统/环境代理（直连）。"""
+    if not requests:
+        return None
+    s = requests.Session()
+    s.trust_env = bool(use_env)
+    s.headers.update(LIST_HEADERS)
+    s.headers["Referer"] = base + "/"
+    t0 = time.time()
+    try:
+        r = s.get(base + "/", timeout=timeout, verify=False, allow_redirects=True)
+        r.encoding = "utf-8"
+        text = r.text or ""
+    except Exception:
+        return None
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+    cost = time.time() - t0
+    if not text:
+        return None
+    if not any(k in text for k in ("movie-box", "ageVerify", "existmag", "JavBus")):
+        return None
+    return cost
+
+
+def pick_host(candidates=None):
+    """选域名：优先不需要代理的直连，其次按响应时间排序。"""
+    cands = [c.rstrip("/") for c in (candidates or HOST_CANDIDATES)]
+    key = tuple(cands)
+    if key in _HOST_PROBE_CACHE:
+        return _HOST_PROBE_CACHE[key]
+    if not cands or not requests:
+        return None
+
+    best = None
+    args = [(u, False) for u in cands] + [(u, True) for u in cands]
+
+    def task(arg):
+        base, use_env = arg
+        cost = _probe_host(base, use_env)
+        if cost is None:
+            return None
+        return (0 if not use_env else 1, cost, base)
+
+    try:
+        with ThreadPoolExecutor(max_workers=len(args)) as ex:
+            for res in ex.map(task, args):
+                if res and (best is None or res < best):
+                    best = res
+    except Exception:
+        best = None
+
+    host = best[2] if best else None
+    _HOST_PROBE_CACHE[key] = host
+    return host
+
+
 class Spider:
     def __init__(self):
-        self.s = self.session = self.sess = None
+        self.s = None
         self.host = HOST
-        self.host_uc = HOST_UC
-        self.img_host = IMG_HOST
         self.ua = WEB_UA
         self.timeout = 15
         self.page_size = PAGE_SIZE
         self.search_limit = SEARCH_LIMIT
         self.enable_magnet = True
         self.enable_uncensored = True
+        # 默认全部影片；可切「已有磁力」
+        self.existmag = EXISTMAG_ALL
         self.cookie = ""
         self.img_proxy = ""
         self.lang = "zh"
+        self.verify = False
 
         # filters / 默认值缓存
         self._cache_filters = {}
+        self._host_locked = False
+        self._probed = False
 
         if requests:
-            self.s = self.session = self.sess = requests.Session()
+            self.s = requests.Session()
             self.s.headers.update(LIST_HEADERS)
 
     def getDependence(self):
@@ -305,8 +388,9 @@ class Spider:
 
         if extend.get("host"):
             self.host = str(extend["host"]).rstrip("/")
-            self.host_uc = self.host + "/uncensored"
-            self.img_host = self.host
+            self._host_locked = True
+        if extend.get("noProbe"):
+            self._host_locked = True
         if extend.get("img") or extend.get("imgProxy"):
             self.img_proxy = str(extend.get("img") or extend.get("imgProxy") or "").strip()
         if extend.get("cookie"):
@@ -318,11 +402,35 @@ class Spider:
         if "enableUncensored" in extend:
             self.enable_uncensored = bool(extend["enableUncensored"])
 
+        # 磁力筛选，默认全部影片
+        if "existmag" in extend:
+            self.existmag = _to_text(extend.get("existmag")) or EXISTMAG_ALL
+        elif "onlyMagnet" in extend:
+            self.existmag = EXISTMAG_MAG if bool(extend.get("onlyMagnet")) else EXISTMAG_ALL
+        elif "hasMagnet" in extend:
+            self.existmag = EXISTMAG_MAG if bool(extend.get("hasMagnet")) else EXISTMAG_ALL
+        if self.existmag not in (EXISTMAG_ALL, EXISTMAG_MAG, EXISTMAG_ONLINE):
+            self.existmag = EXISTMAG_ALL
+
+        # 自动选域名：直连（不走代理）优先，其次按响应时间
+        self._ensure_host()
+
         # 清空缓存
         self._cache_filters = {}
 
+    def _ensure_host(self):
+        """探测候选域名并选一个：免代理 > 最快"""
+        if self._host_locked or self._probed:
+            return
+        self._probed = True
+        host = pick_host()
+        if host:
+            self.host = host
+
     # ========== 首页分类 ==========
     def homeContent(self, filter=None):
+        self._ensure_host()
+
         classes = []
         for c in JAVBUS_CLASSES:
             if c["type_id"] in ("jav_uncensored", "jav_uncensored_genre",
@@ -333,14 +441,18 @@ class Spider:
         filters = {}
         for c in classes:
             tid = c["type_id"]
+            fs = []
             if tid == "jav_genre":
-                filters[tid] = self._build_genre_filters(self.host + "/genre")
+                fs = self._build_genre_filters(self.host + "/genre")
             elif tid == "jav_uncensored_genre":
-                filters[tid] = self._build_genre_filters(self.host + "/uncensored/genre")
+                fs = self._build_genre_filters(self.host + "/uncensored/genre")
             elif tid == "jav_actress":
-                filters[tid] = self._build_star_filters(self.host + "/actresses")
+                fs = self._build_star_filters(self.host + "/actresses")
             elif tid == "jav_uncensored_actress":
-                filters[tid] = self._build_star_filters(self.host + "/uncensored/actresses")
+                fs = self._build_star_filters(self.host + "/uncensored/actresses")
+            fs = list(fs)
+            fs.append(_mag_filter())
+            filters[tid] = fs
         return {"class": classes, "filters": filters}
 
     # ---------- 类别筛选 ----------
@@ -425,6 +537,7 @@ class Spider:
         try:
             text = self._get_html(index_url)
         except Exception:
+            self._cache_filters[cache_key] = []
             return []
 
         values = [{"n": "全部", "v": ""}]
@@ -461,48 +574,33 @@ class Spider:
         return out
 
     # ---------- 默认值（点分类未选筛选时用） ----------
+    @staticmethod
+    def _first_filter_value(filters):
+        """从已构建的筛选里取第一个非空 value（复用缓存，不再重复请求）"""
+        for f in filters or []:
+            for v in f.get("value") or []:
+                val = _to_text(v.get("v")) if isinstance(v, dict) else ""
+                if val:
+                    return val
+        return ""
+
     def _get_default_genre(self, index_url):
-        """取类别页第一个类别作为默认"""
+        """取类别页第一个类别作为默认（复用 _build_genre_filters 的结果）"""
         cache_key = "default_genre:" + index_url
         if cache_key in self._cache_filters:
             return self._cache_filters[cache_key]
-
-        try:
-            text = self._get_html(index_url)
-            groups = self._parse_genre_groups(text)
-        except Exception:
-            groups = []
-        if not groups:
-            groups = self._builtin_genre_groups(index_url)
-
-        for gname, items in groups:
-            if items:
-                gid = items[0]["gid"]
-                self._cache_filters[cache_key] = gid
-                return gid
-        return ""
+        gid = self._first_filter_value(self._build_genre_filters(index_url))
+        self._cache_filters[cache_key] = gid
+        return gid
 
     def _get_default_star(self, index_url):
-        """取女优页第一个女优作为默认"""
+        """取女优页第一个女优作为默认（复用 _build_star_filters 的结果）"""
         cache_key = "default_star:" + index_url
         if cache_key in self._cache_filters:
             return self._cache_filters[cache_key]
-
-        try:
-            text = self._get_html(index_url)
-        except Exception:
-            return ""
-
-        for m in re.finditer(
-            r'<a[^>]+class="[^"]*avatar-box[^"]*"[^>]+href="([^"]+)"',
-            text
-        ):
-            href = _fix_url(m.group(1), self.host)
-            sid = _extract_id(href)
-            if sid:
-                self._cache_filters[cache_key] = sid
-                return sid
-        return ""
+        sid = self._first_filter_value(self._build_star_filters(index_url))
+        self._cache_filters[cache_key] = sid
+        return sid
 
     def homeVideoContent(self):
         return {"list": []}
@@ -515,6 +613,7 @@ class Spider:
         # 解析筛选
         genre_sel = {}
         star_sel = {}
+        mag = ""
         for src in (filter, extend):
             if isinstance(src, dict):
                 for k, v in src.items():
@@ -526,114 +625,153 @@ class Spider:
                         genre_sel[v] = True
                     elif k == "star":
                         star_sel[v] = True
+                    elif k == "existmag":
+                        mag = v
+        hdr = self._mag_headers(mag)
 
         # 有码首页
         if t == "jav_home":
             if page <= 1:
-                return self._list_page(self.host + "/", page)
-            return self._list_page(self.host + "/page/%d" % page, page)
+                return self._list_page(self.host + "/", page, hdr)
+            return self._list_page(self.host + "/page/%d" % page, page, hdr)
 
         # 无码首页
         if t == "jav_uncensored":
             if page <= 1:
-                return self._list_page(self.host + "/uncensored", page)
-            return self._list_page(self.host + "/uncensored/page/%d" % page, page)
+                return self._list_page(self.host + "/uncensored", page, hdr)
+            return self._list_page(self.host + "/uncensored/page/%d" % page, page, hdr)
 
-        # 有码类别：选筛选 → 对应类别；否则 → 第一个默认类别
+        # 有码类别：选筛选 → 对应类别（支持多选 a-b-c）；否则 → 第一个默认类别
         if t == "jav_genre":
-            if len(genre_sel) == 1:
-                gid = list(genre_sel.keys())[0]
-                return self._category_list(self.host + "/genre", gid, page)
+            if genre_sel:
+                return self._category_list(
+                    self.host + "/genre", "-".join(genre_sel.keys()), page, hdr)
             default_gid = self._get_default_genre(self.host + "/genre")
             if default_gid:
-                return self._category_list(self.host + "/genre", default_gid, page)
+                return self._category_list(self.host + "/genre", default_gid, page, hdr)
             if page <= 1:
-                return self._list_page(self.host + "/", page)
-            return self._list_page(self.host + "/page/%d" % page, page)
+                return self._list_page(self.host + "/", page, hdr)
+            return self._list_page(self.host + "/page/%d" % page, page, hdr)
 
-        # 无码类别：选筛选 → 对应类别；否则 → 第一个默认类别
+        # 无码类别：选筛选 → 对应类别（支持多选 a-b-c）；否则 → 第一个默认类别
         if t == "jav_uncensored_genre":
-            if len(genre_sel) == 1:
-                gid = list(genre_sel.keys())[0]
-                return self._category_list(self.host + "/uncensored/genre", gid, page)
+            if genre_sel:
+                return self._category_list(
+                    self.host + "/uncensored/genre", "-".join(genre_sel.keys()), page, hdr)
             default_gid = self._get_default_genre(self.host + "/uncensored/genre")
             if default_gid:
-                return self._category_list(self.host + "/uncensored/genre", default_gid, page)
+                return self._category_list(
+                    self.host + "/uncensored/genre", default_gid, page, hdr)
             if page <= 1:
-                return self._list_page(self.host + "/uncensored", page)
-            return self._list_page(self.host + "/uncensored/page/%d" % page, page)
+                return self._list_page(self.host + "/uncensored", page, hdr)
+            return self._list_page(self.host + "/uncensored/page/%d" % page, page, hdr)
 
         # 有码女优：选女优 → 该女优影片；否则 → 第一个默认女优
         if t == "jav_actress":
-            if len(star_sel) == 1:
-                sid = list(star_sel.keys())[0]
-                return self._star_list(self.host + "/star", sid, page)
+            if star_sel:
+                return self._star_list(
+                    self.host + "/star", next(iter(star_sel)), page, hdr)
             default_sid = self._get_default_star(self.host + "/actresses")
             if default_sid:
-                return self._star_list(self.host + "/star", default_sid, page)
+                return self._star_list(self.host + "/star", default_sid, page, hdr)
             if page <= 1:
-                return self._list_page(self.host + "/", page)
-            return self._list_page(self.host + "/page/%d" % page, page)
+                return self._list_page(self.host + "/", page, hdr)
+            return self._list_page(self.host + "/page/%d" % page, page, hdr)
 
         # 无码女优：选女优 → 该女优影片；否则 → 第一个默认女优
         if t == "jav_uncensored_actress":
-            if len(star_sel) == 1:
-                sid = list(star_sel.keys())[0]
-                return self._star_list(self.host + "/uncensored/star", sid, page)
+            if star_sel:
+                return self._star_list(
+                    self.host + "/uncensored/star", next(iter(star_sel)), page, hdr)
             default_sid = self._get_default_star(self.host + "/uncensored/actresses")
             if default_sid:
-                return self._star_list(self.host + "/uncensored/star", default_sid, page)
+                return self._star_list(
+                    self.host + "/uncensored/star", default_sid, page, hdr)
             if page <= 1:
-                return self._list_page(self.host + "/uncensored", page)
-            return self._list_page(self.host + "/uncensored/page/%d" % page, page)
+                return self._list_page(self.host + "/uncensored", page, hdr)
+            return self._list_page(
+                self.host + "/uncensored/page/%d" % page, page, hdr)
 
         # 具体类别页
         if t.startswith("jav_genre_"):
             gid = t[len("jav_genre_"):]
-            return self._category_list(self.host + "/genre", gid, page)
+            return self._category_list(self.host + "/genre", gid, page, hdr)
 
         if t.startswith("jav_uc_genre_"):
             gid = t[len("jav_uc_genre_"):]
-            return self._category_list(self.host + "/uncensored/genre", gid, page)
+            return self._category_list(self.host + "/uncensored/genre", gid, page, hdr)
 
         # 具体女优页
         if t.startswith("jav_star_"):
             sid = t[len("jav_star_"):]
-            return self._star_list(self.host + "/star", sid, page)
+            return self._star_list(self.host + "/star", sid, page, hdr)
 
         if t.startswith("jav_uc_star_"):
             sid = t[len("jav_uc_star_"):]
-            return self._star_list(self.host + "/uncensored/star", sid, page)
+            return self._star_list(self.host + "/uncensored/star", sid, page, hdr)
 
         return {"list": [], "page": page, "pagecount": 1,
                 "limit": self.page_size, "total": 0}
 
-    def _category_list(self, base, gid, page):
+    def _mag_headers(self, mag):
+        """按筛选覆盖 existmag cookie；与全局一致时不覆盖"""
+        mag = _to_text(mag)
+        if not mag or mag == self.existmag:
+            return None
+        parts = ["existmag=" + mag]
+        if self.cookie:
+            parts.append(self.cookie)
+        return {"Cookie": "; ".join(parts)}
+
+    def _category_list(self, base, gid, page, hdr=None):
         """类别列表页：/genre/xxx 或 /genre/xxx/2"""
         if page <= 1:
             url = "%s/%s" % (base.rstrip("/"), gid)
         else:
             url = "%s/%s/%d" % (base.rstrip("/"), gid, page)
-        return self._list_page(url, page)
+        return self._list_page(url, page, hdr)
 
-    def _star_list(self, base, sid, page):
+    def _star_list(self, base, sid, page, hdr=None):
         """女优列表页：/star/xxx 或 /star/xxx/2"""
         if page <= 1:
             url = "%s/%s" % (base.rstrip("/"), sid)
         else:
             url = "%s/%s/%d" % (base.rstrip("/"), sid, page)
-        return self._list_page(url, page)
+        return self._list_page(url, page, hdr)
 
     # ========== 列表页解析 ==========
-    def _list_page(self, url, page):
-        seen = set()
-        out = []
-        try:
-            text = self._get_html(url)
-        except Exception:
-            return {"list": [], "page": page, "pagecount": 1,
-                    "limit": self.page_size, "total": 0}
+    @staticmethod
+    def _parse_tags(block):
+        """取 item-tag 里的标记（高清 / 前日新種 …，即磁力可用性提示）"""
+        tags = []
+        m = re.search(
+            r'<div[^>]+class="[^"]*item-tag[^"]*"[^>]*>(.*?)</div>', block, re.S
+        )
+        if not m:
+            return tags
+        for t in re.findall(r"<button[^>]*>([^<]+)</button>", m.group(1)):
+            t = _clean_text(t)
+            if t and t not in tags:
+                tags.append(t)
+        return tags
 
+    @staticmethod
+    def _has_next_page(text, page):
+        if re.search(r'<a[^>]+id="next"[^>]+href="[^"]+"', text):
+            return True
+        pag = re.search(
+            r'<ul[^>]+class="[^"]*pagination[^"]*"[^>]*>(.*?)</ul>', text, re.S
+        )
+        if not pag:
+            return False
+        nums = [_safe_int(x) for x in re.findall(r'href="[^"]*?/(\d+)"', pag.group(1))]
+        nums = [n for n in nums if n > 0]
+        return bool(nums) and max(nums) > page
+
+    def _parse_movie_boxes(self, text):
+        """解析所有 movie-box 条目（列表页 / 搜索页共用）"""
+        out = []
+        seen = set()
         for m in re.finditer(
             r'<a[^>]+class="[^"]*movie-box[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
             text, re.S
@@ -667,29 +805,26 @@ class Spider:
                     continue
                 seen.add(vid)
 
+                remarks = " ".join([x for x in [num] + self._parse_tags(block) if x])
                 out.append({
                     "vod_id": vid,
                     "vod_name": title or num or vid,
-                    "vod_pic": pic,
-                    "vod_remarks": num or "",
+                    "vod_pic": self._proxy_pic(pic),
+                    "vod_remarks": remarks,
                 })
             except Exception:
                 continue
+        return out
 
-        has_next = bool(re.search(r'<a[^>]+id="next"[^>]+href="[^"]+"', text))
-        if not has_next:
-            pag = re.search(
-                r'<ul[^>]+class="[^"]*pagination[^"]*"[^>]*>(.*?)</ul>',
-                text, re.S
-            )
-            if pag:
-                nums = [
-                    _safe_int(x)
-                    for x in re.findall(r'href="[^"]*?/(\d+)"', pag.group(1))
-                ]
-                nums = [n for n in nums if n > 0]
-                if nums and max(nums) > page:
-                    has_next = True
+    def _list_page(self, url, page, hdr=None):
+        try:
+            text = self._get_html(url, headers=hdr)
+        except Exception:
+            return {"list": [], "page": page, "pagecount": 1,
+                    "limit": self.page_size, "total": 0}
+
+        out = self._parse_movie_boxes(text)
+        has_next = self._has_next_page(text, page)
 
         return {
             "list": out,
@@ -770,10 +905,34 @@ class Spider:
             )
         actors = [_clean_text(a) for a in actors if a]
 
-        genres = re.findall(r'<a href="[^"]*genre/[^"]+">([^<]+)</a>', text)
-        genres = [_clean_text(g) for g in genres if g]
+        # 类别：优先取勾选框 gr_sel（唯一代表本片类别），避免命中导航里的 genre/hd
+        genres = []
         seen_g = set()
-        genres = [g for g in genres if not (g in seen_g or seen_g.add(g))]
+        for gm in re.finditer(
+            r'name="gr_sel"[^>]*value="([^"]*)"[^>]*>\s*'
+            r'<a href="[^"]*?/genre/([^"]+)">([^<]+)</a>',
+            text
+        ):
+            gname = _clean_text(gm.group(3))
+            gid = gm.group(2)
+            if not gname or gid in seen_g:
+                continue
+            seen_g.add(gid)
+            genres.append(gname)
+        if not genres:
+            # 兜底：只在正文区（</nav> 之后、抽屉菜单之前）找类别链接，排除导航
+            body = text
+            n0 = body.find("</nav>")
+            if n0 > 0:
+                body = body[n0 + 6:]
+            n1 = body.find('class="overlay')
+            if n1 > 0:
+                body = body[:n1]
+            for g in re.findall(r'<a href="[^"]*?/genre/[^"]+">([^<]+)</a>', body):
+                g = _clean_text(g)
+                if g and g not in seen_g:
+                    seen_g.add(g)
+                    genres.append(g)
 
         info_lines = []
         if num:
@@ -805,9 +964,17 @@ class Spider:
                 froms.append("磁力")
                 urls.append("#".join(eps))
 
+        # 标题去重：页面 <title> 本身通常已带番号
+        vod_name = _to_text(title)
+        if num and vod_name:
+            if not vod_name.startswith(num):
+                vod_name = (num + " " + vod_name).strip()
+        elif num:
+            vod_name = num
+
         item = {
             "vod_id": vid,
-            "vod_name": (num + " " + title).strip(),
+            "vod_name": vod_name or vid,
             "vod_pic": pic,
             "vod_year": (date or "")[:4],
             "vod_actor": "、".join(actors),
@@ -934,6 +1101,7 @@ class Spider:
 
         seen = set()
         out = []
+        has_next = False
         urls = [
             "%s/search/%s&type=&parent=ce" % (self.host, quote(keyword)),
         ]
@@ -947,47 +1115,18 @@ class Spider:
                 text = self._get_html(u)
             except Exception:
                 continue
-            for m in re.finditer(
-                r'<a[^>]+class="[^"]*movie-box[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
-                text, re.S
-            ):
-                try:
-                    href = _fix_url(m.group(1), self.host)
-                    block = m.group(2)
-                    img = re.search(
-                        r'<img[^>]*(?:src|data-src|data-original)=["\']([^"\']+)',
-                        block, re.I
-                    )
-                    pic = _fix_url(img.group(1), self.host) if img else ""
-                    title = ""
-                    tm = re.search(r'<img[^>]+title="([^"]+)"', block, re.I)
-                    if tm:
-                        title = _clean_text(tm.group(1))
-                    if not title:
-                        tm = re.search(r"<span>([^<]+)", block)
-                        if tm:
-                            title = _clean_text(tm.group(1))
-                    num = ""
-                    dates = re.findall(r"<date>([^<]+)</date>", block)
-                    if dates:
-                        num = _clean_text(dates[0])
-                    vid = _extract_id(href)
-                    if not vid or vid in seen:
-                        continue
-                    seen.add(vid)
-                    out.append({
-                        "vod_id": vid,
-                        "vod_name": title or num or vid,
-                        "vod_pic": pic,
-                        "vod_remarks": num or "",
-                    })
-                except Exception:
+            has_next = has_next or self._has_next_page(text, page)
+            for it in self._parse_movie_boxes(text):
+                vid = _to_text(it.get("vod_id"))
+                if not vid or vid in seen:
                     continue
+                seen.add(vid)
+                out.append(it)
 
         return {
             "list": out,
             "page": page,
-            "pagecount": page + 1 if len(out) >= self.search_limit else page,
+            "pagecount": page + 1 if has_next else page,
             "limit": self.search_limit,
             "total": len(out),
         }
@@ -1045,14 +1184,49 @@ class Spider:
         h["Referer"] = self.host + "/"
         if self.cookie:
             h["Cookie"] = self.cookie
+        # 站点「已有磁力 / 全部影片」开关，默认全部影片
+        if self.existmag and "existmag=" not in (h.get("Cookie") or ""):
+            prefix = (h["Cookie"] + "; ") if h.get("Cookie") else ""
+            h["Cookie"] = prefix + "existmag=" + self.existmag
         if extra:
             h.update(extra)
         return h
 
-    def _get_html(self, url, headers=None):
+    @staticmethod
+    def _is_age_gate(text):
+        return bool(text) and "我已經成年" in text and 'id="ageVerify"' in text
+
+    def _pass_age_verify(self, resp, url, headers=None):
+        """年龄验证是一个 POST 表单（name=Submit value=確認），自动提交通过"""
+        if not requests or self.s is None:
+            return False
+        targets = []
+        final = _to_text(getattr(resp, "url", ""))
+        if final:
+            targets.append(final)
+        if url and url not in targets:
+            targets.append(url)
+        base = self._headers(headers)
+        for t in targets:
+            try:
+                r = self.s.post(t, data={"Submit": "確認"}, headers=base,
+                                timeout=self.timeout, verify=self.verify,
+                                allow_redirects=True)
+                r.encoding = "utf-8"
+                body = r.text or ""
+                if body and not self._is_age_gate(body):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _get_html(self, url, headers=None, _age=True):
         if not requests or self.s is None:
             raise RuntimeError("requests 不可用")
-        r = self.s.get(url, headers=headers or self._headers(),
-                       timeout=self.timeout, verify=False)
+        r = self.s.get(url, headers=self._headers(headers),
+                       timeout=self.timeout, verify=self.verify)
         r.encoding = "utf-8"
-        return r.text or ""
+        text = r.text or ""
+        if _age and self._is_age_gate(text) and self._pass_age_verify(r, url, headers):
+            return self._get_html(url, headers=headers, _age=False)
+        return text
