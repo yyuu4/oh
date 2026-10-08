@@ -28,7 +28,7 @@ except Exception:
 #     "7890"                    = 自动补成 http://127.0.0.1:7890
 #     "http://1.2.3.4:7890"     = 指定代理（支持 http://user:pass@host:port）
 #     "off" / "none" / "直连"   = 直连
-PROXY = ""
+PROXY = "http://192.168.1.8:7890"
 
 # (2) 图片反代：图片显示不出来时再开（默认关闭，直连能看图就不需要）
 #     实测：images.weserv.nl / wsrv.nl 已把本站域名拉黑
