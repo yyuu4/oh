@@ -19,6 +19,19 @@ except Exception:
     pass
 
 
+# 版本号
+VERSION = "1.1.5"
+
+# 站点扩展参数示例（TVBox ext / init(extend) 传 JSON）：
+#   {
+#     "proxy": "7890",              # 直连不通时填代理端口，或 "127.0.0.1:7890" / "http://1.2.3.4:7890"；"" 或 "off" = 直连
+#     "host": "https://www.javbus.com",  # 固定域名（固定后不再自动探测）
+#     "existmag": "mag",            # all=全部影片 mag=已有磁力 online=僅線上
+#     "img": "https://img.example.com/?url=",  # 图片反代
+#     "cookie": "", "lang": "zh",
+#     "enableMagnet": true, "enableUncensored": true
+#   }
+
 # 候选域名：运行时自动探测，优先直连（不走代理），其次按延迟排序
 HOST_CANDIDATES = [
     "https://www.javbus.com",
@@ -285,15 +298,33 @@ def _mag_filter():
     }
 
 
+def _norm_proxy(v):
+    """代理地址归一化：支持纯端口 / host:port / 完整 URL；空值表示直连"""
+    p = _to_text(v)
+    if not p:
+        return ""
+    if p.lower() in ("0", "off", "none", "no", "false", "直连", "disable", "disabled"):
+        return ""
+    if p.isdigit():
+        return "http://127.0.0.1:%s" % p
+    if "://" not in p:
+        return "http://" + p
+    return p
+
+
 _HOST_PROBE_CACHE = {}
 
 
-def _probe_host(base, use_env, timeout=PROBE_TIMEOUT):
-    """探测单个域名。use_env=False 表示不走系统/环境代理（直连）。"""
+def _probe_host(base, use_env, timeout=PROBE_TIMEOUT, proxy=""):
+    """探测单个域名。proxy 优先；use_env=False 表示不走系统/环境代理（直连）。"""
     if not requests:
         return None
     s = requests.Session()
-    s.trust_env = bool(use_env)
+    if proxy:
+        s.trust_env = False
+        s.proxies = {"http": proxy, "https": proxy}
+    else:
+        s.trust_env = bool(use_env)
     s.headers.update(LIST_HEADERS)
     s.headers["Referer"] = base + "/"
     t0 = time.time()
@@ -316,21 +347,24 @@ def _probe_host(base, use_env, timeout=PROBE_TIMEOUT):
     return cost
 
 
-def pick_host(candidates=None):
-    """选域名：优先不需要代理的直连，其次按响应时间排序。"""
+def pick_host(candidates=None, proxy=""):
+    """选域名：配置了代理就全走代理；否则免代理 > 最快。"""
     cands = [c.rstrip("/") for c in (candidates or HOST_CANDIDATES)]
-    key = tuple(cands)
+    key = (tuple(cands), proxy)
     if key in _HOST_PROBE_CACHE:
         return _HOST_PROBE_CACHE[key]
     if not cands or not requests:
         return None
 
     best = None
-    args = [(u, False) for u in cands] + [(u, True) for u in cands]
+    if proxy:
+        args = [(u, False) for u in cands]
+    else:
+        args = [(u, False) for u in cands] + [(u, True) for u in cands]
 
     def task(arg):
         base, use_env = arg
-        cost = _probe_host(base, use_env)
+        cost = _probe_host(base, use_env, proxy=proxy)
         if cost is None:
             return None
         return (0 if not use_env else 1, cost, base)
@@ -362,6 +396,8 @@ class Spider:
         self.existmag = EXISTMAG_ALL
         self.cookie = ""
         self.img_proxy = ""
+        # 代理（直连不通时填端口/地址），例："7890"、"127.0.0.1:7890"、"http://127.0.0.1:7890"
+        self.proxy = ""
         self.lang = "zh"
         self.verify = False
 
@@ -412,18 +448,45 @@ class Spider:
         if self.existmag not in (EXISTMAG_ALL, EXISTMAG_MAG, EXISTMAG_ONLINE):
             self.existmag = EXISTMAG_ALL
 
-        # 自动选域名：直连（不走代理）优先，其次按响应时间
+        # 代理：直连不通时填端口即可（"7890" / "127.0.0.1:7890" / 完整 URL）；空值 = 直连
+        if "proxy" in extend:
+            self.set_proxy(extend.get("proxy"))
+        elif "proxyPort" in extend or "proxy_port" in extend:
+            self.set_proxy(extend.get("proxyPort") or extend.get("proxy_port"))
+
+        # 自动选域名：配置了代理全走代理，否则免代理 > 最快
         self._ensure_host()
 
         # 清空缓存
         self._cache_filters = {}
 
+    def set_proxy(self, value):
+        """设置/清除代理，返回归一化后的代理地址"""
+        p = _norm_proxy(value)
+        if p != self.proxy:
+            self.proxy = p
+            # 代理变了，重新探测域名
+            self._probed = False
+        self._apply_proxy()
+        return self.proxy
+
+    def _apply_proxy(self):
+        """把代理挂到会话上（无代理则清空，保持直连/环境代理）"""
+        if not self.s:
+            return
+        if self.proxy:
+            self.s.trust_env = False
+            self.s.proxies = {"http": self.proxy, "https": self.proxy}
+        else:
+            self.s.trust_env = True
+            self.s.proxies = {}
+
     def _ensure_host(self):
-        """探测候选域名并选一个：免代理 > 最快"""
+        """探测候选域名并选一个：有代理走代理，否则免代理 > 最快"""
         if self._host_locked or self._probed:
             return
         self._probed = True
-        host = pick_host()
+        host = pick_host(proxy=self.proxy)
         if host:
             self.host = host
 
@@ -529,6 +592,30 @@ class Spider:
         ]
 
     # ---------- 女优筛选 ----------
+    def _parse_actresses(self, text):
+        """解析女优头像列表页（/actresses）：sid + 名字 + 头像"""
+        out = []
+        seen = set()
+        for m in re.finditer(
+            r'<a[^>]+class="[^"]*avatar-box[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+            text, re.S
+        ):
+            sid = _extract_id(_fix_url(m.group(1), self.host))
+            block = m.group(2)
+            name = ""
+            nm = re.search(r"<span>([^<]+)</span>", block)
+            if nm:
+                name = _clean_text(nm.group(1))
+            pic = ""
+            im = re.search(r'<img[^>]+src="([^"]+)"', block, re.I)
+            if im:
+                pic = _fix_url(im.group(1), self.host)
+            if not sid or not name or sid in seen:
+                continue
+            seen.add(sid)
+            out.append({"sid": sid, "name": name, "pic": pic})
+        return out
+
     def _build_star_filters(self, index_url):
         cache_key = "star:" + index_url
         if cache_key in self._cache_filters:
@@ -541,22 +628,8 @@ class Spider:
             return []
 
         values = [{"n": "全部", "v": ""}]
-        seen = set()
-        for m in re.finditer(
-            r'<a[^>]+class="[^"]*avatar-box[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
-            text, re.S
-        ):
-            href = _fix_url(m.group(1), self.host)
-            block = m.group(2)
-            sid = _extract_id(href)
-            name = ""
-            nm = re.search(r"<span>([^<]+)</span>", block)
-            if nm:
-                name = _clean_text(nm.group(1))
-            if not sid or not name or sid in seen:
-                continue
-            seen.add(sid)
-            values.append({"n": name, "v": sid})
+        for it in self._parse_actresses(text):
+            values.append({"n": it["name"], "v": it["sid"]})
             if len(values) > STAR_FILTER_LIMIT:
                 break
 
@@ -592,15 +665,6 @@ class Spider:
         gid = self._first_filter_value(self._build_genre_filters(index_url))
         self._cache_filters[cache_key] = gid
         return gid
-
-    def _get_default_star(self, index_url):
-        """取女优页第一个女优作为默认（复用 _build_star_filters 的结果）"""
-        cache_key = "default_star:" + index_url
-        if cache_key in self._cache_filters:
-            return self._cache_filters[cache_key]
-        sid = self._first_filter_value(self._build_star_filters(index_url))
-        self._cache_filters[cache_key] = sid
-        return sid
 
     def homeVideoContent(self):
         return {"list": []}
@@ -666,31 +730,21 @@ class Spider:
                 return self._list_page(self.host + "/uncensored", page, hdr)
             return self._list_page(self.host + "/uncensored/page/%d" % page, page, hdr)
 
-        # 有码女优：选女优 → 该女优影片；否则 → 第一个默认女优
+        # 有码女优：选了女优 → 该女优影片；否则 → 头像列表（点头像进她影片）
         if t == "jav_actress":
             if star_sel:
                 return self._star_list(
                     self.host + "/star", next(iter(star_sel)), page, hdr)
-            default_sid = self._get_default_star(self.host + "/actresses")
-            if default_sid:
-                return self._star_list(self.host + "/star", default_sid, page, hdr)
-            if page <= 1:
-                return self._list_page(self.host + "/", page, hdr)
-            return self._list_page(self.host + "/page/%d" % page, page, hdr)
+            return self._actress_list(
+                self.host + "/actresses", "jav_star_", page, hdr)
 
-        # 无码女优：选女优 → 该女优影片；否则 → 第一个默认女优
+        # 无码女优：选了女优 → 该女优影片；否则 → 头像列表（点头像进她影片）
         if t == "jav_uncensored_actress":
             if star_sel:
                 return self._star_list(
                     self.host + "/uncensored/star", next(iter(star_sel)), page, hdr)
-            default_sid = self._get_default_star(self.host + "/uncensored/actresses")
-            if default_sid:
-                return self._star_list(
-                    self.host + "/uncensored/star", default_sid, page, hdr)
-            if page <= 1:
-                return self._list_page(self.host + "/uncensored", page, hdr)
-            return self._list_page(
-                self.host + "/uncensored/page/%d" % page, page, hdr)
+            return self._actress_list(
+                self.host + "/uncensored/actresses", "jav_uc_star_", page, hdr)
 
         # 具体类别页
         if t.startswith("jav_genre_"):
@@ -738,6 +792,34 @@ class Spider:
         else:
             url = "%s/%s/%d" % (base.rstrip("/"), sid, page)
         return self._list_page(url, page, hdr)
+
+    def _actress_list(self, index_url, id_prefix, page, hdr=None):
+        """女优头像列表：vod_tag=folder，点击后 vod_id 变成新的分类 ID 进下一层"""
+        url = index_url if page <= 1 else "%s/%d" % (index_url.rstrip("/"), page)
+        try:
+            text = self._get_html(url, headers=hdr)
+        except Exception:
+            return {"list": [], "page": page, "pagecount": 1,
+                    "limit": self.page_size, "total": 0}
+
+        out = []
+        for it in self._parse_actresses(text):
+            out.append({
+                "vod_id": id_prefix + it["sid"],
+                "vod_name": it["name"],
+                "vod_pic": self._proxy_pic(it["pic"]),
+                "vod_remarks": "",
+                "vod_tag": "folder",
+            })
+
+        has_next = self._has_next_page(text, page)
+        return {
+            "list": out,
+            "page": page,
+            "pagecount": page + 1 if has_next else page,
+            "limit": len(out) or self.page_size,
+            "total": len(out),
+        }
 
     # ========== 列表页解析 ==========
     @staticmethod
@@ -840,10 +922,14 @@ class Spider:
         if not vid:
             return {"list": []}
 
-        # 兼容：如果框架把类别/女优 ID 传到 detailContent，直接返回空
-        if vid.startswith(("jav_genre_", "jav_uc_genre_",
-                           "jav_star_", "jav_uc_star_")):
+        # 兼容：如果框架把类别 ID 传到 detailContent，直接返回空
+        if vid.startswith(("jav_genre_", "jav_uc_genre_")):
             return {"list": []}
+
+        # 兼容：框架不支持 vod_tag=folder 时，点头像会进这里。
+        # 返回她的影片作为播放列表，点影片时再去取磁力播放。
+        if vid.startswith(("jav_star_", "jav_uc_star_")):
+            return self._actress_detail(vid)
 
         url = _fix_url("/" + vid, self.host)
         try:
@@ -984,6 +1070,64 @@ class Spider:
             item["vod_play_from"] = "$$$".join(froms)
             item["vod_play_url"] = "$$$".join(urls)
         return {"list": [item]}
+
+    def _actress_detail(self, vid):
+        """女优详情（vod_tag=folder 不被支持时的兜底）：把她的影片做成播放列表"""
+        if vid.startswith("jav_uc_star_"):
+            sid = vid[len("jav_uc_star_"):]
+            base = self.host + "/uncensored/star"
+        else:
+            sid = vid[len("jav_star_"):]
+            base = self.host + "/star"
+        if not sid:
+            return {"list": []}
+        try:
+            text = self._get_html("%s/%s" % (base.rstrip("/"), sid))
+        except Exception:
+            return {"list": []}
+
+        title = ""
+        tm = re.search(r"<title>([^<]+)</title>", text)
+        if tm:
+            title = _clean_text(tm.group(1))
+            title = title.replace(" - JavBus", "").strip()
+            title = re.sub(r"\s*-\s*(影片|有碼|無碼)\s*$", "", title).strip()
+
+        pic = ""
+        pm = re.search(r'(?:src|href)="([^"]*pics/actress/[^"]+)"', text, re.I)
+        if pm:
+            pic = self._proxy_pic(_fix_url(pm.group(1), self.host))
+
+        eps = []
+        for m in self._parse_movie_boxes(text):
+            name = _to_text(m.get("vod_name"))
+            label = re.sub(r"[$#&\n\r\t]", " ", name).strip()[:40]
+            mid = _to_text(m.get("vod_id"))
+            if not mid:
+                continue
+            eps.append("%s$%s" % (label or sid, "jav_movie_" + mid))
+
+        item = {
+            "vod_id": vid,
+            "vod_name": title or sid,
+            "vod_pic": pic,
+            "vod_content": "",
+        }
+        if eps:
+            item["vod_play_from"] = "她的影片"
+            item["vod_play_url"] = "#".join(eps)
+        return {"list": [item]}
+
+    def _magnets_of(self, vid):
+        """按影片 ID 取磁力列表（兜底播放用）"""
+        try:
+            text = self._get_html(_fix_url("/" + _to_text(vid), self.host))
+        except Exception:
+            return []
+        try:
+            return self._fetch_magnets(text, vid)
+        except Exception:
+            return []
 
     def _fetch_magnets(self, detail_html, vid):
         gid = ""
@@ -1144,6 +1288,19 @@ class Spider:
                 "url": m or vid,
                 "header": {"User-Agent": self.ua, "Accept": "*/*"},
             }
+
+        # 兜底：女优头像 → 详情播放列表里的“影片”，取该片磁力播放
+        if vid.startswith("jav_movie_"):
+            for g in self._magnets_of(vid[len("jav_movie_"):]):
+                m = _normalize_magnet(g.get("magnet"))
+                if m:
+                    return {
+                        "parse": 0,
+                        "jx": 0,
+                        "playUrl": "",
+                        "url": m,
+                        "header": {"User-Agent": self.ua, "Accept": "*/*"},
+                    }
 
         return {
             "parse": 0,
