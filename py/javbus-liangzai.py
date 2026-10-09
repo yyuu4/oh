@@ -1,4 +1,4 @@
-VERSION = "1.1.21"
+VERSION = "1.2.3"
 # -*- coding: utf-8 -*-
 import os
 import re
@@ -56,6 +56,8 @@ IMG_PROXY = ""
 #     "offlineSavePath": "0",                  # 115 离线保存目录 cid，默认根目录
 #     "offlineAppVer": "4.8.2",                # 115 离线接口 appVer
 #     "offlineProxy": ""                       # 115 接口代理，"" = 直连（不走上面的 PROXY）
+#     "offlineDebug": 1                        # 播放过程逐步弹提示，排障时开（默认 1）
+#     "offlineTestMp4": ""                     # 二分实验："noheader"/"header" 才开，正常留空
 #   }
 # 优先级：ext > 顶部 PROXY / IMG_PROXY
 #
@@ -113,13 +115,88 @@ DEFAULT_COOKIE_115 = ("UID=7090991_R1_1785487771; CID=3c1a3ab03cfc92b0b7c80db6ef
                       "SEID=81ec0f1ad4aa99de925b609465a91c20d8894da910834a59f27cb239ebc5eb70412b456e8e91fff5654dc089a9d0c153f5fcec844b4cf7fa1b8aac84; "
                       "KID=bc573815d056010f1b8373db03247c3b")
 
-# 详情页播放地址里的 115 离线标记，后面接 base64(磁力链接)
+# 详情页播放地址里的 115 离线标记。
+# 新格式 base64(json{"m":磁力,"t":片名})，旧格式 base64(磁力) 也能解
 OFF_PREFIX_115 = "http://115off/"
+# 播放过程留痕：写进 Python 沙箱 home 下的小文件，跨实例/跨重启都能看到。
+# 用来判断「点播放后到底有没有走到我们的代码」。
+OFF_TRACE_FILE = os.path.join(os.path.expanduser("~"), "javbus_off_trace.txt")
+
+
+def _trace_write(text):
+    try:
+        with open(OFF_TRACE_FILE, "w", encoding="utf-8") as f:
+            f.write(_to_text(text))
+    except Exception:
+        pass
+
+
+def _trace_read():
+    try:
+        with open(OFF_TRACE_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def _fc(item):
+    """115 的 fc 字段：1=文件 0=文件夹。注意可能是 int 0，不能用 or 判空"""
+    v = item.get("fc") if isinstance(item, dict) else None
+    return "" if v is None else str(v).strip()
+
+
+def _off_id_encode(magnet, title="", label=""):
+    payload = {"m": _to_text(magnet)}
+    if _to_text(title):
+        payload["t"] = _to_text(title)
+    if _to_text(label):
+        payload["l"] = _to_text(label)
+    raw = json.dumps(payload, ensure_ascii=False)
+    return base64.b64encode(raw.encode("utf-8")).decode("ascii")
+
+
+def _off_id_decode(text):
+    """播放地址解码 → (磁力, 片名, 小标题)。旧格式 base64(磁力) 也能解"""
+    # 地址后面可能挂着 ?t=时间戳（防 App 按播放地址缓存旧结果），base64 里没有 ?/#
+    text = _to_text(text).strip().split("#")[0].split("?")[0]
+    try:
+        raw = base64.b64decode(text.encode("ascii")).decode("utf-8")
+    except Exception:
+        return "", "", ""
+    raw = raw.strip()
+    if raw.startswith("{"):
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = {}
+        if isinstance(data, dict):
+            return (_to_text(data.get("m") or ""),
+                    _to_text(data.get("t") or ""),
+                    _to_text(data.get("l") or ""))
+    return raw, "", ""
+
 OFFLINE_UA = WEB_UA + " 115Browser/36.0.0"
+OFFLINE_VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".flv", ".ts", ".m4v",
+                      ".wmv", ".rm", ".rmvb", ".iso", ".mpg", ".mpeg", ".3gp",
+                      ".webm", ".m2ts", ".rmvb", ".vob", ".mp2")
 OFFLINE_ADD_API = "https://115.com/web/lixian/?ct=lixian&ac=add_task_urls"
 OFFLINE_LIST_API = "https://115.com/web/lixian/?ct=lixian&ac=task_lists"
-OFFLINE_POLL_TIMEOUT = 12
+OFFLINE_POLL_TIMEOUT = 15
 OFFLINE_POLL_INTERVAL = 1
+# 整理+取直链一起最多花几秒；超了就不整理，直接走 v1.1.21 的老路径（先直链、取不到再搜）
+OFFLINE_FINISH_BUDGET = 9
+# 超过几秒还没好，就开始每一步都弹提示（卡在哪一步一看就知道）
+OFFLINE_TRACE_AFTER = 4
+# 本地代理回流时单次最多回多少字节（整个文件不能进内存，靠 Range 一段段回）
+OFFLINE_RELAY_CHUNK = 4 * 1024 * 1024
+# 二分实验用的公开测试片（免鉴权、支持 Range），只在 ext.offlineTestMp4 打开时用
+OFFLINE_TEST_MP4 = ("https://commondatastorage.googleapis.com/gtv-videos-bucket/"
+                    "sample/BigBuckBunny.mp4")
+OFFLINE_TEST_HEADER = {
+    "User-Agent": OFFLINE_UA,
+    "Referer": "https://115.com/",
+    "Accept": "*/*",
+}
 
 RSA_N = 0x8686980c0f5a24c4b9d43020cd2c22703ff3f450756529058b1cf88f09b8602136477198a6e2683149659bd122c33592fdb5ad47944ad1ea4d36c6b172aad6338c3bb6ac6227502d010993ac967d1aef00f0c8e038de2e4d3bc2ec368af2e9f10a6f1eda4f7262f136420c07c331b871bf139f74f3010e3c4fe57df3afb71683
 RSA_E = 0x10001
@@ -710,14 +787,24 @@ class Spider:
         self.enable_offline_115 = True
         self.offline_save_path = "0"
         self.offline_app_ver = "4.8.2"
-        self.offline_timeout = 15
+        self.offline_timeout = 10
         self.offline_proxy = ""
+        self.offline_debug = True
+        # 二分实验开关（ext.offlineTestMp4）："" = 关闭
+        self.offline_test_mp4 = ""
+        self._off_relay_pos = 0
+        self._off_relay_logged = False
+        # 直链地址（去参数） -> 取直链时 downurl 下发的完整 Cookie。
+        # downurl 的 Set-Cookie 会补一个 CDN 令牌，没有它直链 403 "no cookie value"
+        self._off_ck = {}
         # info_hash -> pickcode 缓存，重试时不再重新搜文件
         self._off_cache = {}
         # info_hash -> 文件名，缓存命中时给成功提示用
         self._off_name = {}
         # info_hash -> 该片原简介（详情页拿到），播放页 desc 提示时放在提示后面
         self._off_syn = {}
+        # 影片 id -> 片名（女优列表入口离线整理时用）
+        self._vid_title = {}
 
         # filters / 默认值缓存
         self._cache_filters = {}
@@ -807,12 +894,22 @@ class Spider:
         self._apply_proxy()
 
         # ==== 115 ====
-        self.cookie_115 = (
-            _to_text(extend.get("cookie115"))
-            or _env("Y115_COOKIE")
-            or _env("MY115_COOKIE")
-            or DEFAULT_COOKIE_115
-        )
+        # 跑在 alist-tvbox 的 Atvp 包装里时**不认 ext.cookie115**（那边的 cookie 不用），
+        # 只用环境变量 / 本文件里的 DEFAULT_COOKIE_115；直连时仍按 ext 优先。
+        if self._in_atvp():
+            self.cookie_115 = (
+                _env("Y115_COOKIE")
+                or _env("MY115_COOKIE")
+                or DEFAULT_COOKIE_115
+                or _to_text(extend.get("cookie115"))
+            )
+        else:
+            self.cookie_115 = (
+                _to_text(extend.get("cookie115"))
+                or _env("Y115_COOKIE")
+                or _env("MY115_COOKIE")
+                or DEFAULT_COOKIE_115
+            )
         if "enableOffline115" in extend:
             self.enable_offline_115 = bool(extend["enableOffline115"])
         if extend.get("offlineSavePath"):
@@ -822,7 +919,20 @@ class Spider:
         if "offlineProxy" in extend:
             self.offline_proxy = _to_text(extend.get("offlineProxy"))
             # 代理变了，重建 115 会话
-            self.s115 = None
+        self.s115 = None
+        self._off_last = ""
+        if "offlineDebug" in extend:
+            self.offline_debug = str(extend.get("offlineDebug")).lower() not in (
+                "0", "false", "off", "no")
+        # 二分实验：播放直接返回公开测试 MP4，用来判断「转圈不出画」是 result
+        # 结构问题 还是 115 直链/header 的问题。"" = 关闭，线上行为不变
+        self.offline_test_mp4 = _to_text(extend.get("offlineTestMp4")).strip().lower()
+        # 客户端链路诊断：Atvp 配了 local_proxy_config 时会把它注入本 ext
+        # （Atvp._compose_inner_extend），App 实际走本地分片代理改写还是直连就看它
+        self.offline_local_proxy_cfg = extend.get("local_proxy_config") or ""
+        self._off_pp_base = None      # 设备上 VideoStreamProxy 端口探测缓存（""=没有）
+        self._off_relay_pos = 0
+        self._off_relay_logged = False
 
         # 自动选域名：配置了代理全走代理，否则免代理 > 最快
         self._ensure_host()
@@ -1404,7 +1514,9 @@ class Spider:
         if genres:
             info_lines.append("类别: %s" % "、".join(genres))
         if self.enable_offline_115:
-            info_lines.append("115离线：提交到115云端，完成后自动直连播放 (v%s)" % VERSION)
+            info_lines.append("115离线：提交到115云端，完成后自动直连播放；"
+                              "网盘里只留视频文件，命名为「片名_小标题 大小」(v%s)"
+                              % VERSION)
 
         magnets = []
         if self.enable_magnet or self.enable_offline_115:
@@ -1425,6 +1537,14 @@ class Spider:
             # 115 只认干净的 btih 磁力（去掉 dn / tr 参数）
             magnet_items.append((g, raw, _normalize_magnet(raw), h))
 
+        # 标题去重：页面 <title> 本身通常已带番号
+        vod_name = _to_text(title)
+        if num and vod_name:
+            if not vod_name.startswith(num):
+                vod_name = (num + " " + vod_name).strip()
+        elif num:
+            vod_name = num
+
         froms, urls = [], []
 
         # 磁力源（交给播放器，能不能播看内核；保留原始磁力，带 tracker）
@@ -1437,24 +1557,21 @@ class Spider:
                 froms.append("磁力")
                 urls.append("#".join(eps))
 
-        # 115 离线源（提交到 115 云端，完成后取播放直链）
+        # 115 离线源（提交到 115 云端，完成后取播放直链）。
+        # 把片名和这条磁力的小标题（含大小）一起带过去，整理文件时命名：
+        # 片名_小标题 1.35GB.mp4
         if self.enable_offline_115 and magnet_items:
             eps = []
             for i, (g, raw, clean, h) in enumerate(magnet_items):
                 label = self._magnet_label(g, i, num)
-                b64 = base64.b64encode(clean.encode("utf-8")).decode("ascii")
-                eps.append("%s$%s%s" % (label, OFF_PREFIX_115, b64))
+                b64 = _off_id_encode(clean, vod_name, label)
+                # ?t= 时间戳：App 若按播放地址缓存了旧结果（旧直链改名后就失效），
+                # 每次进详情都换个地址，强制重新走 playerContent 拿新直链
+                eps.append("%s$%s%s?t=%d" % (label, OFF_PREFIX_115, b64,
+                                             int(time.time())))
             if eps:
                 froms.append("115离线")
                 urls.append("#".join(eps))
-
-        # 标题去重：页面 <title> 本身通常已带番号
-        vod_name = _to_text(title)
-        if num and vod_name:
-            if not vod_name.startswith(num):
-                vod_name = (num + " " + vod_name).strip()
-        elif num:
-            vod_name = num
 
         # 记下原简介：播放页 desc 提示时把提示放在原简介前面，不把原简介顶掉
         base_content = "\n".join(info_lines)
@@ -1473,6 +1590,10 @@ class Spider:
                 break
         if done_note:
             info_lines.insert(0, done_note)
+        # 上次点播放走到哪一步/什么结果：直接写进简介首行（一定看得见，不依赖 toast）
+        last = _to_text(self._off_last) or _trace_read()
+        if self.enable_offline_115 and last:
+            info_lines.insert(0, "[上次播放] " + last)
 
         item = {
             "vod_id": vid,
@@ -1489,6 +1610,9 @@ class Spider:
         res = {"list": [item]}
         if done_note:
             res["msg"] = done_note
+        elif self.enable_offline_115 and last:
+            # 兜底诊断：上次点播放卡在哪一步/结果如何，进详情页弹一次
+            res["msg"] = last
         return res
 
     def _actress_detail(self, vid):
@@ -1527,7 +1651,8 @@ class Spider:
                 continue
             eps.append("%s$%s" % (label or sid, "jav_movie_" + mid))
             if self.enable_offline_115:
-                eps115.append("%s$%s" % (label or sid, "jav_movie115_" + mid))
+                eps115.append("%s$jav_movie115_%s?t=%d"
+                              % (label or sid, mid, int(time.time())))
 
         item = {
             "vod_id": vid,
@@ -1553,10 +1678,23 @@ class Spider:
             text = self._get_html(_fix_url("/" + _to_text(vid), self.host))
         except Exception:
             return []
+        # 顺手记下片名，115 离线整理文件时要用
+        try:
+            m = re.search(r"<title>([^<]+)</title>", text or "", re.I)
+            if m:
+                name = _clean_text(m.group(1))
+                name = re.sub(r"\s*-\s*JavBus\s*$", "", name, flags=re.I).strip()
+                if name:
+                    self._vid_title[_to_text(vid)] = name
+        except Exception:
+            pass
         try:
             return self._fetch_magnets(text, vid)
         except Exception:
             return []
+
+    def _title_of(self, vid):
+        return _to_text(self._vid_title.get(_to_text(vid), ""))
 
     def _fetch_magnets(self, detail_html, vid):
         gid = ""
@@ -1623,7 +1761,8 @@ class Spider:
             if not sm:
                 sm = re.search(r"([\d]+(?:\.\d+)?)\s*(TB|GB|MB|KB)\b", block, re.I)
             if sm:
-                size = "%s %s" % (sm.group(1), sm.group(2).upper())
+                # 数字和单位不加空格：2.62GB（JavBus 页面本身就是这么写的）
+                size = "%s%s" % (sm.group(1), sm.group(2).upper())
 
             out.append({
                 "name": name,
@@ -1692,6 +1831,17 @@ class Spider:
         m = re.search(r"btih:([0-9a-fA-F]{40}|[0-9a-zA-Z]{32})", magnet or "")
         return m.group(1).lower() if m else ""
 
+    @staticmethod
+    def _magnet_dn(magnet):
+        """磁力链接里的 dn 参数（原始文件名）→ 提交前先拿它搜一遍网盘"""
+        m = re.search(r"[?&]dn=([^&]+)", magnet or "")
+        if not m:
+            return ""
+        try:
+            return unquote(m.group(1)).replace("+", " ").strip()
+        except Exception:
+            return ""
+
     def _offline_add(self, magnet):
         sess = self._offline_session()
         if sess is None:
@@ -1720,8 +1870,8 @@ class Spider:
         except Exception:
             return {}
 
-    def _offline_find_task(self, info_hash):
-        for page in (1, 2):
+    def _offline_find_task(self, info_hash, max_page=2):
+        for page in range(1, max_page + 1):
             try:
                 res = self._offline_list(page)
             except Exception:
@@ -1773,7 +1923,7 @@ class Spider:
         last_name = ""
         while time.time() < deadline:
             try:
-                task = self._offline_find_task(info_hash)
+                task = self._offline_find_task(info_hash, max_page=1)
             except Exception:
                 task = None
             done, failed, msg = self._offline_task_state(task)
@@ -1790,6 +1940,15 @@ class Spider:
     def _guess_keyword_from_name(name):
         if not name:
             return ""
+        name = _to_text(name).strip()
+        # 站点前缀必须在 splitext 之前剥：不然 kss55.cc@ABF-390 会被当成
+        # 「后缀 .cc@ABF-390」，只剩 kss55，搜出来就是搜不到的 KSS-55
+        if "@" in name:
+            name = name.rsplit("@", 1)[-1].strip() or name
+        # 没有 @ 的域名前缀：kss55.cc ABF-390 → ABF-390（TLD 后必须是空白才剥，
+        # 免得把 My.Movie.2024.mp4 这种正常片名的前半截也剥了）
+        name = re.sub(r"^[A-Za-z0-9-]{2,20}\.[A-Za-z]{2,10}[\s_]+", "",
+                      name) or name
         base = os.path.splitext(name)[0]
         ext = os.path.splitext(name)[1].lower()
         # 带视频后缀的完整文件名：直接按文件名搜（115 是子串匹配，最准）
@@ -1800,7 +1959,12 @@ class Spider:
         m = re.search(r"(FC2)[- ]?(PPV)?[- ]?(\d{5,8})", base, re.I)
         if m:
             return "FC2-PPV-%s" % m.group(3)
-        m = re.search(r"([A-Za-z]{2,6})[- ]?(\d{2,5})", base)
+        # 番号优先：ABF-390 / SSIS_001（带分隔符），搜出来才是这片
+        m = re.search(r"([A-Za-z]{2,10})[-_ ](\d{2,5})\b", base)
+        if m:
+            return "%s-%s" % (m.group(1).upper(), m.group(2))
+        # 兜底：连字符番号 SSIS001 → SSIS-001
+        m = re.search(r"([A-Za-z]{2,6})(\d{2,5})\b", base)
         if m:
             return "%s-%s" % (m.group(1).upper(), m.group(2))
         return base[:40]
@@ -1828,7 +1992,7 @@ class Spider:
                     r = sess.get("https://webapi.115.com/files/search", params={
                         "search_value": keyword, "type": stype, "offset": 0,
                         "limit": 50, "aid": 1, "cid": 0, "format": "json",
-                    }, headers=headers, timeout=20, verify=False)
+                    }, headers=headers, timeout=10, verify=False)
                     data = _safe_json(r.text, {})
                     rows = data.get("data")
                     if not isinstance(rows, list):
@@ -1871,7 +2035,7 @@ class Spider:
             "Origin": "https://115.com",
         }
         try:
-            r = sess.post(url, data=body, headers=headers, timeout=20, verify=False)
+            r = sess.post(url, data=body, headers=headers, timeout=12, verify=False)
         except Exception as e:
             return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
                     "msg": "115 取直链失败: %s" % e}
@@ -1915,6 +2079,11 @@ class Spider:
         }
         if fmt:
             result["format"] = fmt
+        # 记下这条直链对应的完整 Cookie（含 downurl 下发的 CDN 令牌）
+        self._off_ck = dict(list(self._off_ck.items())[-8:])
+        self._off_ck[real_url.split("?")[0]] = final_cookie
+        # 播放地址保持 v1.1.21 的老样子：直链 + header（alist-tvbox 实测能播），
+        # 不要改指本地代理——csp_PyProxy 那条链路会 "bad http status"。
         return result
 
     @staticmethod
@@ -1930,6 +2099,31 @@ class Spider:
         """
         name = _to_text(name).strip()
         return "%s：%s" % (prefix, name) if name else prefix
+
+    def _set_off_last(self, text):
+        """记下上次播放走到哪一步：内存 + 文件（跨实例/重启也能看）"""
+        self._off_last = _to_text(text)
+        _trace_write(self._off_last)
+
+    def _off_trace(self, phase, t0, force=False):
+        """离线播放过程提示（ext.offlineDebug 控制，默认开）。
+
+        文本总是记到 self._off_last——播放页看不到时，进详情页会用 msg 弹一次兜底。
+        每一步都 toast 一次，一直转圈时就知道卡在哪一步。
+        """
+        el = time.time() - t0
+        text = "115离线：%s（%.0fs）" % (_to_text(phase), el)
+        self._set_off_last(text)
+        if not self.offline_debug:
+            return
+        try:
+            try:
+                from com.github.catvod.utils import Notify
+            except Exception:
+                from com.github.catvod import Notify
+            Notify.show(text)
+        except Exception:
+            pass
 
     @staticmethod
     def _offline_proxy_base():
@@ -1967,41 +2161,697 @@ class Spider:
             pass
         return res
 
-    def _offline_finish(self, info_hash, pc, name, allow_search=True):
+    # ========== 115 网盘整理：一个种子只留一个视频，改名 片名_小标题 大小 ==========
+
+    def _offline_webapi(self, path, params=None, data=None, timeout=8):
+        """webapi.115.com 通用请求 → dict"""
+        sess = self._offline_session()
+        if sess is None:
+            return {}
+        url = "https://webapi.115.com" + path
+        headers = {
+            "Cookie": self.cookie_115,
+            "User-Agent": WEB_UA,
+            "Referer": "https://115.com/",
+            "Origin": "https://115.com",
+            "Accept": "application/json, text/plain, */*",
+        }
+        try:
+            if data is not None:
+                headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+                r = sess.post(url, data=data, headers=headers, timeout=timeout,
+                              verify=False)
+            else:
+                r = sess.get(url, params=params or {}, headers=headers,
+                             timeout=timeout, verify=False)
+        except Exception:
+            return {}
+        out = _safe_json(r.text, {})
+        return out if isinstance(out, dict) else {}
+
+    def _offline_info(self, pickcode):
+        """pick_code → 文件/文件夹信息 dict（fc: 1=文件 0=文件夹）"""
+        if not pickcode:
+            return {}
+        data = self._offline_webapi("/files/get_info",
+                                    params={"pick_code": pickcode, "format": "json"})
+        row = data.get("data")
+        if isinstance(row, list):
+            row = row[0] if row else {}
+        return row if isinstance(row, dict) else {}
+
+    def _offline_dir(self, cid, limit=1000, deadline=0):
+        """列目录（aid=1）→ 子项列表，自动翻页"""
+        rows, offset, step = [], 0, 200
+        while offset < limit:
+            if deadline and time.time() >= deadline:
+                break
+            data = self._offline_webapi("/files", params={
+                "aid": 1, "cid": _to_text(cid or "0"), "offset": offset,
+                "limit": step, "show_dir": 1, "format": "json"})
+            chunk = data.get("data")
+            if not isinstance(chunk, list) or not chunk:
+                break
+            rows.extend(chunk)
+            total = _safe_int(data.get("count"), 0)
+            offset += len(chunk)
+            if total and offset >= total:
+                break
+            if len(chunk) < step:
+                break
+        return rows
+
+    @staticmethod
+    def _is_video_name(name):
+        n = _to_text(name).lower()
+        return any(n.endswith(ext) for ext in OFFLINE_VIDEO_EXTS)
+
+    @classmethod
+    def _pick_video(cls, rows):
+        """目录子项 → 要播的那个视频文件；不是视频就返回 None（别乱删）"""
+        videos = [r for r in rows if _fc(r) == "1"
+                  and cls._is_video_name(r.get("n") or r.get("name") or "")]
+        return max(videos, key=lambda r: _safe_int(r.get("s") or r.get("size") or 0, 0),
+                   default=None)
+
+    def _offline_find_video(self, cid, depth=1, deadline=0):
+        """找体积最大的视频 → (子项, 它所在的目录 cid)；找不到返回 (None, "")"""
+        if not cid or (deadline and time.time() >= deadline):
+            return None, ""
+        rows = self._offline_dir(cid, deadline=deadline)
+        best = self._pick_video(rows)
+        if best:
+            return best, _to_text(cid)
+        if depth > 0:
+            subs = [r for r in rows if _fc(r) == "0"]
+            for sub in subs[:5]:
+                found, src = self._offline_find_video(
+                    sub.get("cid") or sub.get("fid"), depth - 1, deadline=deadline)
+                if found:
+                    return found, src
+        return None, ""
+
+    @staticmethod
+    def _safe_name(name):
+        n = re.sub(r"\s+", " ", _to_text(name))
+        n = re.sub(r'[\\/:*?"<>|\r\n\t]', "", n)
+        return n.strip()[:120].strip(" .")
+
+    @classmethod
+    def _offline_new_name(cls, title, orig, label=""):
+        """片名_小标题 1.35GB.mp4（用户指定下划线分隔）
+
+        带来小标题就用「片名_小标题 大小.后缀」；带不过来退回「片名_原文件名」。
+        """
+        title = cls._safe_name(title)
+        orig = cls._safe_name(orig)
+        label = cls._safe_name(label)
+        if not title:
+            return orig
+        if label:
+            ext = os.path.splitext(orig)[1]
+            tail = label if (not ext or label.lower().endswith(ext.lower())) \
+                else label + ext
+            if tail == title:
+                return orig
+            name = "%s_%s" % (title, tail)
+            # 115 文件名别超长（截片名，小标题和后缀保留）
+            if len(name) > 140:
+                room = max(8, 140 - len(tail) - 1)
+                name = "%s_%s" % (title[:room], tail)
+            return orig if name == orig else name
+        if orig == title or orig.startswith(title + "_"):
+            return orig
+        return "%s_%s" % (title, orig)
+
+    def _offline_rename(self, fid, new_name):
+        if not fid or not new_name:
+            return False
+        data = self._offline_webapi("/files/edit",
+                                    data={"fid": fid, "file_name": new_name})
+        return bool(data.get("state"))
+
+    def _offline_move(self, pid, fid):
+        if not fid:
+            return False
+        data = self._offline_webapi("/files/move", data={"pid": pid, "fid[0]": fid})
+        return bool(data.get("state"))
+
+    def _offline_trash(self, fid):
+        """丢回收站（可恢复），顺带删掉里面的其它文件"""
+        if not fid:
+            return False
+        data = self._offline_webapi("/rb/delete", data={"fid[0]": fid})
+        return bool(data.get("state"))
+
+    def _offline_parent(self, info, deadline=0):
+        """文件夹所在的父目录 cid；拿不到就返回 ""（宁可不移动）"""
+        pid = _to_text(info.get("pid") or "")
+        if pid:
+            return pid
+        cid = _to_text(info.get("cid") or "")
+        if not cid:
+            return ""
+        for it in self._offline_dir("0", limit=500, deadline=deadline):
+            if _to_text(it.get("cid") or it.get("fid") or "") == cid:
+                return "0"
+        return ""
+
+    def _tidy_file(self, info, name, title="", label="", deadline=0):
+        """单文件种子：改名；文件若还躺在离线任务文件夹里，挪出来 + 文件夹进回收站"""
+        pc = info.get("pc") or info.get("pick_code") or ""
+        fid = _to_text(info.get("fid") or "")
+        orig = _to_text(info.get("n") or info.get("name") or name)
+        new = self._offline_new_name(title, orig, label)
+        if new and new != orig and self._offline_rename(fid, new):
+            orig = new
+        try:
+            self._pull_out_of_task_folder(info, name, title, deadline=deadline)
+        except Exception:
+            pass
+        return pc, orig or _to_text(name)
+
+    def _search_rows(self, keyword, stype=0, limit=50):
+        """搜网盘原始行。type=4 只搜视频；type=0 连文件夹一起搜（行里带 pid）"""
+        sess = self._offline_session()
+        if sess is None or not keyword:
+            return []
+        headers = {
+            "User-Agent": WEB_UA,
+            "Referer": "https://115.com/",
+            "Origin": "https://115.com",
+            "Accept": "application/json, text/plain, */*",
+            "Cookie": self.cookie_115,
+        }
+        try:
+            r = sess.get("https://webapi.115.com/files/search", params={
+                "search_value": keyword, "type": stype, "offset": 0,
+                "limit": limit, "aid": 1, "cid": 0, "format": "json",
+            }, headers=headers, timeout=10, verify=False)
+            chunk = _safe_json(r.text, {}).get("data")
+            return chunk if isinstance(chunk, list) else []
+        except Exception:
+            return []
+
+    def _dir_row(self, fcid, code="", deadline=0):
+        """按 cid 找到装着文件的文件夹 → (行, 父目录 cid)；找不到 → (None, "")。
+
+        文件行的 cid 就是它所在的文件夹。文件夹的 pid 先问搜索接口
+        （type=0 连文件夹一起搜，自带 pid），搜不到再从根目录数一层。
+        """
+        fcid = _to_text(fcid)
+        if not fcid:
+            return None, ""
+        if code:
+            for it in self._search_rows(code, 0):
+                if _fc(it) == "0" and _to_text(it.get("cid") or "") == fcid:
+                    return it, _to_text(it.get("pid") or "") or "0"
+        for r in self._offline_dir("0", limit=200, deadline=deadline):
+            if _fc(r) != "0":
+                continue
+            if _to_text(r.get("cid") or "") == fcid:
+                return r, "0"
+            for c in self._offline_dir(_to_text(r.get("cid") or ""),
+                                       limit=200, deadline=deadline):
+                if _fc(c) == "0" and _to_text(c.get("cid") or "") == fcid:
+                    return c, _to_text(r.get("cid") or "") or "0"
+        return None, ""
+
+    def _pull_out_of_task_folder(self, info, name, title="", deadline=0):
+        """文件还躺在离线任务文件夹里 → 挪到文件夹的上一层，空壳文件夹丢回收站。
+
+        两条都对才动手（都对得上才算「离线任务文件夹」，免得误删用户自建目录）：
+        文件夹名 = 任务名 或 带番号；文件真在里面。夹带的广告视频、html、压缩包
+        一律跟着文件夹进回收站——本来就是「下完删杂项」，回收站还能捞回来。
+        """
+        if deadline and time.time() >= deadline:
+            return
+        fid = _to_text(info.get("fid") or "")
+        fcid = _to_text(info.get("cid") or "")
+        if not fid or not fcid:
+            return
+        code = self._guess_keyword_from_name(_to_text(title) or _to_text(name))
+        want = _to_text(name).strip()
+        folder, parent = self._dir_row(fcid, code, deadline=deadline)
+        if folder is None:
+            return
+        fname = _to_text(folder.get("n") or "")
+        if not ((want and fname == want)
+                or (code and code.lower() in fname.lower())):
+            return
+        kids = self._offline_dir(fcid, limit=200, deadline=deadline)
+        if not any(_to_text(k.get("fid") or "") == fid for k in kids):
+            return
+        if self._offline_move(parent or "0", fid):
+            self._offline_trash(fcid)
+
+    def _tidy_folder(self, info, name, title, label="", deadline=0):
+        """文件夹种子：挑体积最大的视频 → 改名 → 移出文件夹 → 删掉文件夹（回收站）"""
+        cid = _to_text(info.get("cid") or info.get("fid") or "")
+        if deadline and time.time() >= deadline:
+            return "", _to_text(name)
+        video, src = self._offline_find_video(cid, deadline=deadline) if cid else (None, "")
+        if not video:
+            return "", _to_text(name)
+        fid = _to_text(video.get("fid") or "")
+        vpc = _to_text(video.get("pc") or video.get("pick_code") or "")
+        orig = _to_text(video.get("n") or video.get("name") or "")
+        new = self._offline_new_name(title, orig, label)
+        if new and new != orig and self._offline_rename(fid, new):
+            orig = new
+        pid = "" if (deadline and time.time() >= deadline) \
+            else self._offline_parent(info, deadline)
+        if pid and fid and self._offline_move(pid, fid):
+            left = self._offline_dir(src or cid, limit=200, deadline=deadline)
+            if any(_to_text(r.get("fid") or "") == fid for r in left):
+                pass                        # 其实没移动成功，文件夹不能删
+            else:
+                self._offline_trash(cid)     # 连子目录和其它文件一起进回收站
+        return vpc or _to_text(info.get("pc") or ""), orig or _to_text(name)
+
+    def _offline_tidy(self, pc, name, title="", label="", deadline=0):
+        """整理离线产物；返回 (播放用 pickcode, 展示名)。任何失败都不影响播放。"""
+        try:
+            info = self._offline_info(pc) or {}
+        except Exception:
+            info = {}
+        if not info:
+            return pc, _to_text(name)
+        # fc 可能是 int 0（文件夹），拿不到 fc 时用有没有 fid 兜底判断
+        fc = _fc(info)
+        is_dir = (fc == "0") if fc else (not bool(info.get("fid")))
+        try:
+            if is_dir:
+                return self._tidy_folder(info, name, title, label, deadline=deadline)
+            return self._tidy_file(info, name, title, label,
+                                  deadline=deadline)
+        except Exception:
+            return pc, _to_text(name)
+
+    def _offline_real_name(self, pickcode):
+        """拿文件现在在网盘里的名字（整理过就是 片名_小标题 大小.mp4）"""
+        try:
+            info = self._offline_info(pickcode) or {}
+        except Exception:
+            return ""
+        return _to_text(info.get("n") or info.get("name") or "")
+
+    def _pickcode_children(self, pickcode, deadline=0):
+        """pickcode 指向文件夹 → 里面体积最大的那个视频的 pickcode。
+
+        整理没跑成（超预算/接口失败）时任务 pc 还是文件夹，直接取直链会返回
+        「未发现下载链接」；这里把文件夹挖开拿视频的 pc 再取。
+        """
+        if not pickcode:
+            return ""
+        try:
+            info = self._offline_info(pickcode) or {}
+        except Exception:
+            info = {}
+        if not info:
+            return ""
+        fc = _fc(info)
+        is_dir = (fc == "0") if fc else (not bool(info.get("fid")))
+        if not is_dir:
+            return pickcode
+        cid = _to_text(info.get("cid") or info.get("fid") or "")
+        if not cid:
+            return ""
+        try:
+            video, _src = self._offline_find_video(cid, depth=2, deadline=deadline)
+        except Exception:
+            video = None
+        if video:
+            return _to_text(video.get("pc") or video.get("pick_code") or "") or pickcode
+        return ""
+
+    def _pickcode_in_root(self, title="", label="", deadline=0):
+        """搜索接口也失手时的最后兜底：列「云下载」根目录，按番号/片名挑那个视频。
+
+        文件被整理过就躺在根目录，名字里带番号；一次列表调用，很便宜。
+        """
+        keys = []
+        for kw in (label, title):
+            code = self._guess_keyword_from_name(_to_text(kw))
+            if code and code.lower() not in [k.lower() for k in keys]:
+                keys.append(code)
+        if not keys or (deadline and time.time() >= deadline):
+            return ""
+        try:
+            rows = self._offline_dir("0", limit=1000, deadline=deadline)
+        except Exception:
+            return ""
+        best, best_size = None, -1
+        for r in rows:
+            if _fc(r) != "1":
+                continue
+            n = _to_text(r.get("n") or r.get("name") or "")
+            if not self._is_video_name(n):
+                continue
+            low = n.lower()
+            if not any(k.lower() in low for k in keys):
+                continue
+            size = _safe_int(r.get("s") or r.get("size") or 0, 0)
+            if size > best_size:
+                best, best_size = r, size
+        if best:
+            return _to_text(best.get("pc") or best.get("pick_code") or "")
+        return ""
+
+    def _offline_finish(self, info_hash, pc, name, title="", label="",
+                        allow_search=True, t0=None):
         """pickcode → 播放直链。
 
-        任务对象里的 pick_code 常指向「离线任务文件夹」（多文件/单文件都可能），
-        这种情况 downurl 返回 url:false，需要按文件名搜出真正的文件再取直链。
-        成功才写 pickcode 缓存。
+        任务 pick_code 常指向「离线任务文件夹」（多文件），downurl 返回 url:false。
+        整理：挑体积最大的视频、改名成 片名_小标题 1.35GB.mp4、移到原位置、
+        文件夹和里面其它文件丢回收站；整理后再取直链。
+
+        取不到直链时的兜底顺序（整理可能已经把任务文件夹丢回收站了）：
+        ① 挖开文件夹拿视频 pc → ② 按小标题/片名/任务名搜 → ③ 根目录按番号扫。
+
+        整理只在预算（OFFLINE_FINISH_BUDGET）内做：超预算就完全不整理，直接按
+        v1.1.21 的老路子取直链（取不到再按文件名搜），保证能及时返回不卡播放页。
         """
+        name = _to_text(name).strip()
+        title = _to_text(title).strip()
+        label = _to_text(label).strip()
+        t0 = t0 or time.time()
+        # 预算从「这次开始整理」算：前面等下载可能已经花掉十几秒，
+        # 拿提交时刻当起点会把整理和所有兜底一次跳光（live 实测踩过）
+        deadline = time.time() + OFFLINE_FINISH_BUDGET
+        play_pc, display, tidied = pc, name, False
+        if time.time() < deadline:
+            self._off_trace("整理网盘", t0)
+            try:
+                got = self._offline_tidy(pc, name, title, label,
+                                         deadline=deadline)
+                if got and got[0]:
+                    play_pc, display = got[0], got[1]
+                    tidied = True
+            except Exception:
+                play_pc, display = pc, name
+        if not play_pc:
+            play_pc, display = pc, name
+
         res = None
-        if pc:
-            res = self._resolve_pickcode(pc)
+        if play_pc:
+            self._off_trace("取直链", t0)
+            res = self._resolve_pickcode(play_pc)
+            if not res.get("url") and time.time() < deadline:
+                # 任务 pc 还是文件夹（整理没跑成）→ 挖出里面体积最大的视频再取
+                child = self._pickcode_children(play_pc, deadline=deadline)
+                if child and child != play_pc:
+                    self._off_trace("文件夹里找视频", t0)
+                    res = self._resolve_pickcode(child)
+                    if res.get("url"):
+                        play_pc = child
+                        display = self._offline_real_name(child) or display
+                        tidied = True
             if res.get("url"):
-                self._off_cache[info_hash] = pc
-                if _to_text(name):
-                    self._off_name[info_hash] = _to_text(name)
-                return self._offline_hint(res, self._offline_note("115离线完成", name),
+                # 整理过就用整理时算好的名字；没整理成才去网盘查一次实际文件名
+                if not tidied:
+                    display = self._offline_real_name(play_pc) or display
+                self._off_cache[info_hash] = play_pc
+                if display:
+                    self._off_name[info_hash] = display
+                return self._offline_hint(res,
+                                          self._offline_note("115离线完成", display),
                                           info_hash)
-        if allow_search and _to_text(name):
-            alt = self._find_pickcode_by_name(name, retries=2, interval=1,
-                                              exact=_to_text(name))
-            if alt and alt != pc:
+        # 兜底：文件夹被整理掉、pickcode 失效时按片名/小标题/任务名搜出那个视频
+        if allow_search:
+            seen = set()
+            for kw in (label, title, name):
+                kw = _to_text(kw).strip()
+                if not kw or kw in seen:
+                    continue
+                if time.time() >= deadline:
+                    break
+                seen.add(kw)
+                self._off_trace("按名字搜索", t0)
+                alt = self._find_pickcode_by_name(kw, retries=1, interval=0)
+                if not alt or alt in (pc, play_pc):
+                    continue
                 res2 = self._resolve_pickcode(alt)
                 if res2.get("url"):
+                    shown = self._offline_real_name(alt) or display or kw
                     self._off_cache[info_hash] = alt
-                    self._off_name[info_hash] = _to_text(name)
+                    self._off_name[info_hash] = shown
                     return self._offline_hint(res2,
-                                              self._offline_note("115离线完成", name),
+                                              self._offline_note("115离线完成", shown),
                                               info_hash)
                 res = res2
+            # ③ 搜索接口没结果：直接列云下载根目录按番号扫
+            if time.time() < deadline:
+                self._off_trace("根目录扫描", t0)
+                alt = self._pickcode_in_root(title, label or name,
+                                             deadline=deadline)
+                if alt and alt not in (pc, play_pc):
+                    res2 = self._resolve_pickcode(alt)
+                    if res2.get("url"):
+                        shown = self._offline_real_name(alt) or display or title
+                        self._off_cache[info_hash] = alt
+                        self._off_name[info_hash] = shown
+                        return self._offline_hint(
+                            res2,
+                            self._offline_note("115离线完成", shown),
+                            info_hash)
+                    res = res2
         return res or {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
-                       "msg": "取直链失败"}
+                       "msg": "取直链失败（%.0fs），可重试" % (time.time() - t0)}
 
-    def _submit_offline_115(self, magnet):
+    def _offline_preflight(self, res):
+        """返回直链后自测一次：用一模一样的 header 拉 64 字节。
+
+        App 端转圈时，简介里这行能当场分辨两种锅：
+        [自检] 206 … → 直链和 header 都没问题（锅在客户端没带 header / 网络）；
+        [自检] 403 … → 直链本身取不到（锅在 spider 这边的 cookie/签名）。
+        只报告，不改播放行为。
+        """
+        url = _to_text(res.get("url") or "")
+        if not url.lower().startswith("http"):
+            return ""
+        h = dict(res.get("header") or {})
+        h["Range"] = "bytes=0-63"
+        t0 = time.time()
+        sess = self._offline_session()
+        if sess is None:
+            return "[自检] 无会话"
+        code, total, body = 0, 0, ""
+        try:
+            r = sess.get(url, headers=h, timeout=8, verify=False, stream=True)
+            code = r.status_code
+            cr = _to_text(r.headers.get("Content-Range") or "")
+            mm = re.search(r"/(\d+)", cr)
+            if mm:
+                total = int(mm.group(1))
+            if code != 206:
+                try:
+                    body = _to_text(r.content[:80]).replace("\n", " ")
+                except Exception:
+                    body = ""
+            try:
+                r.close()
+            except Exception:
+                pass
+        except Exception as e:
+            return "[自检] 直链探测异常 %s（%.1fs）" % (e, time.time() - t0)
+        size = ("%.2fGB" % (total / 1073741824.0)) if total > 0 else "?"
+        if code == 206:
+            return "[自检] 直链206 ✓ %s（%.1fs）" % (size, time.time() - t0)
+        return "[自检] 直链%d ✗ %s（%.1fs）" % (code, body, time.time() - t0)
+
+    def _offline_client_probe(self, res):
+        """客户端侧链路实测（只报告，不改播放结果）。
+
+        115 直链+header 在 spider 侧 206 但 App 转圈时，这一行分辨 App 实际拿到什么：
+        lp=ext 里有没有 local_proxy_config（Atvp/PyProxy 是否会把直链改写成本地代理）；
+        pp=设备上 VideoStreamProxy 监听的端口（5000-5009 /status 探测）；
+        rw=模拟 Atvp 的 /player 改写后，App 真正会播的地址能否拉到 206。
+        """
+        lp_cfg = getattr(self, "offline_local_proxy_cfg", "")
+        parts = ["lp=%d" % (1 if lp_cfg else 0)]
+        if not lp_cfg or not requests:
+            return " ".join(parts)
+        if self._off_pp_base is None:
+            self._off_pp_base = ""
+            for port in range(5000, 5010):
+                try:
+                    s = requests.Session()
+                    s.trust_env = False
+                    r = s.get("http://127.0.0.1:%d/status" % port, timeout=0.3,
+                              verify=False)
+                    if r.status_code == 200:
+                        self._off_pp_base = "http://127.0.0.1:%d" % port
+                        break
+                except Exception:
+                    continue
+        parts.append("pp=%s" % (self._off_pp_base.rsplit(":", 1)[-1]
+                                if self._off_pp_base else "-"))
+        if not self._off_pp_base:
+            return " ".join(parts)
+        url = _to_text(res.get("url") or "")
+        if not url.startswith(("http://", "https://")):
+            parts.append("rw=skip")
+            return " ".join(parts)
+        lp_obj = lp_cfg
+        if isinstance(lp_obj, str):
+            try:
+                lp_obj = json.loads(lp_obj)
+            except Exception:
+                try:
+                    import ast
+                    lp_obj = ast.literal_eval(lp_obj)
+                except Exception:
+                    pass
+        s = requests.Session()
+        s.trust_env = False
+        t0 = time.time()
+        try:
+            r = s.post(self._off_pp_base + "/player", json={
+                "playerContent": json.dumps(res, ensure_ascii=False),
+                "taskSeed": "selfchk",
+                "localProxyConfig": lp_obj,
+            }, timeout=10, verify=False)
+            if r.status_code != 200:
+                parts.append("rw=http%d" % r.status_code)
+                return " ".join(parts)
+            proxied = r.json()
+            if not isinstance(proxied, dict):
+                parts.append("rw=badjson")
+                return " ".join(parts)
+            u2 = _to_text(proxied.get("url") or "")
+            if not u2:
+                parts.append("rw=nourl:%s" % _to_text(
+                    proxied.get("msg") or proxied.get("error") or "")[:40])
+                return " ".join(parts)
+            if u2 == url:
+                parts.append("rw=same")
+                return " ".join(parts)
+            mm = re.match(r"https?://([^/]+)", u2)
+            host = mm.group(1) if mm else "?"
+            if not u2.startswith(("http://", "https://")):
+                parts.append("rw=other:%s" % u2[:40])
+                return " ".join(parts)
+            try:
+                rr = s.get(u2, headers={"Range": "bytes=0-63"}, timeout=8,
+                           verify=False, stream=True)
+                parts.append("rw=%d@%s(%.1fs)" % (rr.status_code, host,
+                                                  time.time() - t0))
+                try:
+                    rr.close()
+                except Exception:
+                    pass
+            except Exception as e:
+                parts.append("rw=err:%s@%s" % (str(e)[:30], host))
+        except Exception as e:
+            parts.append("rw=err:%s" % str(e)[:50])
+        return " ".join(parts)
+
+    def _play_offline_safe(self, magnet, title="", label=""):
+        """离线播放入口兜底：任何异常都要落到 msg，绝不允许静默转圈。
+
+        OK影视/影视仓 只看 playerContent 的返回；抛异常时 App 端既无 msg 也无 url，
+        播放页就一直转圈没提示。
+        """
+        t0 = time.time()
+        try:
+            res = self._submit_offline_115(magnet, title, label)
+        except Exception as e:
+            res = {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                   "msg": "115离线出错：%s" % e}
+        if not isinstance(res, dict):
+            res = {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                   "msg": "115离线返回异常"}
+        if res.get("url"):
+            # 自检：把直链实测结果塞进简介（播放页 desc / 详情页 [上次播放]）
+            chk = ""
+            try:
+                chk = self._offline_preflight(res)
+            except Exception as e:
+                chk = "[自检] 异常 %s" % e
+            if chk:
+                res["desc"] = (_to_text(res.get("desc")) + "\n" + chk).strip()
+            cli = ""
+            try:
+                cli = self._offline_client_probe(res)
+            except Exception as e:
+                cli = "err %s" % e
+            if cli:
+                res["desc"] = (_to_text(res.get("desc"))
+                               + "\n[自检2] " + cli).strip()
+            note = chk
+            if cli:
+                note = (note + "  [自检2] " + cli) if note else ("[自检2] " + cli)
+            self._set_off_last("115离线：成功（%.0fs）%s"
+                               % (time.time() - t0, (" " + note) if note else ""))
+            return res
+        if not res.get("msg"):
+            res["msg"] = "115离线取直链失败，请重试"
+        self._set_off_last("115离线：失败 %s" % res.get("msg"))
+        return res
+
+    def _search_video(self, title, label):
+        """提交前先搜网盘：→ (pickcode, 文件名)；没下过就返回 ("", "")。
+
+        搜索接口自带文件名，核对一遍番号再用——同番号可能有好几个画质版本，
+        对不上就当没找到，照常提交离线任务（宁可多提交也别播错文件）。
+        """
+        title = _to_text(title).strip()
+        label = _to_text(label).strip()
+        if not (title or label):
+            return "", ""
+        # 搜的词：先整条小标题（最准），再片名，最后才是拆出来的番号
+        terms, codes = [], []
+        for kw in (label, title):
+            kw = _to_text(kw).strip()
+            if kw and kw.lower() not in [t.lower() for t in terms]:
+                terms.append(kw)
+            code = self._guess_keyword_from_name(kw)
+            if not code:
+                continue
+            if code.lower() not in [c.lower() for c in codes]:
+                codes.append(code)
+            if code.lower() not in [t.lower() for t in terms]:
+                terms.append(code)
+        if not terms:
+            return "", ""
+        # 带数字的才算番号（ABF-390）；「高清 4 70GB」这种拆出来的碎片不算，
+        # 拿它去核对文件名只会把对的文件也判错
+        codes = [k for k in codes
+                 if re.match(r"^[A-Za-z]{2,10}[-_ ]?\d{2,5}$", k)]
+        rows = []
+        for keyword in terms:
+            # type=4 视频优先，找不到再搜全部
+            for stype in (4, 0):
+                for it in self._search_rows(keyword, stype):
+                    if int(it.get("fc") or 0) != 1:
+                        continue
+                    pc = it.get("pc") or it.get("pick_code") or it.get("pickcode")
+                    n = _to_text(it.get("n") or it.get("name") or "")
+                    if pc and n:
+                        rows.append((pc, n))
+                if rows:
+                    break
+            if rows:
+                break
+        # 最准的先要：文件名里连小标题+大小都对上（整理过就是 片名_小标题 大小.mp4）
+        if label:
+            low = label.lower()
+            for pc, n in rows:
+                if low in n.lower():
+                    return pc, n
+        for pc, n in rows:
+            low = n.lower()
+            if not codes or any(c.lower() in low for c in codes):
+                return pc, n
+        return "", ""
+
+    def _submit_offline_115(self, magnet, title="", label=""):
         if not self.enable_offline_115:
             return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
                     "msg": "115离线已关闭（ext.enableOffline115）"}
+        # dn 必须在 normalize 之前取：_normalize_magnet 只留 btih，会把 dn 丢掉
+        dn_hint = self._magnet_dn(magnet)
         magnet = _normalize_magnet(magnet)
         if not self.cookie_115:
             return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
@@ -2009,6 +2859,9 @@ class Spider:
         if not requests or self._offline_session() is None:
             return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
                     "msg": "requests 模块不可用"}
+
+        t0 = time.time()
+        self._off_trace("开始处理", t0, force=True)
 
         info_hash = self._magnet_hash(magnet)
         if not info_hash:
@@ -2018,6 +2871,7 @@ class Spider:
         # 已经离线过：直接拿缓存的 pickcode 取直链，不再提交
         cached = self._off_cache.get(info_hash)
         if cached:
+            self._off_trace("命中缓存，取直链", t0)
             res = self._resolve_pickcode(cached)
             if res.get("url"):
                 return self._offline_hint(
@@ -2027,43 +2881,91 @@ class Spider:
             self._off_cache.pop(info_hash, None)
             self._off_name.pop(info_hash, None)
 
-        try:
-            add = self._offline_add(magnet)
-        except Exception as e:
-            return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
-                    "msg": "提交离线失败：%s" % e}
-
-        # 115 把重复提交算失败（error_msg=任务已存在…），只要任务还在就继续走
-        add_msg = _to_text(add.get("message") or add.get("error_msg")
-                           or add.get("error"))
-        existed = any(k in add_msg for k in ("已存在", "重复"))
-
+        # ---- 冷启动重播：缓存 → 搜网盘 → 查任务 → 才提交，能不提交就不提交 ----
+        early_fail = None
         task = None
+        task_name = ""
+
+        # 1) 网盘里可能已经有（小标题/片名搜，文件名对得上番号才算数）
+        if _to_text(title) or _to_text(label) or dn_hint:
+            self._off_trace("先搜网盘", t0)
+            pc1, name1 = self._search_video(_to_text(title) or dn_hint,
+                                            _to_text(label) or dn_hint)
+            if pc1:
+                self._off_cache[info_hash] = pc1
+                res1 = self._offline_finish(info_hash, pc1, name1,
+                                            title=title, label=label,
+                                            allow_search=True, t0=t0)
+                if res1.get("url"):
+                    return res1
+                if res1.get("msg"):
+                    early_fail = res1
+
+        # 2) 离线任务可能早就在（上次提交过）：不重复 add
         try:
             task = self._offline_find_task(info_hash)
         except Exception:
             task = None
+        task_name = _to_text(task.get("name") or task.get("file_name") or "") \
+            if task else ""
 
-        if not task and not add.get("state") and not existed:
-            return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
-                    "msg": "115离线提交失败：%s" % (add_msg or "提交失败")}
-
-        task_name = _to_text(task.get("name") or task.get("file_name") or "") if task else ""
-        early_fail = None
-
-        # 秒传 / 已下完：任务对象里直接带 pick_code，直接取直链
         if task:
             done0, failed0, msg0 = self._offline_task_state(task)
-            if failed0:
-                return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
-                        "msg": "115离线失败：%s" % msg0}
             pc0 = self._task_pickcode(task)
             if done0 and pc0:
-                res0 = self._offline_finish(info_hash, pc0, task_name, allow_search=True)
+                self._off_trace("任务已完成，整理并取直链", t0)
+                res0 = self._offline_finish(info_hash, pc0, task_name,
+                                            title=title, label=label,
+                                            allow_search=True, t0=t0)
                 if res0.get("url"):
                     return res0
                 early_fail = res0
+            elif failed0:
+                task = None            # 上次任务失败：重新提交一次再看结果
 
+        # 3) 任务不在 → 才提交
+        if not task:
+            self._off_trace("提交离线任务", t0)
+            try:
+                add = self._offline_add(magnet)
+            except Exception as e:
+                return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                        "msg": "提交离线失败：%s" % e}
+
+            # 115 把重复提交算失败（error_msg=任务已存在…），只要任务还在就继续走
+            add_msg = _to_text(add.get("message") or add.get("error_msg")
+                               or add.get("error"))
+            existed = any(k in add_msg for k in ("已存在", "重复"))
+
+            try:
+                task = self._offline_find_task(info_hash)
+            except Exception:
+                task = None
+
+            if not task and not add.get("state") and not existed:
+                return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                        "msg": "115离线提交失败：%s" % (add_msg or "提交失败")}
+
+            task_name = _to_text(task.get("name") or task.get("file_name") or "") \
+                if task else ""
+
+            # 秒传 / 已下完：任务对象里直接带 pick_code，直接取直链
+            if task:
+                done0, failed0, msg0 = self._offline_task_state(task)
+                if failed0:
+                    return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                            "msg": "115离线失败：%s" % msg0}
+                pc0 = self._task_pickcode(task)
+                if done0 and pc0:
+                    self._off_trace("任务已完成，整理并取直链", t0)
+                    res0 = self._offline_finish(info_hash, pc0, task_name,
+                                                title=title, label=label,
+                                                allow_search=True, t0=t0)
+                    if res0.get("url"):
+                        return res0
+                    early_fail = res0
+
+        self._off_trace("等待离线完成", t0)
         done, name_or_msg = self._offline_wait_done(info_hash)
         if not done:
             return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
@@ -2077,7 +2979,8 @@ class Spider:
             task = None
         pickcode = self._task_pickcode(task)
         if pickcode:
-            res = self._offline_finish(info_hash, pickcode, name, allow_search=True)
+            res = self._offline_finish(info_hash, pickcode, name,
+                                       title=title, label=label, allow_search=True, t0=t0)
             if res.get("url"):
                 return res
             if early_fail:
@@ -2090,7 +2993,8 @@ class Spider:
                 "parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
                 "msg": "离线已完成，但115网盘里还没搜到文件，请稍后重试"}
 
-        res = self._offline_finish(info_hash, pickcode, name, allow_search=False)
+        res = self._offline_finish(info_hash, pickcode, name,
+                                   title=title, label=label, allow_search=False, t0=t0)
         if res.get("url") or not early_fail:
             return res
         return early_fail
@@ -2139,33 +3043,57 @@ class Spider:
         }
 
     # ========== 播放 ==========
+    def _offline_test_result(self):
+        """二分实验：ext.offlineTestMp4 打开时，115 离线入口直接回公开测试片。
+
+        noheader → url + format，不带 header（判断 result 结构本身能不能播）
+        header   → 再带上 UA/Referer（判断 header 通道有没有被 App 吞掉）
+        """
+        mode = self.offline_test_mp4
+        with_header = mode in ("header", "withheader", "1", "true", "yes")
+        res = {"parse": 0, "jx": 0, "playUrl": "", "url": OFFLINE_TEST_MP4,
+               "format": "video/mp4", "header": dict(OFFLINE_TEST_HEADER)
+               if with_header else {}}
+        res["desc"] = ("[实验] offlineTestMp4=%s（公开测试片，未走115）\n"
+                       "能播 → result 结构没问题，锅在 115 直链/header；"
+                       "不能播 → 结构/被 App 处理坏了" % mode)
+        self._set_off_last("实验直链 offlineTestMp4=%s" % mode)
+        return res
+
     def playerContent(self, flag, ids, vipFlags=None):
         vid = str(ids[0]) if isinstance(ids, (list, tuple)) and ids else str(ids or "")
+        # 留痕：只要 App 调过 playerContent 就一定有这行（详情页简介首行能看到）
+        self._set_off_last("收到播放请求：%s" % _to_text(vid)[:50])
 
-        # 115 离线：http://115off/<base64(磁力)> → 提交离线 → 取播放直链
+        # 二分实验：只劫持 115 离线入口，其它播放源一律不碰
+        if self.offline_test_mp4 and (vid.startswith(OFF_PREFIX_115)
+                                      or vid.startswith("115off:")
+                                      or vid.startswith("jav_movie115_")):
+            return self._offline_test_result()
+
+        # 115 离线：http://115off/<base64(磁力|json)> → 提交离线 → 取播放直链
         if vid.startswith(OFF_PREFIX_115):
-            b64 = vid[len(OFF_PREFIX_115):].strip()
-            try:
-                magnet = base64.b64decode(b64.encode("ascii")).decode("utf-8")
-            except Exception:
+            magnet, title, label = _off_id_decode(vid[len(OFF_PREFIX_115):])
+            if not magnet:
                 return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
                         "msg": "磁力解码失败"}
-            return self._submit_offline_115(magnet)
+            return self._play_offline_safe(magnet, title, label)
 
         if vid.startswith("115off:"):
-            return self._submit_offline_115(vid[len("115off:"):].strip())
+            return self._play_offline_safe(vid[len("115off:"):].strip())
 
         # 女优列表的「115离线」源：先取该片磁力，再提交到 115
         if vid.startswith("jav_movie115_"):
-            mid = vid[len("jav_movie115_"):]
+            mid = vid[len("jav_movie115_"):].split("?")[0].split("#")[0]
             try:
                 magnets = self._magnets_of(mid)
             except Exception:
                 magnets = []
-            for g in magnets:
+            for i, g in enumerate(magnets):
                 m = _normalize_magnet(g.get("magnet"))
                 if m:
-                    return self._submit_offline_115(m)
+                    return self._play_offline_safe(m, self._title_of(mid),
+                                                   self._magnet_label(g, i, ""))
             return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
                     "msg": "该片没有可用磁力，无法115离线"}
 
@@ -2212,7 +3140,141 @@ class Spider:
         if _to_text(param.get("k")) == "offnote":
             body = self._offline_srt(param.get("v") or "")
             return [200, "application/x-subrip", body.encode("utf-8"), {}]
+        # 播放回流：客户端只管要 proxy://，Cookie 由这边补
+        if _to_text(param.get("k")) == "offplay":
+            return self._offline_relay_stream(param)
         return [404, "text/plain", b"Not Found", {}]
+
+    @staticmethod
+    def _in_atvp():
+        """跑在 alist-tvbox 的 Atvp 包装里吗？
+
+        Atvp._load_inner_spider_class 是用 ModuleType("atvp_inner_spider") exec 本文件的，
+        所以类的 __module__ 就是判据；直连 OK影视 时是别的模块名。
+        """
+        try:
+            return __name__ == "atvp_inner_spider"
+        except Exception:
+            return False
+
+    def _offline_relay_url(self, url):
+        """115 直链 → 本地代理地址（跑爬虫的那端负责带 Cookie 回流）。
+
+        拼法跟字幕 subs 完全一致：base + do=py + siteKey（local 才能路由回本爬虫）。
+        """
+        try:
+            tok = base64.b64encode(_to_text(url).encode("utf-8")).decode("ascii")
+        except Exception:
+            tok = ""
+        key = _to_text(getattr(self, "siteKey", ""))
+        q = "do=py" + ("&siteKey=%s" % quote(key) if key else "")
+        return self._offline_proxy_base() + q + "&k=offplay&u=%s" % quote(tok)
+
+    @staticmethod
+    def _offline_range_bounds(rng):
+        """从 Range: bytes=2048-4095 里取 (起, 止)；没有 Range 返回 (None, None)"""
+        m = re.match(r"^\s*bytes\s*=\s*(\d+)\s*-\s*(\d*)\s*$", _to_text(rng) or "")
+        if not m:
+            return None, None
+        start = int(m.group(1))
+        end = int(m.group(2)) if m.group(2) else None
+        return start, end
+
+    @classmethod
+    def _offline_range_start(cls, rng):
+        return cls._offline_range_bounds(rng)[0]
+
+    def _offline_relay_stream(self, param):
+        """把 115 直链按 Range 分段回给播放器（每次都带 Cookie）。
+
+        客户端只发 proxy:// 地址，不用它转发 header；单次最多回
+        OFFLINE_RELAY_CHUNK 字节，靠 206 + Content-Range 让播放器继续要下一段。
+        """
+        raw = _to_text(param.get("u") or "")
+        url = ""
+        for cand in (raw, unquote(raw)):
+            try:
+                url = base64.b64decode(cand.encode("ascii")).decode("utf-8")
+                break
+            except Exception:
+                continue
+        if not url.lower().startswith("http"):
+            return [404, "text/plain", b"bad url", {}]
+        rng = ""
+        for key in ("range", "Range", "RANGE"):
+            if param.get(key):
+                rng = _to_text(param.get(key))
+                break
+        start, end = self._offline_range_bounds(rng)
+        if end is not None and end < start:
+            end = None                      # 起止颠倒的 Range 当成开放区间
+        if start is None:
+            start = self._off_relay_pos
+        log = (start == 0)
+        cap = OFFLINE_RELAY_CHUNK
+        if end is not None and end >= start:
+            cap = min(cap, end - start + 1)
+        ck = self._off_ck.get(url.split("?")[0]) or self.cookie_115
+        headers = {"User-Agent": OFFLINE_UA, "Cookie": ck,
+                   "Referer": "https://115.com/", "Accept": "*/*",
+                   "Range": "bytes=%s" % ("%d-%d" % (start, end) if end is not None
+                                          else "%d-" % start)}
+        sess = self._offline_session()
+        if sess is None:
+            return [502, "text/plain", b"no session", {}]
+        try:
+            r = sess.get(url, headers=headers, stream=True, timeout=20, verify=False)
+        except Exception as e:
+            return [502, "text/plain", ("fetch failed: %s" % e).encode("utf-8", "ignore"), {}]
+        if r.status_code not in (200, 206):
+            body = b""
+            try:
+                body = r.content[:200]
+            except Exception:
+                pass
+            return [r.status_code or 502, "application/json", body, {}]
+        total = -1
+        crange = r.headers.get("Content-Range") or ""
+        m = re.search(r"/(\d+)\s*$", crange)
+        if m:
+            total = int(m.group(1))
+        elif r.headers.get("Content-Length"):
+            try:
+                total = start + int(r.headers.get("Content-Length"))
+            except Exception:
+                total = -1
+        data = b""
+        try:
+            for chunk in r.iter_content(65536):
+                if not chunk:
+                    continue
+                data += chunk
+                if len(data) >= cap:
+                    data = data[:cap]
+                    break
+        except Exception:
+            pass
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
+        if not data:
+            return [416, "text/plain", b"", {"Content-Range": "bytes */%d" % total}
+                    if total > 0 else {}]
+        end = start + len(data) - 1
+        if not rng:
+            self._off_relay_pos = end + 1
+        if total < 0:
+            total = end + 1
+        if log and not self._off_relay_logged:
+            self._off_relay_logged = True
+            self._set_off_last("代理回流：bytes %d-%d/%d（带Cookie）" % (start, end, total))
+        return [206, "video/mp4", data, {
+            "Content-Range": "bytes %d-%d/%d" % (start, end, total),
+            "Content-Length": str(len(data)),
+            "Accept-Ranges": "bytes",
+        }]
 
     def manualVideoCheck(self):
         return False
