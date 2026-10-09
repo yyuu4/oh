@@ -1,4 +1,4 @@
-VERSION = "1.1.26"
+VERSION = "1.1.27"
 # -*- coding: utf-8 -*-
 import os
 import re
@@ -56,6 +56,7 @@ IMG_PROXY = ""
 #     "offlineSavePath": "0",                  # 115 离线保存目录 cid，默认根目录
 #     "offlineAppVer": "4.8.2",                # 115 离线接口 appVer
 #     "offlineProxy": ""                       # 115 接口代理，"" = 直连（不走上面的 PROXY）
+#     "offlineTestMp4": ""                     # 二分实验："noheader"/"header" 才开，正常留空
 #   }
 # 优先级：ext > 顶部 PROXY / IMG_PROXY
 #
@@ -179,12 +180,20 @@ OFFLINE_VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".flv", ".ts", ".m4v",
                       ".webm", ".m2ts", ".rmvb", ".vob", ".mp2")
 OFFLINE_ADD_API = "https://115.com/web/lixian/?ct=lixian&ac=add_task_urls"
 OFFLINE_LIST_API = "https://115.com/web/lixian/?ct=lixian&ac=task_lists"
-OFFLINE_POLL_TIMEOUT = 12
+OFFLINE_POLL_TIMEOUT = 15
 OFFLINE_POLL_INTERVAL = 1
 # 整理+取直链一起最多花几秒；超了就不整理，直接走 v1.1.21 的老路径（先直链、取不到再搜）
 OFFLINE_FINISH_BUDGET = 9
 # 超过几秒还没好，就开始每一步都弹提示（卡在哪一步一看就知道）
 OFFLINE_TRACE_AFTER = 4
+# 二分实验用的公开测试片（免鉴权、支持 Range），只在 ext.offlineTestMp4 打开时用
+OFFLINE_TEST_MP4 = ("https://commondatastorage.googleapis.com/gtv-videos-bucket/"
+                    "sample/BigBuckBunny.mp4")
+OFFLINE_TEST_HEADER = {
+    "User-Agent": OFFLINE_UA,
+    "Referer": "https://115.com/",
+    "Accept": "*/*",
+}
 
 RSA_N = 0x8686980c0f5a24c4b9d43020cd2c22703ff3f450756529058b1cf88f09b8602136477198a6e2683149659bd122c33592fdb5ad47944ad1ea4d36c6b172aad6338c3bb6ac6227502d010993ac967d1aef00f0c8e038de2e4d3bc2ec368af2e9f10a6f1eda4f7262f136420c07c331b871bf139f74f3010e3c4fe57df3afb71683
 RSA_E = 0x10001
@@ -778,6 +787,8 @@ class Spider:
         self.offline_timeout = 10
         self.offline_proxy = ""
         self.offline_debug = True
+        # 二分实验开关（ext.offlineTestMp4）："" = 关闭
+        self.offline_test_mp4 = ""
         # info_hash -> pickcode 缓存，重试时不再重新搜文件
         self._off_cache = {}
         # info_hash -> 文件名，缓存命中时给成功提示用
@@ -895,6 +906,9 @@ class Spider:
         if "offlineDebug" in extend:
             self.offline_debug = str(extend.get("offlineDebug")).lower() not in (
                 "0", "false", "off", "no")
+        # 二分实验：播放直接返回公开测试 MP4，用来判断「转圈不出画」是
+        # result 结构问题 还是 115 直链/header 的问题。"" = 关闭，线上行为不变
+        self.offline_test_mp4 = _to_text(extend.get("offlineTestMp4")).strip().lower()
 
         # 自动选域名：配置了代理全走代理，否则免代理 > 最快
         self._ensure_host()
@@ -1792,6 +1806,17 @@ class Spider:
         m = re.search(r"btih:([0-9a-fA-F]{40}|[0-9a-zA-Z]{32})", magnet or "")
         return m.group(1).lower() if m else ""
 
+    @staticmethod
+    def _magnet_dn(magnet):
+        """磁力链接里的 dn 参数（原始文件名）→ 用来提交前先搜一遍网盘"""
+        m = re.search(r"[?&]dn=([^&]+)", magnet or "")
+        if not m:
+            return ""
+        try:
+            return unquote(m.group(1)).replace("+", " ").strip()
+        except Exception:
+            return ""
+
     def _offline_add(self, magnet):
         sess = self._offline_session()
         if sess is None:
@@ -2404,6 +2429,8 @@ class Spider:
         if not self.enable_offline_115:
             return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
                     "msg": "115离线已关闭（ext.enableOffline115）"}
+        # dn 必须在 normalize 之前取：_normalize_magnet 只留 btih，会把 dn 丢掉
+        dn_hint = self._magnet_dn(magnet)
         magnet = _normalize_magnet(magnet)
         if not self.cookie_115:
             return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
@@ -2433,37 +2460,37 @@ class Spider:
             self._off_cache.pop(info_hash, None)
             self._off_name.pop(info_hash, None)
 
-        self._off_trace("提交离线任务", t0)
-        try:
-            add = self._offline_add(magnet)
-        except Exception as e:
-            return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
-                    "msg": "提交离线失败：%s" % e}
+        # ---- 冷启动重播：先搜网盘、再看已有任务，能不提交就不提交 ----
+        # （借鉴 良最新 的顺序：缓存 → 按名搜网盘 → 查任务 → 才提交，
+        #   上次下完但 App 重启丢了缓存时，省掉 task_lists + add_task_urls 两次请求）
+        name_hint = dn_hint
+        early_fail = None
 
-        # 115 把重复提交算失败（error_msg=任务已存在…），只要任务还在就继续走
-        add_msg = _to_text(add.get("message") or add.get("error_msg")
-                           or add.get("error"))
-        existed = any(k in add_msg for k in ("已存在", "重复"))
+        # 1) 网盘里可能已经有文件（dn 是磁力自带的原始文件名）
+        if name_hint:
+            self._off_trace("先搜网盘", t0)
+            pc1 = self._find_pickcode_by_name(name_hint, retries=1, interval=0)
+            if pc1:
+                self._off_cache[info_hash] = pc1
+                res1 = self._offline_finish(info_hash, pc1, name_hint, title=title,
+                                            label=label, allow_search=True, t0=t0)
+                if res1.get("url"):
+                    return res1
+                if res1.get("msg"):
+                    early_fail = res1
 
+        # 2) 离线任务可能早就在（上次提交过）
         task = None
         try:
             task = self._offline_find_task(info_hash)
         except Exception:
             task = None
-
-        if not task and not add.get("state") and not existed:
-            return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
-                    "msg": "115离线提交失败：%s" % (add_msg or "提交失败")}
-
         task_name = _to_text(task.get("name") or task.get("file_name") or "") if task else ""
-        early_fail = None
+        if not name_hint:
+            name_hint = task_name
 
-        # 秒传 / 已下完：任务对象里直接带 pick_code，直接取直链
         if task:
             done0, failed0, msg0 = self._offline_task_state(task)
-            if failed0:
-                return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
-                        "msg": "115离线失败：%s" % msg0}
             pc0 = self._task_pickcode(task)
             if done0 and pc0:
                 self._off_trace("任务已完成，整理并取直链", t0)
@@ -2472,6 +2499,51 @@ class Spider:
                 if res0.get("url"):
                     return res0
                 early_fail = res0
+            elif failed0:
+                # 上次任务失败：重新提交一次再看结果（保持老流程的重试语义）
+                task = None
+
+        if not task:
+            self._off_trace("提交离线任务", t0)
+            try:
+                add = self._offline_add(magnet)
+            except Exception as e:
+                return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                        "msg": "提交离线失败：%s" % e}
+
+            # 115 把重复提交算失败（error_msg=任务已存在…），只要任务还在就继续走
+            add_msg = _to_text(add.get("message") or add.get("error_msg")
+                               or add.get("error"))
+            existed = any(k in add_msg for k in ("已存在", "重复"))
+
+            try:
+                task = self._offline_find_task(info_hash)
+            except Exception:
+                task = None
+
+            if not task and not add.get("state") and not existed:
+                return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                        "msg": "115离线提交失败：%s" % (add_msg or "提交失败")}
+
+            task_name = _to_text(task.get("name") or task.get("file_name") or "") if task else ""
+            if not name_hint:
+                name_hint = task_name
+
+            # 秒传 / 已下完：任务对象里直接带 pick_code，直接取直链
+            if task:
+                done0, failed0, msg0 = self._offline_task_state(task)
+                if failed0:
+                    return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                            "msg": "115离线失败：%s" % msg0}
+                pc0 = self._task_pickcode(task)
+                if done0 and pc0:
+                    self._off_trace("任务已完成，整理并取直链", t0)
+                    res0 = self._offline_finish(info_hash, pc0, task_name,
+                                                title=title, label=label,
+                                                allow_search=True, t0=t0)
+                    if res0.get("url"):
+                        return res0
+                    early_fail = res0
 
         self._off_trace("等待离线完成", t0)
         done, name_or_msg = self._offline_wait_done(info_hash)
@@ -2551,10 +2623,33 @@ class Spider:
         }
 
     # ========== 播放 ==========
+    def _offline_test_result(self):
+        """二分实验：ext.offlineTestMp4 打开时，115 离线入口直接回公开测试片。
+
+        noheader → url + format，不带 header（判断 result 结构本身能不能播）
+        header   → 再带上 UA/Referer（判断 header 通道有没有被 App 吞掉）
+        """
+        mode = self.offline_test_mp4
+        with_header = mode in ("header", "withheader", "1", "true", "yes")
+        res = {"parse": 0, "jx": 0, "playUrl": "", "url": OFFLINE_TEST_MP4,
+               "format": "video/mp4", "header": dict(OFFLINE_TEST_HEADER)
+               if with_header else {}}
+        res["desc"] = ("[实验] offlineTestMp4=%s（公开测试片，未走115）\n"
+                       "能播 → result 结构没问题，锅在 115 直链/header；"
+                       "不能播 → 结构/被 App 处理坏了" % mode)
+        self._set_off_last("实验直链 offlineTestMp4=%s" % mode)
+        return res
+
     def playerContent(self, flag, ids, vipFlags=None):
         vid = str(ids[0]) if isinstance(ids, (list, tuple)) and ids else str(ids or "")
         # 留痕：只要 App 调过 playerContent 就一定有这行（详情页简介首行能看到）
         self._set_off_last("收到播放请求：%s" % _to_text(vid)[:50])
+
+        # 二分实验：只劫持 115 离线入口，其它播放源一律不碰
+        if self.offline_test_mp4 and (vid.startswith(OFF_PREFIX_115)
+                                      or vid.startswith("115off:")
+                                      or vid.startswith("jav_movie115_")):
+            return self._offline_test_result()
 
         # 115 离线：http://115off/<base64(磁力|json)> → 提交离线 → 取播放直链
         if vid.startswith(OFF_PREFIX_115):
