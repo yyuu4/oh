@@ -1,4 +1,4 @@
-VERSION = "1.1.19"
+VERSION = "1.1.20"
 # -*- coding: utf-8 -*-
 import os
 import re
@@ -716,6 +716,8 @@ class Spider:
         self._off_cache = {}
         # info_hash -> 文件名，缓存命中时给成功提示用
         self._off_name = {}
+        # info_hash -> 该片原简介（详情页拿到），播放页 desc 提示时放在提示后面
+        self._off_syn = {}
         # 已经在详情页弹过提示的 info_hash（每部片每次会话只弹一次）
         self._off_notified = set()
 
@@ -1404,7 +1406,7 @@ class Spider:
         if genres:
             info_lines.append("类别: %s" % "、".join(genres))
         if self.enable_offline_115:
-            info_lines.append("115离线：提交到115云端，完成后自动直连播放")
+            info_lines.append("115离线：提交到115云端，完成后自动直连播放 (v%s)" % VERSION)
 
         magnets = []
         if self.enable_magnet or self.enable_offline_115:
@@ -1456,6 +1458,26 @@ class Spider:
         elif num:
             vod_name = num
 
+        # 记下原简介：播放页 desc 提示时把提示放在原简介前面，不把原简介顶掉
+        base_content = "\n".join(info_lines)
+        if self.enable_offline_115:
+            for (_g, _raw, _clean, h) in magnet_items:
+                if h not in self._off_syn:
+                    self._off_syn[h] = base_content
+
+        # 已经离线完成的片子：简介第一行给提示，打开详情页再弹一次 toast。
+        # FongMi 对 detailContent 的 msg 是 Notify.show（list 非空不会被打断），
+        # 而 playerContent 的 msg 会被当播放错误，两边不能混用。
+        done_note = ""
+        first_h = ""
+        for (_g, _raw, _clean, h) in magnet_items:
+            if h in self._off_name:
+                done_note = self._offline_note("115离线完成", self._off_name.get(h, ""))
+                first_h = h
+                break
+        if done_note:
+            info_lines.insert(0, done_note)
+
         item = {
             "vod_id": vid,
             "vod_name": vod_name or vid,
@@ -1468,18 +1490,10 @@ class Spider:
             item["vod_play_from"] = "$$$".join(froms)
             item["vod_play_url"] = "$$$".join(urls)
 
-        # 已经离线完成的片子：进详情页给一次 toast 提示。
-        # FongMi 对 detailContent 的 msg 是 Notify.show（list 非空不会被打断），
-        # 而 playerContent 的 msg 会被当播放错误，两边不能混用。
-        note = ""
-        for (_g, _raw, _clean, h) in magnet_items:
-            if h in self._off_name and h not in self._off_notified:
-                self._off_notified.add(h)
-                note = self._offline_note("115离线完成", self._off_name.get(h, ""))
-                break
         res = {"list": [item]}
-        if note:
-            res["msg"] = note
+        if done_note and first_h not in self._off_notified:
+            self._off_notified.add(first_h)
+            res["msg"] = done_note
         return res
 
     def _actress_detail(self, vid):
@@ -1915,7 +1929,9 @@ class Spider:
         不能用 msg：FongMi/OK影视 的 PlaybackActivity.getPlaybackError() 里
         `if (result.hasMsg()) return result.getMsg()`，playerContent 的 msg 一律当
         播放错误处理（成功也会打断播放），msg 只留给真正的错误。
-        成功提示走两个非阻塞通道：desc（详情面板描述区）+ subs（画面下方字幕条）。
+        播放页没有可用的 toast 入口，成功提示走三个非阻塞通道：
+        desc（播放页描述面板，提示放原简介前面）+ detailContent 的 msg（打开详情页时
+        Notify.show 一次）+ subs（画面下方 8 秒字幕）。
         """
         name = _to_text(name).strip()
         return "%s：%s" % (prefix, name) if name else prefix
@@ -1936,9 +1952,14 @@ class Spider:
         text = _to_text(text).strip() or "115离线完成"
         return "1\n00:00:00,000 --> 00:00:08,000\n%s\n\n" % text
 
-    def _offline_hint(self, res, note):
-        """成功结果挂提示：绝不写 msg（会变成播放错误），用 desc + subs。"""
-        res["desc"] = note
+    def _offline_hint(self, res, note, info_hash=""):
+        """成功结果挂提示：绝不写 msg（会变成播放错误），用 desc + subs。
+
+        desc 落在播放页的描述面板（renderDescription → mBinding.content），
+        把提示放在原简介前面，原简介仍然保留。
+        """
+        syn = _to_text(self._off_syn.get(info_hash, "")) if info_hash else ""
+        res["desc"] = (note + "\n\n" + syn) if syn else note
         try:
             # siteKey 由 App 在 init 前注入（chaquo 里 obj.put("siteKey", ...)），
             # 带上它，本地 /proxy 才能路由回本爬虫
@@ -1965,7 +1986,8 @@ class Spider:
                 self._off_cache[info_hash] = pc
                 if _to_text(name):
                     self._off_name[info_hash] = _to_text(name)
-                return self._offline_hint(res, self._offline_note("115离线完成", name))
+                return self._offline_hint(res, self._offline_note("115离线完成", name),
+                                          info_hash)
         if allow_search and _to_text(name):
             alt = self._find_pickcode_by_name(name, retries=2, interval=1,
                                               exact=_to_text(name))
@@ -1974,7 +1996,9 @@ class Spider:
                 if res2.get("url"):
                     self._off_cache[info_hash] = alt
                     self._off_name[info_hash] = _to_text(name)
-                    return self._offline_hint(res2, self._offline_note("115离线完成", name))
+                    return self._offline_hint(res2,
+                                              self._offline_note("115离线完成", name),
+                                              info_hash)
                 res = res2
         return res or {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
                        "msg": "取直链失败"}
@@ -2003,7 +2027,8 @@ class Spider:
             if res.get("url"):
                 return self._offline_hint(
                     res, self._offline_note("115离线命中缓存",
-                                            self._off_name.get(info_hash, "")))
+                                            self._off_name.get(info_hash, "")),
+                    info_hash)
             self._off_cache.pop(info_hash, None)
             self._off_name.pop(info_hash, None)
 
