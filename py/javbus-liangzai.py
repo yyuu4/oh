@@ -1,4 +1,4 @@
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 # -*- coding: utf-8 -*-
 import os
 import re
@@ -901,6 +901,7 @@ class Spider:
                 _env("Y115_COOKIE")
                 or _env("MY115_COOKIE")
                 or DEFAULT_COOKIE_115
+                or _to_text(extend.get("cookie115"))
             )
         else:
             self.cookie_115 = (
@@ -2077,10 +2078,8 @@ class Spider:
         # 记下这条直链对应的完整 Cookie（含 downurl 下发的 CDN 令牌）
         self._off_ck = dict(list(self._off_ck.items())[-8:])
         self._off_ck[real_url.split("?")[0]] = final_cookie
-        # 插件链路（alist-tvbox 的 csp_PyProxy）会把 header 丢掉 → 直链 403。
-        # Atvp 包装里自动改指本地代理，Cookie 由跑爬虫的那一端补上。
-        if self._relay_enabled():
-            result["url"] = self._offline_relay_url(real_url)
+        # 播放地址保持 v1.1.21 的老样子：直链 + header（alist-tvbox 实测能播），
+        # 不要改指本地代理——csp_PyProxy 那条链路会 "bad http status"。
         return result
 
     @staticmethod
@@ -3005,15 +3004,6 @@ class Spider:
             return __name__ == "atvp_inner_spider"
         except Exception:
             return False
-
-    @staticmethod
-    def _relay_enabled():
-        """要不要把播放地址改指本地代理（全在 py 里定，配置里不用加任何东西）。
-
-        跑在 alist-tvbox 的 Atvp 包装里就开——插件链路丢 header.Cookie，直链 403；
-        直连 OK影视（直链 + header 能播）保持原样。
-        """
-        return Spider._in_atvp()
 
     def _offline_relay_url(self, url):
         """115 直链 → 本地代理地址（跑爬虫的那端负责带 Cookie 回流）。
