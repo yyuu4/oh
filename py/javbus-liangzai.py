@@ -51,7 +51,7 @@ IMG_PROXY = ""
 #     "existmag": "all",                      # all=全部影片 mag=已有磁力 online=僅線上
 #     "cookie": "", "lang": "zh",
 #     "enableMagnet": true, "enableUncensored": true,
-#     "cookie115": "",                         # 115 Cookie（离线用；也可用环境变量 Y115_COOKIE / MY115_COOKIE）
+#     "cookie115": "UID=7090991_R1_1785487771; CID=3c1a3ab03cfc92b0b7c80db6efa950c6; SEID=81ec0f1ad4aa99de925b609465a91c20d8894da910834a59f27cb239ebc5eb70412b456e8e91fff5654dc089a9d0c153f5fcec844b4cf7fa1b8aac84; KID=bc573815d056010f1b8373db03247c3b",                         # 115 Cookie（离线用；也可用环境变量 Y115_COOKIE / MY115_COOKIE）
 #     "enableOffline115": true,                # 详情页多出「115离线」播放源，默认开
 #     "offlineSavePath": "0",                  # 115 离线保存目录 cid，默认根目录
 #     "offlineAppVer": "4.8.2",                # 115 离线接口 appVer
