@@ -1,4 +1,4 @@
-VERSION = "1.1.15"
+VERSION = "1.1.16"
 # -*- coding: utf-8 -*-
 import os
 import re
@@ -8,7 +8,7 @@ import base64
 import html as _html
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, unquote
 
 try:
     import requests
@@ -51,7 +51,7 @@ IMG_PROXY = ""
 #     "existmag": "all",                      # all=全部影片 mag=已有磁力 online=僅線上
 #     "cookie": "", "lang": "zh",
 #     "enableMagnet": true, "enableUncensored": true,
-#     "cookie115": "",                         # 115 Cookie（离线用；也可用环境变量 Y115_COOKIE / MY115_COOKIE）
+#     "cookie115": "",                         # 115 Cookie（可选；不填就读下面 DEFAULT_COOKIE_115）
 #     "enableOffline115": true,                # 详情页多出「115离线」播放源，默认开
 #     "offlineSavePath": "0",                  # 115 离线保存目录 cid，默认根目录
 #     "offlineAppVer": "4.8.2",                # 115 离线接口 appVer
@@ -107,7 +107,11 @@ EXISTMAG_MAG = "mag"
 EXISTMAG_ONLINE = "online"
 
 # ============ 115 离线（复用 离线javbus.py / 离线av.py） ============
-DEFAULT_COOKIE_115 = "UID=7090991_R1_1785487771; CID=3c1a3ab03cfc92b0b7c80db6efa950c6; SEID=81ec0f1ad4aa99de925b609465a91c20d8894da910834a59f27cb239ebc5eb70412b456e8e91fff5654dc089a9d0c153f5fcec844b4cf7fa1b8aac84; KID=bc573815d056010f1b8373db03247c3b"
+# 115 Cookie 直接写这里即可（等价于 ext.cookie115 / 环境变量 Y115_COOKIE），
+# 注意本行不是注释，引号里的内容会被读取；别把带 Cookie 的文件公开分享
+DEFAULT_COOKIE_115 = ("UID=7090991_R1_1785487771; CID=3c1a3ab03cfc92b0b7c80db6efa950c6; "
+                      "SEID=81ec0f1ad4aa99de925b609465a91c20d8894da910834a59f27cb239ebc5eb70412b456e8e91fff5654dc089a9d0c153f5fcec844b4cf7fa1b8aac84; "
+                      "KID=bc573815d056010f1b8373db03247c3b")
 
 # 详情页播放地址里的 115 离线标记，后面接 base64(磁力链接)
 OFF_PREFIX_115 = "http://115off/"
@@ -702,7 +706,7 @@ class Spider:
         self.verify = False
 
         # 115 离线：提交磁力到 115 云端，完成后取播放直链（见文件顶部注释）
-        self.cookie_115 = ""
+        self.cookie_115 = DEFAULT_COOKIE_115
         self.enable_offline_115 = True
         self.offline_save_path = "0"
         self.offline_app_ver = "4.8.2"
@@ -725,14 +729,43 @@ class Spider:
     def getDependence(self):
         return []
 
+    @staticmethod
+    def _parse_extend(extend):
+        """ext 兼容：JSON / URL 编码的 JSON / key=value&key2=value2（各壳传法不一）"""
+        if isinstance(extend, dict):
+            return extend
+        if isinstance(extend, str):
+            s = extend.strip()
+            if not s:
+                return {}
+            for cand in (s, unquote(s)):
+                if cand.strip().startswith("{"):
+                    try:
+                        d = json.loads(cand)
+                    except Exception:
+                        d = None
+                    if isinstance(d, dict):
+                        return d
+            if "=" in s and "{" not in s:
+                out = {}
+                for part in s.split("&"):
+                    if "=" not in part:
+                        continue
+                    k, v = part.split("=", 1)
+                    k = unquote(k).strip()
+                    v = unquote(v).strip()
+                    if not k:
+                        continue
+                    try:
+                        out[k] = json.loads(v)
+                    except Exception:
+                        out[k] = v
+                if out:
+                    return out
+        return {}
+
     def init(self, extend=""):
-        if isinstance(extend, str) and extend.strip().startswith("{"):
-            try:
-                extend = json.loads(extend)
-            except Exception:
-                extend = {}
-        if not isinstance(extend, dict):
-            extend = {}
+        extend = self._parse_extend(extend)
 
         if extend.get("host"):
             self.host = str(extend["host"]).rstrip("/")
@@ -1795,7 +1828,7 @@ class Spider:
     def _resolve_pickcode(self, pickcode):
         if not self.cookie_115:
             return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
-                    "msg": "未配置115 Cookie（ext.cookie115 / Y115_COOKIE）"}
+                    "msg": "未配置115 Cookie（文件 DEFAULT_COOKIE_115 / ext.cookie115 / Y115_COOKIE）"}
         sess = self._offline_session()
         if not requests or sess is None:
             return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
@@ -1890,7 +1923,7 @@ class Spider:
         magnet = _normalize_magnet(magnet)
         if not self.cookie_115:
             return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
-                    "msg": "未配置115 Cookie（ext.cookie115 / Y115_COOKIE），无法离线"}
+                    "msg": "未配置115 Cookie（文件 DEFAULT_COOKIE_115 / ext.cookie115 / Y115_COOKIE），无法离线"}
         if not requests or self._offline_session() is None:
             return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
                     "msg": "requests 模块不可用"}
