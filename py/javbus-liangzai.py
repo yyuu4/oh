@@ -1,4 +1,4 @@
-VERSION = "1.1.27"
+VERSION = "1.2.0"
 # -*- coding: utf-8 -*-
 import os
 import re
@@ -56,6 +56,7 @@ IMG_PROXY = ""
 #     "offlineSavePath": "0",                  # 115 离线保存目录 cid，默认根目录
 #     "offlineAppVer": "4.8.2",                # 115 离线接口 appVer
 #     "offlineProxy": ""                       # 115 接口代理，"" = 直连（不走上面的 PROXY）
+#     "offlineDebug": 1                        # 播放过程逐步弹提示，排障时开（默认 1）
 #     "offlineTestMp4": ""                     # 二分实验："noheader"/"header" 才开，正常留空
 #   }
 # 优先级：ext > 顶部 PROXY / IMG_PROXY
@@ -906,8 +907,8 @@ class Spider:
         if "offlineDebug" in extend:
             self.offline_debug = str(extend.get("offlineDebug")).lower() not in (
                 "0", "false", "off", "no")
-        # 二分实验：播放直接返回公开测试 MP4，用来判断「转圈不出画」是
-        # result 结构问题 还是 115 直链/header 的问题。"" = 关闭，线上行为不变
+        # 二分实验：播放直接返回公开测试 MP4，用来判断「转圈不出画」是 result
+        # 结构问题 还是 115 直链/header 的问题。"" = 关闭，线上行为不变
         self.offline_test_mp4 = _to_text(extend.get("offlineTestMp4")).strip().lower()
 
         # 自动选域名：配置了代理全走代理，否则免代理 > 最快
@@ -1737,7 +1738,8 @@ class Spider:
             if not sm:
                 sm = re.search(r"([\d]+(?:\.\d+)?)\s*(TB|GB|MB|KB)\b", block, re.I)
             if sm:
-                size = "%s %s" % (sm.group(1), sm.group(2).upper())
+                # 数字和单位不加空格：2.62GB（JavBus 页面本身就是这么写的）
+                size = "%s%s" % (sm.group(1), sm.group(2).upper())
 
             out.append({
                 "name": name,
@@ -1808,7 +1810,7 @@ class Spider:
 
     @staticmethod
     def _magnet_dn(magnet):
-        """磁力链接里的 dn 参数（原始文件名）→ 用来提交前先搜一遍网盘"""
+        """磁力链接里的 dn 参数（原始文件名）→ 提交前先拿它搜一遍网盘"""
         m = re.search(r"[?&]dn=([^&]+)", magnet or "")
         if not m:
             return ""
@@ -1915,6 +1917,15 @@ class Spider:
     def _guess_keyword_from_name(name):
         if not name:
             return ""
+        name = _to_text(name).strip()
+        # 站点前缀必须在 splitext 之前剥：不然 kss55.cc@ABF-390 会被当成
+        # 「后缀 .cc@ABF-390」，只剩 kss55，搜出来就是搜不到的 KSS-55
+        if "@" in name:
+            name = name.rsplit("@", 1)[-1].strip() or name
+        # 没有 @ 的域名前缀：kss55.cc ABF-390 → ABF-390（TLD 后必须是空白才剥，
+        # 免得把 My.Movie.2024.mp4 这种正常片名的前半截也剥了）
+        name = re.sub(r"^[A-Za-z0-9-]{2,20}\.[A-Za-z]{2,10}[\s_]+", "",
+                      name) or name
         base = os.path.splitext(name)[0]
         ext = os.path.splitext(name)[1].lower()
         # 带视频后缀的完整文件名：直接按文件名搜（115 是子串匹配，最准）
@@ -1925,7 +1936,12 @@ class Spider:
         m = re.search(r"(FC2)[- ]?(PPV)?[- ]?(\d{5,8})", base, re.I)
         if m:
             return "FC2-PPV-%s" % m.group(3)
-        m = re.search(r"([A-Za-z]{2,6})[- ]?(\d{2,5})", base)
+        # 番号优先：ABF-390 / SSIS_001（带分隔符），搜出来才是这片
+        m = re.search(r"([A-Za-z]{2,10})[-_ ](\d{2,5})\b", base)
+        if m:
+            return "%s-%s" % (m.group(1).upper(), m.group(2))
+        # 兜底：连字符番号 SSIS001 → SSIS-001
+        m = re.search(r"([A-Za-z]{2,6})(\d{2,5})\b", base)
         if m:
             return "%s-%s" % (m.group(1).upper(), m.group(2))
         return base[:40]
@@ -2273,14 +2289,93 @@ class Spider:
                 return "0"
         return ""
 
-    def _tidy_file(self, info, name, title, label=""):
-        """单文件种子：只改名"""
+    def _tidy_file(self, info, name, title="", label="", deadline=0):
+        """单文件种子：改名；文件若还躺在离线任务文件夹里，挪出来 + 文件夹进回收站"""
         pc = info.get("pc") or info.get("pick_code") or ""
+        fid = _to_text(info.get("fid") or "")
         orig = _to_text(info.get("n") or info.get("name") or name)
         new = self._offline_new_name(title, orig, label)
-        if new and new != orig and self._offline_rename(info.get("fid"), new):
+        if new and new != orig and self._offline_rename(fid, new):
             orig = new
+        try:
+            self._pull_out_of_task_folder(info, name, title, deadline=deadline)
+        except Exception:
+            pass
         return pc, orig or _to_text(name)
+
+    def _search_rows(self, keyword, stype=0, limit=50):
+        """搜网盘原始行。type=4 只搜视频；type=0 连文件夹一起搜（行里带 pid）"""
+        sess = self._offline_session()
+        if sess is None or not keyword:
+            return []
+        headers = {
+            "User-Agent": WEB_UA,
+            "Referer": "https://115.com/",
+            "Origin": "https://115.com",
+            "Accept": "application/json, text/plain, */*",
+            "Cookie": self.cookie_115,
+        }
+        try:
+            r = sess.get("https://webapi.115.com/files/search", params={
+                "search_value": keyword, "type": stype, "offset": 0,
+                "limit": limit, "aid": 1, "cid": 0, "format": "json",
+            }, headers=headers, timeout=10, verify=False)
+            chunk = _safe_json(r.text, {}).get("data")
+            return chunk if isinstance(chunk, list) else []
+        except Exception:
+            return []
+
+    def _dir_row(self, fcid, code="", deadline=0):
+        """按 cid 找到装着文件的文件夹 → (行, 父目录 cid)；找不到 → (None, "")。
+
+        文件行的 cid 就是它所在的文件夹。文件夹的 pid 先问搜索接口
+        （type=0 连文件夹一起搜，自带 pid），搜不到再从根目录数一层。
+        """
+        fcid = _to_text(fcid)
+        if not fcid:
+            return None, ""
+        if code:
+            for it in self._search_rows(code, 0):
+                if _fc(it) == "0" and _to_text(it.get("cid") or "") == fcid:
+                    return it, _to_text(it.get("pid") or "") or "0"
+        for r in self._offline_dir("0", limit=200, deadline=deadline):
+            if _fc(r) != "0":
+                continue
+            if _to_text(r.get("cid") or "") == fcid:
+                return r, "0"
+            for c in self._offline_dir(_to_text(r.get("cid") or ""),
+                                       limit=200, deadline=deadline):
+                if _fc(c) == "0" and _to_text(c.get("cid") or "") == fcid:
+                    return c, _to_text(r.get("cid") or "") or "0"
+        return None, ""
+
+    def _pull_out_of_task_folder(self, info, name, title="", deadline=0):
+        """文件还躺在离线任务文件夹里 → 挪到文件夹的上一层，空壳文件夹丢回收站。
+
+        两条都对才动手（都对得上才算「离线任务文件夹」，免得误删用户自建目录）：
+        文件夹名 = 任务名 或 带番号；文件真在里面。夹带的广告视频、html、压缩包
+        一律跟着文件夹进回收站——本来就是「下完删杂项」，回收站还能捞回来。
+        """
+        if deadline and time.time() >= deadline:
+            return
+        fid = _to_text(info.get("fid") or "")
+        fcid = _to_text(info.get("cid") or "")
+        if not fid or not fcid:
+            return
+        code = self._guess_keyword_from_name(_to_text(title) or _to_text(name))
+        want = _to_text(name).strip()
+        folder, parent = self._dir_row(fcid, code, deadline=deadline)
+        if folder is None:
+            return
+        fname = _to_text(folder.get("n") or "")
+        if not ((want and fname == want)
+                or (code and code.lower() in fname.lower())):
+            return
+        kids = self._offline_dir(fcid, limit=200, deadline=deadline)
+        if not any(_to_text(k.get("fid") or "") == fid for k in kids):
+            return
+        if self._offline_move(parent or "0", fid):
+            self._offline_trash(fcid)
 
     def _tidy_folder(self, info, name, title, label="", deadline=0):
         """文件夹种子：挑体积最大的视频 → 改名 → 移出文件夹 → 删掉文件夹（回收站）"""
@@ -2320,7 +2415,8 @@ class Spider:
         try:
             if is_dir:
                 return self._tidy_folder(info, name, title, label, deadline=deadline)
-            return self._tidy_file(info, name, title, label)
+            return self._tidy_file(info, name, title, label,
+                                  deadline=deadline)
         except Exception:
             return pc, _to_text(name)
 
@@ -2332,6 +2428,68 @@ class Spider:
             return ""
         return _to_text(info.get("n") or info.get("name") or "")
 
+    def _pickcode_children(self, pickcode, deadline=0):
+        """pickcode 指向文件夹 → 里面体积最大的那个视频的 pickcode。
+
+        整理没跑成（超预算/接口失败）时任务 pc 还是文件夹，直接取直链会返回
+        「未发现下载链接」；这里把文件夹挖开拿视频的 pc 再取。
+        """
+        if not pickcode:
+            return ""
+        try:
+            info = self._offline_info(pickcode) or {}
+        except Exception:
+            info = {}
+        if not info:
+            return ""
+        fc = _fc(info)
+        is_dir = (fc == "0") if fc else (not bool(info.get("fid")))
+        if not is_dir:
+            return pickcode
+        cid = _to_text(info.get("cid") or info.get("fid") or "")
+        if not cid:
+            return ""
+        try:
+            video, _src = self._offline_find_video(cid, depth=2, deadline=deadline)
+        except Exception:
+            video = None
+        if video:
+            return _to_text(video.get("pc") or video.get("pick_code") or "") or pickcode
+        return ""
+
+    def _pickcode_in_root(self, title="", label="", deadline=0):
+        """搜索接口也失手时的最后兜底：列「云下载」根目录，按番号/片名挑那个视频。
+
+        文件被整理过就躺在根目录，名字里带番号；一次列表调用，很便宜。
+        """
+        keys = []
+        for kw in (label, title):
+            code = self._guess_keyword_from_name(_to_text(kw))
+            if code and code.lower() not in [k.lower() for k in keys]:
+                keys.append(code)
+        if not keys or (deadline and time.time() >= deadline):
+            return ""
+        try:
+            rows = self._offline_dir("0", limit=1000, deadline=deadline)
+        except Exception:
+            return ""
+        best, best_size = None, -1
+        for r in rows:
+            if _fc(r) != "1":
+                continue
+            n = _to_text(r.get("n") or r.get("name") or "")
+            if not self._is_video_name(n):
+                continue
+            low = n.lower()
+            if not any(k.lower() in low for k in keys):
+                continue
+            size = _safe_int(r.get("s") or r.get("size") or 0, 0)
+            if size > best_size:
+                best, best_size = r, size
+        if best:
+            return _to_text(best.get("pc") or best.get("pick_code") or "")
+        return ""
+
     def _offline_finish(self, info_hash, pc, name, title="", label="",
                         allow_search=True, t0=None):
         """pickcode → 播放直链。
@@ -2340,6 +2498,9 @@ class Spider:
         整理：挑体积最大的视频、改名成 片名_小标题 1.35GB.mp4、移到原位置、
         文件夹和里面其它文件丢回收站；整理后再取直链。
 
+        取不到直链时的兜底顺序（整理可能已经把任务文件夹丢回收站了）：
+        ① 挖开文件夹拿视频 pc → ② 按小标题/片名/任务名搜 → ③ 根目录按番号扫。
+
         整理只在预算（OFFLINE_FINISH_BUDGET）内做：超预算就完全不整理，直接按
         v1.1.21 的老路子取直链（取不到再按文件名搜），保证能及时返回不卡播放页。
         """
@@ -2347,7 +2508,9 @@ class Spider:
         title = _to_text(title).strip()
         label = _to_text(label).strip()
         t0 = t0 or time.time()
-        deadline = t0 + OFFLINE_FINISH_BUDGET
+        # 预算从「这次开始整理」算：前面等下载可能已经花掉十几秒，
+        # 拿提交时刻当起点会把整理和所有兜底一次跳光（live 实测踩过）
+        deadline = time.time() + OFFLINE_FINISH_BUDGET
         play_pc, display, tidied = pc, name, False
         if time.time() < deadline:
             self._off_trace("整理网盘", t0)
@@ -2362,10 +2525,20 @@ class Spider:
         if not play_pc:
             play_pc, display = pc, name
 
-        self._off_trace("取直链", t0)
         res = None
         if play_pc:
+            self._off_trace("取直链", t0)
             res = self._resolve_pickcode(play_pc)
+            if not res.get("url") and time.time() < deadline:
+                # 任务 pc 还是文件夹（整理没跑成）→ 挖出里面体积最大的视频再取
+                child = self._pickcode_children(play_pc, deadline=deadline)
+                if child and child != play_pc:
+                    self._off_trace("文件夹里找视频", t0)
+                    res = self._resolve_pickcode(child)
+                    if res.get("url"):
+                        play_pc = child
+                        display = self._offline_real_name(child) or display
+                        tidied = True
             if res.get("url"):
                 # 整理过就用整理时算好的名字；没整理成才去网盘查一次实际文件名
                 if not tidied:
@@ -2399,6 +2572,22 @@ class Spider:
                                               self._offline_note("115离线完成", shown),
                                               info_hash)
                 res = res2
+            # ③ 搜索接口没结果：直接列云下载根目录按番号扫
+            if time.time() < deadline:
+                self._off_trace("根目录扫描", t0)
+                alt = self._pickcode_in_root(title, label or name,
+                                             deadline=deadline)
+                if alt and alt not in (pc, play_pc):
+                    res2 = self._resolve_pickcode(alt)
+                    if res2.get("url"):
+                        shown = self._offline_real_name(alt) or display or title
+                        self._off_cache[info_hash] = alt
+                        self._off_name[info_hash] = shown
+                        return self._offline_hint(
+                            res2,
+                            self._offline_note("115离线完成", shown),
+                            info_hash)
+                    res = res2
         return res or {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
                        "msg": "取直链失败（%.0fs），可重试" % (time.time() - t0)}
 
@@ -2424,6 +2613,62 @@ class Spider:
             res["msg"] = "115离线取直链失败，请重试"
         self._set_off_last("115离线：失败 %s" % res.get("msg"))
         return res
+
+    def _search_video(self, title, label):
+        """提交前先搜网盘：→ (pickcode, 文件名)；没下过就返回 ("", "")。
+
+        搜索接口自带文件名，核对一遍番号再用——同番号可能有好几个画质版本，
+        对不上就当没找到，照常提交离线任务（宁可多提交也别播错文件）。
+        """
+        title = _to_text(title).strip()
+        label = _to_text(label).strip()
+        if not (title or label):
+            return "", ""
+        # 搜的词：先整条小标题（最准），再片名，最后才是拆出来的番号
+        terms, codes = [], []
+        for kw in (label, title):
+            kw = _to_text(kw).strip()
+            if kw and kw.lower() not in [t.lower() for t in terms]:
+                terms.append(kw)
+            code = self._guess_keyword_from_name(kw)
+            if not code:
+                continue
+            if code.lower() not in [c.lower() for c in codes]:
+                codes.append(code)
+            if code.lower() not in [t.lower() for t in terms]:
+                terms.append(code)
+        if not terms:
+            return "", ""
+        # 带数字的才算番号（ABF-390）；「高清 4 70GB」这种拆出来的碎片不算，
+        # 拿它去核对文件名只会把对的文件也判错
+        codes = [k for k in codes
+                 if re.match(r"^[A-Za-z]{2,10}[-_ ]?\d{2,5}$", k)]
+        rows = []
+        for keyword in terms:
+            # type=4 视频优先，找不到再搜全部
+            for stype in (4, 0):
+                for it in self._search_rows(keyword, stype):
+                    if int(it.get("fc") or 0) != 1:
+                        continue
+                    pc = it.get("pc") or it.get("pick_code") or it.get("pickcode")
+                    n = _to_text(it.get("n") or it.get("name") or "")
+                    if pc and n:
+                        rows.append((pc, n))
+                if rows:
+                    break
+            if rows:
+                break
+        # 最准的先要：文件名里连小标题+大小都对上（整理过就是 片名_小标题 大小.mp4）
+        if label:
+            low = label.lower()
+            for pc, n in rows:
+                if low in n.lower():
+                    return pc, n
+        for pc, n in rows:
+            low = n.lower()
+            if not codes or any(c.lower() in low for c in codes):
+                return pc, n
+        return "", ""
 
     def _submit_offline_115(self, magnet, title="", label=""):
         if not self.enable_offline_115:
@@ -2460,34 +2705,33 @@ class Spider:
             self._off_cache.pop(info_hash, None)
             self._off_name.pop(info_hash, None)
 
-        # ---- 冷启动重播：先搜网盘、再看已有任务，能不提交就不提交 ----
-        # （借鉴 良最新 的顺序：缓存 → 按名搜网盘 → 查任务 → 才提交，
-        #   上次下完但 App 重启丢了缓存时，省掉 task_lists + add_task_urls 两次请求）
-        name_hint = dn_hint
+        # ---- 冷启动重播：缓存 → 搜网盘 → 查任务 → 才提交，能不提交就不提交 ----
         early_fail = None
+        task = None
+        task_name = ""
 
-        # 1) 网盘里可能已经有文件（dn 是磁力自带的原始文件名）
-        if name_hint:
+        # 1) 网盘里可能已经有（小标题/片名搜，文件名对得上番号才算数）
+        if _to_text(title) or _to_text(label) or dn_hint:
             self._off_trace("先搜网盘", t0)
-            pc1 = self._find_pickcode_by_name(name_hint, retries=1, interval=0)
+            pc1, name1 = self._search_video(_to_text(title) or dn_hint,
+                                            _to_text(label) or dn_hint)
             if pc1:
                 self._off_cache[info_hash] = pc1
-                res1 = self._offline_finish(info_hash, pc1, name_hint, title=title,
-                                            label=label, allow_search=True, t0=t0)
+                res1 = self._offline_finish(info_hash, pc1, name1,
+                                            title=title, label=label,
+                                            allow_search=True, t0=t0)
                 if res1.get("url"):
                     return res1
                 if res1.get("msg"):
                     early_fail = res1
 
-        # 2) 离线任务可能早就在（上次提交过）
-        task = None
+        # 2) 离线任务可能早就在（上次提交过）：不重复 add
         try:
             task = self._offline_find_task(info_hash)
         except Exception:
             task = None
-        task_name = _to_text(task.get("name") or task.get("file_name") or "") if task else ""
-        if not name_hint:
-            name_hint = task_name
+        task_name = _to_text(task.get("name") or task.get("file_name") or "") \
+            if task else ""
 
         if task:
             done0, failed0, msg0 = self._offline_task_state(task)
@@ -2495,14 +2739,15 @@ class Spider:
             if done0 and pc0:
                 self._off_trace("任务已完成，整理并取直链", t0)
                 res0 = self._offline_finish(info_hash, pc0, task_name,
-                                            title=title, label=label, allow_search=True, t0=t0)
+                                            title=title, label=label,
+                                            allow_search=True, t0=t0)
                 if res0.get("url"):
                     return res0
                 early_fail = res0
             elif failed0:
-                # 上次任务失败：重新提交一次再看结果（保持老流程的重试语义）
-                task = None
+                task = None            # 上次任务失败：重新提交一次再看结果
 
+        # 3) 任务不在 → 才提交
         if not task:
             self._off_trace("提交离线任务", t0)
             try:
@@ -2525,9 +2770,8 @@ class Spider:
                 return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
                         "msg": "115离线提交失败：%s" % (add_msg or "提交失败")}
 
-            task_name = _to_text(task.get("name") or task.get("file_name") or "") if task else ""
-            if not name_hint:
-                name_hint = task_name
+            task_name = _to_text(task.get("name") or task.get("file_name") or "") \
+                if task else ""
 
             # 秒传 / 已下完：任务对象里直接带 pick_code，直接取直链
             if task:
