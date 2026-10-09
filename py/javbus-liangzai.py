@@ -187,6 +187,8 @@ OFFLINE_POLL_INTERVAL = 1
 OFFLINE_FINISH_BUDGET = 9
 # 超过几秒还没好，就开始每一步都弹提示（卡在哪一步一看就知道）
 OFFLINE_TRACE_AFTER = 4
+# 本地代理回流时单次最多回多少字节（整个文件不能进内存，靠 Range 一段段回）
+OFFLINE_RELAY_CHUNK = 4 * 1024 * 1024
 # 二分实验用的公开测试片（免鉴权、支持 Range），只在 ext.offlineTestMp4 打开时用
 OFFLINE_TEST_MP4 = ("https://commondatastorage.googleapis.com/gtv-videos-bucket/"
                     "sample/BigBuckBunny.mp4")
@@ -790,6 +792,11 @@ class Spider:
         self.offline_debug = True
         # 二分实验开关（ext.offlineTestMp4）："" = 关闭
         self.offline_test_mp4 = ""
+        self._off_relay_pos = 0
+        self._off_relay_logged = False
+        # 直链地址（去参数） -> 取直链时 downurl 下发的完整 Cookie。
+        # downurl 的 Set-Cookie 会补一个 CDN 令牌，没有它直链 403 "no cookie value"
+        self._off_ck = {}
         # info_hash -> pickcode 缓存，重试时不再重新搜文件
         self._off_cache = {}
         # info_hash -> 文件名，缓存命中时给成功提示用
@@ -887,12 +894,21 @@ class Spider:
         self._apply_proxy()
 
         # ==== 115 ====
-        self.cookie_115 = (
-            _to_text(extend.get("cookie115"))
-            or _env("Y115_COOKIE")
-            or _env("MY115_COOKIE")
-            or DEFAULT_COOKIE_115
-        )
+        # 跑在 alist-tvbox 的 Atvp 包装里时**不认 ext.cookie115**（那边的 cookie 不用），
+        # 只用环境变量 / 本文件里的 DEFAULT_COOKIE_115；直连时仍按 ext 优先。
+        if self._in_atvp():
+            self.cookie_115 = (
+                _env("Y115_COOKIE")
+                or _env("MY115_COOKIE")
+                or DEFAULT_COOKIE_115
+            )
+        else:
+            self.cookie_115 = (
+                _to_text(extend.get("cookie115"))
+                or _env("Y115_COOKIE")
+                or _env("MY115_COOKIE")
+                or DEFAULT_COOKIE_115
+            )
         if "enableOffline115" in extend:
             self.enable_offline_115 = bool(extend["enableOffline115"])
         if extend.get("offlineSavePath"):
@@ -910,6 +926,8 @@ class Spider:
         # 二分实验：播放直接返回公开测试 MP4，用来判断「转圈不出画」是 result
         # 结构问题 还是 115 直链/header 的问题。"" = 关闭，线上行为不变
         self.offline_test_mp4 = _to_text(extend.get("offlineTestMp4")).strip().lower()
+        self._off_relay_pos = 0
+        self._off_relay_logged = False
 
         # 自动选域名：配置了代理全走代理，否则免代理 > 最快
         self._ensure_host()
@@ -2056,6 +2074,13 @@ class Spider:
         }
         if fmt:
             result["format"] = fmt
+        # 记下这条直链对应的完整 Cookie（含 downurl 下发的 CDN 令牌）
+        self._off_ck = dict(list(self._off_ck.items())[-8:])
+        self._off_ck[real_url.split("?")[0]] = final_cookie
+        # 插件链路（alist-tvbox 的 csp_PyProxy）会把 header 丢掉 → 直链 403。
+        # Atvp 包装里自动改指本地代理，Cookie 由跑爬虫的那一端补上。
+        if self._relay_enabled():
+            result["url"] = self._offline_relay_url(real_url)
         return result
 
     @staticmethod
@@ -2964,7 +2989,150 @@ class Spider:
         if _to_text(param.get("k")) == "offnote":
             body = self._offline_srt(param.get("v") or "")
             return [200, "application/x-subrip", body.encode("utf-8"), {}]
+        # 播放回流：客户端只管要 proxy://，Cookie 由这边补
+        if _to_text(param.get("k")) == "offplay":
+            return self._offline_relay_stream(param)
         return [404, "text/plain", b"Not Found", {}]
+
+    @staticmethod
+    def _in_atvp():
+        """跑在 alist-tvbox 的 Atvp 包装里吗？
+
+        Atvp._load_inner_spider_class 是用 ModuleType("atvp_inner_spider") exec 本文件的，
+        所以类的 __module__ 就是判据；直连 OK影视 时是别的模块名。
+        """
+        try:
+            return __name__ == "atvp_inner_spider"
+        except Exception:
+            return False
+
+    @staticmethod
+    def _relay_enabled():
+        """要不要把播放地址改指本地代理（全在 py 里定，配置里不用加任何东西）。
+
+        跑在 alist-tvbox 的 Atvp 包装里就开——插件链路丢 header.Cookie，直链 403；
+        直连 OK影视（直链 + header 能播）保持原样。
+        """
+        return Spider._in_atvp()
+
+    def _offline_relay_url(self, url):
+        """115 直链 → 本地代理地址（跑爬虫的那端负责带 Cookie 回流）。
+
+        拼法跟字幕 subs 完全一致：base + do=py + siteKey（local 才能路由回本爬虫）。
+        """
+        try:
+            tok = base64.b64encode(_to_text(url).encode("utf-8")).decode("ascii")
+        except Exception:
+            tok = ""
+        key = _to_text(getattr(self, "siteKey", ""))
+        q = "do=py" + ("&siteKey=%s" % quote(key) if key else "")
+        return self._offline_proxy_base() + q + "&k=offplay&u=%s" % quote(tok)
+
+    @staticmethod
+    def _offline_range_bounds(rng):
+        """从 Range: bytes=2048-4095 里取 (起, 止)；没有 Range 返回 (None, None)"""
+        m = re.match(r"^\s*bytes\s*=\s*(\d+)\s*-\s*(\d*)\s*$", _to_text(rng) or "")
+        if not m:
+            return None, None
+        start = int(m.group(1))
+        end = int(m.group(2)) if m.group(2) else None
+        return start, end
+
+    @classmethod
+    def _offline_range_start(cls, rng):
+        return cls._offline_range_bounds(rng)[0]
+
+    def _offline_relay_stream(self, param):
+        """把 115 直链按 Range 分段回给播放器（每次都带 Cookie）。
+
+        客户端只发 proxy:// 地址，不用它转发 header；单次最多回
+        OFFLINE_RELAY_CHUNK 字节，靠 206 + Content-Range 让播放器继续要下一段。
+        """
+        raw = _to_text(param.get("u") or "")
+        url = ""
+        for cand in (raw, unquote(raw)):
+            try:
+                url = base64.b64decode(cand.encode("ascii")).decode("utf-8")
+                break
+            except Exception:
+                continue
+        if not url.lower().startswith("http"):
+            return [404, "text/plain", b"bad url", {}]
+        rng = ""
+        for key in ("range", "Range", "RANGE"):
+            if param.get(key):
+                rng = _to_text(param.get(key))
+                break
+        start, end = self._offline_range_bounds(rng)
+        if end is not None and end < start:
+            end = None                      # 起止颠倒的 Range 当成开放区间
+        if start is None:
+            start = self._off_relay_pos
+        log = (start == 0)
+        cap = OFFLINE_RELAY_CHUNK
+        if end is not None and end >= start:
+            cap = min(cap, end - start + 1)
+        ck = self._off_ck.get(url.split("?")[0]) or self.cookie_115
+        headers = {"User-Agent": OFFLINE_UA, "Cookie": ck,
+                   "Referer": "https://115.com/", "Accept": "*/*",
+                   "Range": "bytes=%s" % ("%d-%d" % (start, end) if end is not None
+                                          else "%d-" % start)}
+        sess = self._offline_session()
+        if sess is None:
+            return [502, "text/plain", b"no session", {}]
+        try:
+            r = sess.get(url, headers=headers, stream=True, timeout=20, verify=False)
+        except Exception as e:
+            return [502, "text/plain", ("fetch failed: %s" % e).encode("utf-8", "ignore"), {}]
+        if r.status_code not in (200, 206):
+            body = b""
+            try:
+                body = r.content[:200]
+            except Exception:
+                pass
+            return [r.status_code or 502, "application/json", body, {}]
+        total = -1
+        crange = r.headers.get("Content-Range") or ""
+        m = re.search(r"/(\d+)\s*$", crange)
+        if m:
+            total = int(m.group(1))
+        elif r.headers.get("Content-Length"):
+            try:
+                total = start + int(r.headers.get("Content-Length"))
+            except Exception:
+                total = -1
+        data = b""
+        try:
+            for chunk in r.iter_content(65536):
+                if not chunk:
+                    continue
+                data += chunk
+                if len(data) >= cap:
+                    data = data[:cap]
+                    break
+        except Exception:
+            pass
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
+        if not data:
+            return [416, "text/plain", b"", {"Content-Range": "bytes */%d" % total}
+                    if total > 0 else {}]
+        end = start + len(data) - 1
+        if not rng:
+            self._off_relay_pos = end + 1
+        if total < 0:
+            total = end + 1
+        if log and not self._off_relay_logged:
+            self._off_relay_logged = True
+            self._set_off_last("代理回流：bytes %d-%d/%d（带Cookie）" % (start, end, total))
+        return [206, "video/mp4", data, {
+            "Content-Range": "bytes %d-%d/%d" % (start, end, total),
+            "Content-Length": str(len(data)),
+            "Accept-Ranges": "bytes",
+        }]
 
     def manualVideoCheck(self):
         return False
