@@ -1,4 +1,4 @@
-VERSION = "1.1.20"
+VERSION = "1.1.21"
 # -*- coding: utf-8 -*-
 import os
 import re
@@ -718,8 +718,6 @@ class Spider:
         self._off_name = {}
         # info_hash -> 该片原简介（详情页拿到），播放页 desc 提示时放在提示后面
         self._off_syn = {}
-        # 已经在详情页弹过提示的 info_hash（每部片每次会话只弹一次）
-        self._off_notified = set()
 
         # filters / 默认值缓存
         self._cache_filters = {}
@@ -1465,15 +1463,13 @@ class Spider:
                 if h not in self._off_syn:
                     self._off_syn[h] = base_content
 
-        # 已经离线完成的片子：简介第一行给提示，打开详情页再弹一次 toast。
+        # 已经离线完成的片子：简介第一行给提示，进详情页就弹一次 toast。
         # FongMi 对 detailContent 的 msg 是 Notify.show（list 非空不会被打断），
         # 而 playerContent 的 msg 会被当播放错误，两边不能混用。
         done_note = ""
-        first_h = ""
         for (_g, _raw, _clean, h) in magnet_items:
             if h in self._off_name:
                 done_note = self._offline_note("115离线完成", self._off_name.get(h, ""))
-                first_h = h
                 break
         if done_note:
             info_lines.insert(0, done_note)
@@ -1491,8 +1487,7 @@ class Spider:
             item["vod_play_url"] = "$$$".join(urls)
 
         res = {"list": [item]}
-        if done_note and first_h not in self._off_notified:
-            self._off_notified.add(first_h)
+        if done_note:
             res["msg"] = done_note
         return res
 
