@@ -1,4 +1,4 @@
-VERSION = "1.1.17"
+VERSION = "1.1.18"
 # -*- coding: utf-8 -*-
 import os
 import re
@@ -714,6 +714,8 @@ class Spider:
         self.offline_proxy = ""
         # info_hash -> pickcode 缓存，重试时不再重新搜文件
         self._off_cache = {}
+        # info_hash -> 文件名，缓存命中时给成功提示用
+        self._off_name = {}
 
         # filters / 默认值缓存
         self._cache_filters = {}
@@ -1893,7 +1895,13 @@ class Spider:
 
     @staticmethod
     def _offline_note(prefix, name=""):
-        """成功提示文案：msg 是协议通用字段，客户端会当提示显示。"""
+        """成功提示文案。
+
+        不能用 msg：FongMi/OK影视 的 PlaybackActivity.getPlaybackError() 里
+        `if (result.hasMsg()) return result.getMsg()`，playerContent 的 msg 一律当
+        播放错误处理（成功也打断播放）。msg 只留给真正的错误；
+        成功提示走 desc（播放页描述区，VodPlaybackController.renderDescription）。
+        """
         name = _to_text(name).strip()
         return "%s：%s" % (prefix, name) if name else prefix
 
@@ -1909,7 +1917,9 @@ class Spider:
             res = self._resolve_pickcode(pc)
             if res.get("url"):
                 self._off_cache[info_hash] = pc
-                res["msg"] = self._offline_note("115离线完成", name)
+                if _to_text(name):
+                    self._off_name[info_hash] = _to_text(name)
+                res["desc"] = self._offline_note("115离线完成", name)
                 return res
         if allow_search and _to_text(name):
             alt = self._find_pickcode_by_name(name, retries=2, interval=1,
@@ -1918,7 +1928,8 @@ class Spider:
                 res2 = self._resolve_pickcode(alt)
                 if res2.get("url"):
                     self._off_cache[info_hash] = alt
-                    res2["msg"] = self._offline_note("115离线完成", name)
+                    self._off_name[info_hash] = _to_text(name)
+                    res2["desc"] = self._offline_note("115离线完成", name)
                     return res2
                 res = res2
         return res or {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
@@ -1946,9 +1957,11 @@ class Spider:
         if cached:
             res = self._resolve_pickcode(cached)
             if res.get("url"):
-                res["msg"] = self._offline_note("115离线命中缓存")
+                res["desc"] = self._offline_note("115离线命中缓存",
+                                                 self._off_name.get(info_hash, ""))
                 return res
             self._off_cache.pop(info_hash, None)
+            self._off_name.pop(info_hash, None)
 
         try:
             add = self._offline_add(magnet)
