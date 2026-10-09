@@ -1,8 +1,10 @@
-VERSION = "1.1.13"
+VERSION = "1.1.15"
 # -*- coding: utf-8 -*-
+import os
 import re
 import json
 import time
+import base64
 import html as _html
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -48,9 +50,17 @@ IMG_PROXY = ""
 #     "noProbe": true,                        # 不探测域名
 #     "existmag": "all",                      # all=全部影片 mag=已有磁力 online=僅線上
 #     "cookie": "", "lang": "zh",
-#     "enableMagnet": true, "enableUncensored": true
+#     "enableMagnet": true, "enableUncensored": true,
+#     "cookie115": "",                         # 115 Cookie（离线用；也可用环境变量 Y115_COOKIE / MY115_COOKIE）
+#     "enableOffline115": true,                # 详情页多出「115离线」播放源，默认开
+#     "offlineSavePath": "0",                  # 115 离线保存目录 cid，默认根目录
+#     "offlineAppVer": "4.8.2",                # 115 离线接口 appVer
+#     "offlineProxy": ""                       # 115 接口代理，"" = 直连（不走上面的 PROXY）
 #   }
 # 优先级：ext > 顶部 PROXY / IMG_PROXY
+#
+# 115 离线播放：详情页选「115离线」源 → 把磁力提交到 115 云端离线 → 完成后搜到文件 pickcode →
+#               取播放直链返回给播放器。首次可能提示「下载中，请稍后重试」，再点一次即可。
 
 # 候选域名：运行时自动探测，优先直连（不走代理），其次按延迟排序
 HOST_CANDIDATES = [
@@ -95,6 +105,31 @@ AJAX_HEADERS = {
 EXISTMAG_ALL = "all"
 EXISTMAG_MAG = "mag"
 EXISTMAG_ONLINE = "online"
+
+# ============ 115 离线（复用 离线javbus.py / 离线av.py） ============
+DEFAULT_COOKIE_115 = ""
+
+# 详情页播放地址里的 115 离线标记，后面接 base64(磁力链接)
+OFF_PREFIX_115 = "http://115off/"
+OFFLINE_UA = WEB_UA + " 115Browser/36.0.0"
+OFFLINE_ADD_API = "https://115.com/web/lixian/?ct=lixian&ac=add_task_urls"
+OFFLINE_LIST_API = "https://115.com/web/lixian/?ct=lixian&ac=task_lists"
+OFFLINE_POLL_TIMEOUT = 12
+OFFLINE_POLL_INTERVAL = 1
+
+RSA_N = 0x8686980c0f5a24c4b9d43020cd2c22703ff3f450756529058b1cf88f09b8602136477198a6e2683149659bd122c33592fdb5ad47944ad1ea4d36c6b172aad6338c3bb6ac6227502d010993ac967d1aef00f0c8e038de2e4d3bc2ec368af2e9f10a6f1eda4f7262f136420c07c331b871bf139f74f3010e3c4fe57df3afb71683
+RSA_E = 0x10001
+KEY_TABLE = bytes([
+    240, 229, 105, 174, 191, 220, 191, 138, 26, 69, 232, 190, 125, 166, 115, 184,
+    222, 143, 231, 196, 69, 218, 134, 196, 155, 100, 139, 20, 106, 180, 241, 170,
+    56, 1, 53, 158, 38, 105, 44, 134, 0, 107, 79, 165, 54, 52, 98, 166,
+    42, 150, 104, 24, 242, 74, 253, 189, 107, 151, 143, 77, 143, 137, 19, 183,
+    108, 142, 147, 237, 14, 13, 72, 62, 215, 47, 136, 216, 254, 254, 126, 134,
+    80, 149, 79, 209, 235, 131, 38, 52, 219, 102, 123, 156, 126, 157, 122, 129,
+    50, 234, 182, 51, 222, 58, 169, 89, 52, 102, 59, 170, 186, 129, 96, 72,
+    185, 213, 129, 156, 248, 108, 132, 119, 255, 84, 120, 38, 95, 190, 232, 30,
+    54, 159, 52, 128, 92, 69, 44, 155, 118, 213, 27, 143, 204, 195, 184, 245,
+])
 
 JAVBUS_CLASSES = [
     {"type_id": "jav_home",               "type_name": "有碼"},
@@ -264,8 +299,22 @@ BUILTIN_GENRE_GROUPS = {
 STAR_FILTER_LIMIT = 50
 
 
+def _env(name, default=""):
+    try:
+        return os.environ.get(name, default) or default
+    except Exception:
+        return default
+
+
 def _to_text(v):
     return str(v or "").strip()
+
+
+def _safe_json(text, fallback=None):
+    try:
+        return json.loads(str(text or ""))
+    except Exception:
+        return fallback if fallback is not None else {}
 
 
 def _safe_int(v, default=0):
@@ -438,9 +487,203 @@ def pick_host(candidates=None, proxy=""):
     return host
 
 
+# ==================== 115 加密工具 ====================
+
+def _chunks(start, end, step=1):
+    out = []
+    nxt = start + step
+    while nxt < end:
+        out.append((start, nxt))
+        start = nxt
+        nxt += step
+    if start != end:
+        out.append((start, end))
+    return out
+
+
+def _bytes_to_int(b):
+    out = 0
+    for byte in b:
+        out = (out << 8) | byte
+    return out
+
+
+def _int_to_bytes(value, length=None):
+    if length is None:
+        length = max(1, (value.bit_length() + 7) // 8)
+    out = bytearray(length)
+    for i in range(length - 1, -1, -1):
+        out[i] = value & 0xFF
+        value >>= 8
+    return bytes(out)
+
+
+def _xor_bytes(a, b):
+    return bytes(x ^ y for x, y in zip(a, b))
+
+
+def _xor_by_key(input_bytes, key):
+    out = bytearray(len(input_bytes))
+    head = len(input_bytes) & 3
+    if head:
+        out[0:head] = _xor_bytes(input_bytes[0:head], key[0:head])
+    for (f, t) in _chunks(head, len(input_bytes), len(key)):
+        seg = input_bytes[f:t]
+        klen = len(key)
+        for i in range(len(seg)):
+            out[f + i] = seg[i] ^ key[i % klen]
+    return bytes(out)
+
+
+def _mod_pow(base, exp, mod):
+    if mod == 1:
+        return 0
+    result = 1
+    base %= mod
+    while exp:
+        if exp & 1:
+            result = (result * base) % mod
+        exp >>= 1
+        base = (base * base) % mod
+    return result
+
+
+def _encode_block(input_bytes):
+    block = bytearray(128)
+    fill_end = 127 - len(input_bytes)
+    for i in range(1, max(1, fill_end)):
+        block[i] = 2
+    block[0] = 0
+    block[128 - len(input_bytes):128] = input_bytes
+    return _bytes_to_int(bytes(block))
+
+
+def _table_key(seed, length):
+    out = bytearray(length)
+    n = length * (length - 1)
+    s = 0
+    for i in range(length):
+        mixed = (seed[i] + KEY_TABLE[s]) & 255
+        out[i] = KEY_TABLE[n] ^ mixed
+        n -= length
+        s += length
+    return bytes(out)
+
+
+def _encrypt_payload(value):
+    input_bytes = value.encode("utf-8") if isinstance(value, str) else bytes(value)
+    step1 = _xor_by_key(input_bytes, bytes([141, 165, 165, 141]))
+    step2 = step1[::-1]
+    step3 = _xor_by_key(step2, bytes([120, 6, 173, 76, 51, 134, 93, 24, 76, 1, 63, 70]))
+    padded = bytes(16) + step3
+    blocks = _chunks(0, len(padded), 117)
+    out = bytearray(len(blocks) * 128)
+    pos = 0
+    for (f, t) in blocks:
+        enc = _mod_pow(_encode_block(padded[f:t]), RSA_E, RSA_N)
+        out[pos:pos + 128] = _int_to_bytes(enc, 128)
+        pos += 128
+    return base64.b64encode(bytes(out)).decode("ascii")
+
+
+def _decrypt_payload(value):
+    raw = base64.b64decode(value)
+    merged = bytearray()
+    for (f, t) in _chunks(0, len(raw), 128):
+        dec = _int_to_bytes(_mod_pow(_bytes_to_int(raw[f:t]), RSA_E, RSA_N))
+        idx = dec.find(b"\x00")
+        merged.extend(dec[idx + 1:] if idx >= 0 else dec)
+    if len(merged) < 16:
+        return ""
+    seed = merged[0:16]
+    key = _table_key(seed, 12)
+    body = _xor_by_key(merged[16:], key)[::-1]
+    plain = _xor_by_key(body, bytes([141, 165, 165, 141]))
+    try:
+        return plain.decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _build_downurl_body(payload_dict):
+    enc = _encrypt_payload(json.dumps(payload_dict, separators=(",", ":")))
+    return "data=" + quote(enc, safe="")
+
+
+def _extract_encrypted(data):
+    if isinstance(data, str):
+        try:
+            parsed = json.loads(data)
+        except Exception:
+            return data, None
+        return _extract_encrypted(parsed)
+    if isinstance(data, dict):
+        enc = ""
+        d = data.get("data")
+        if isinstance(d, str):
+            enc = d
+        elif isinstance(d, dict) and isinstance(d.get("data"), str):
+            enc = d["data"]
+        return enc, data
+    return "", data
+
+
+def _decode_downurl_response(data):
+    enc, payload = _extract_encrypted(data)
+    if not enc:
+        return payload or {}
+    try:
+        return json.loads(_decrypt_payload(enc))
+    except Exception:
+        if isinstance(payload, dict):
+            return payload
+        raise
+
+
+def _find_url_deep(obj):
+    if not isinstance(obj, dict):
+        return ""
+    u = obj.get("url")
+    if isinstance(u, str) and u:
+        return u
+    if isinstance(u, dict) and isinstance(u.get("url"), str) and u["url"]:
+        return u["url"]
+    d = obj.get("data")
+    if isinstance(d, dict) and isinstance(d.get("url"), str) and d["url"]:
+        return d["url"]
+    for v in obj.values():
+        hit = _find_url_deep(v)
+        if hit:
+            return hit
+    return ""
+
+
+def _find_msg_deep(obj):
+    if not isinstance(obj, dict):
+        return ""
+    for key in ("msg", "message", "error"):
+        v = obj.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    for v in obj.values():
+        hit = _find_msg_deep(v)
+        if hit:
+            return hit
+    return ""
+
+
+def _set_cookie_text(set_cookie):
+    if not set_cookie:
+        return ""
+    if isinstance(set_cookie, str):
+        set_cookie = [set_cookie]
+    return "; ".join(str(v).split(";")[0].strip() for v in set_cookie if str(v).split(";")[0].strip())
+
+
 class Spider:
     def __init__(self):
         self.s = None
+        self.s115 = None
         self.host = HOST
         self.ua = WEB_UA
         self.timeout = 15
@@ -458,6 +701,16 @@ class Spider:
         self.lang = "zh"
         self.verify = False
 
+        # 115 离线：提交磁力到 115 云端，完成后取播放直链（见文件顶部注释）
+        self.cookie_115 = ""
+        self.enable_offline_115 = True
+        self.offline_save_path = "0"
+        self.offline_app_ver = "4.8.2"
+        self.offline_timeout = 15
+        self.offline_proxy = ""
+        # info_hash -> pickcode 缓存，重试时不再重新搜文件
+        self._off_cache = {}
+
         # filters / 默认值缓存
         self._cache_filters = {}
         self._host_locked = False
@@ -466,7 +719,7 @@ class Spider:
         if requests:
             self.s = requests.Session()
             self.s.headers.update(LIST_HEADERS)
-            # 立即应用顶部 PROXY，只填第 31 行即可生效
+            # 立即应用顶部 PROXY，只填文件顶部 PROXY 即可生效
             self._apply_proxy()
 
     def getDependence(self):
@@ -515,6 +768,24 @@ class Spider:
 
         # 无论 ext 是否带 proxy，都把当前代理挂到会话（顶部 PROXY 也在此生效）
         self._apply_proxy()
+
+        # ==== 115 ====
+        self.cookie_115 = (
+            _to_text(extend.get("cookie115"))
+            or _env("Y115_COOKIE")
+            or _env("MY115_COOKIE")
+            or DEFAULT_COOKIE_115
+        )
+        if "enableOffline115" in extend:
+            self.enable_offline_115 = bool(extend["enableOffline115"])
+        if extend.get("offlineSavePath"):
+            self.offline_save_path = str(extend["offlineSavePath"])
+        if extend.get("offlineAppVer"):
+            self.offline_app_ver = str(extend["offlineAppVer"])
+        if "offlineProxy" in extend:
+            self.offline_proxy = _to_text(extend.get("offlineProxy"))
+            # 代理变了，重建 115 会话
+            self.s115 = None
 
         # 自动选域名：配置了代理全走代理，否则免代理 > 最快
         self._ensure_host()
@@ -1095,25 +1366,49 @@ class Spider:
             info_lines.append("演员: %s" % "、".join(actors))
         if genres:
             info_lines.append("类别: %s" % "、".join(genres))
+        if self.enable_offline_115:
+            info_lines.append("115离线：提交到115云端，完成后自动直连播放")
 
         magnets = []
-        if self.enable_magnet:
+        if self.enable_magnet or self.enable_offline_115:
             try:
                 magnets = self._fetch_magnets(text, vid)
             except Exception:
                 magnets = []
 
+        # 按 info_hash 去重：115 离线按 hash 提交，重复条目没意义
+        magnet_items = []
+        seen_h = set()
+        for g in magnets:
+            raw = _sanitize_play(_to_text(g.get("magnet") or ""))
+            h = self._magnet_hash(raw)
+            if not raw or not h or h in seen_h:
+                continue
+            seen_h.add(h)
+            # 115 只认干净的 btih 磁力（去掉 dn / tr 参数）
+            magnet_items.append((g, raw, _normalize_magnet(raw), h))
+
         froms, urls = [], []
-        if magnets:
+
+        # 磁力源（交给播放器，能不能播看内核；保留原始磁力，带 tracker）
+        if self.enable_magnet and magnet_items:
             eps = []
-            for i, g in enumerate(magnets):
+            for i, (g, raw, clean, h) in enumerate(magnet_items):
                 label = self._magnet_label(g, i, num)
-                magnet = g.get("magnet") or ""
-                if not magnet:
-                    continue
-                eps.append("%s$%s" % (label, magnet))
+                eps.append("%s$%s" % (label, raw))
             if eps:
                 froms.append("磁力")
+                urls.append("#".join(eps))
+
+        # 115 离线源（提交到 115 云端，完成后取播放直链）
+        if self.enable_offline_115 and magnet_items:
+            eps = []
+            for i, (g, raw, clean, h) in enumerate(magnet_items):
+                label = self._magnet_label(g, i, num)
+                b64 = base64.b64encode(clean.encode("utf-8")).decode("ascii")
+                eps.append("%s$%s%s" % (label, OFF_PREFIX_115, b64))
+            if eps:
+                froms.append("115离线")
                 urls.append("#".join(eps))
 
         # 标题去重：页面 <title> 本身通常已带番号
@@ -1164,7 +1459,7 @@ class Spider:
         if pm:
             pic = self._proxy_pic(_fix_url(pm.group(1), self.host))
 
-        eps = []
+        eps, eps115 = [], []
         for m in self._parse_movie_boxes(text):
             name = _to_text(m.get("vod_name"))
             label = re.sub(r"[$#&\n\r\t]", " ", name).strip()[:40]
@@ -1172,6 +1467,8 @@ class Spider:
             if not mid:
                 continue
             eps.append("%s$%s" % (label or sid, "jav_movie_" + mid))
+            if self.enable_offline_115:
+                eps115.append("%s$%s" % (label or sid, "jav_movie115_" + mid))
 
         item = {
             "vod_id": vid,
@@ -1179,9 +1476,16 @@ class Spider:
             "vod_pic": pic,
             "vod_content": "",
         }
+        froms, urls = [], []
         if eps:
-            item["vod_play_from"] = "她的影片"
-            item["vod_play_url"] = "#".join(eps)
+            froms.append("她的影片")
+            urls.append("#".join(eps))
+        if eps115:
+            froms.append("115离线")
+            urls.append("#".join(eps115))
+        if froms:
+            item["vod_play_from"] = "$$$".join(froms)
+            item["vod_play_url"] = "$$$".join(urls)
         return {"list": [item]}
 
     def _magnets_of(self, vid):
@@ -1300,6 +1604,378 @@ class Spider:
             return p.replace("{url}", enc)
         return p + enc
 
+    # ========== 115 离线 ==========
+    def _offline_session(self):
+        """115 接口专用会话：默认直连（不走爬虫代理、不读系统代理）"""
+        if self.s115 is not None:
+            return self.s115
+        if not requests:
+            return None
+        s = requests.Session()
+        s.trust_env = False
+        p = _norm_proxy(self.offline_proxy)
+        if p:
+            s.proxies = {"http": p, "https": p}
+        self.s115 = s
+        return s
+
+    def _offline_headers(self):
+        return {
+            "Cookie": self.cookie_115,
+            "User-Agent": OFFLINE_UA,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": "https://115.com/",
+            "Origin": "https://115.com",
+        }
+
+    @staticmethod
+    def _magnet_hash(magnet):
+        m = re.search(r"btih:([0-9a-fA-F]{40}|[0-9a-zA-Z]{32})", magnet or "")
+        return m.group(1).lower() if m else ""
+
+    def _offline_add(self, magnet):
+        sess = self._offline_session()
+        if sess is None:
+            return {}
+        data = {
+            "url[0]": magnet,
+            "wp_save_path": self.offline_save_path,
+            "appVer": self.offline_app_ver,
+        }
+        r = sess.post(OFFLINE_ADD_API, data=data, headers=self._offline_headers(),
+                      timeout=self.offline_timeout, verify=False)
+        try:
+            return r.json()
+        except Exception:
+            return {}
+
+    def _offline_list(self, page=1):
+        sess = self._offline_session()
+        if sess is None:
+            return {}
+        data = {"page": page, "appVer": self.offline_app_ver}
+        r = sess.post(OFFLINE_LIST_API, data=data, headers=self._offline_headers(),
+                      timeout=self.offline_timeout, verify=False)
+        try:
+            return r.json()
+        except Exception:
+            return {}
+
+    def _offline_find_task(self, info_hash):
+        for page in (1, 2):
+            try:
+                res = self._offline_list(page)
+            except Exception:
+                return None
+            tasks = res.get("tasks") or res.get("list") or []
+            if not tasks:
+                break
+            for t in tasks:
+                h = (t.get("info_hash") or t.get("hash") or "").lower()
+                if h and h == info_hash.lower():
+                    return t
+        return None
+
+    @staticmethod
+    def _task_pickcode(task):
+        """115 离线任务对象里直接带 pick_code，能拿到就不用再按文件名搜"""
+        if not task:
+            return ""
+        return _to_text(task.get("pick_code") or task.get("pickcode")
+                        or task.get("pc") or "")
+
+    def _offline_task_state(self, task):
+        if not task:
+            return False, False, "任务未找到"
+        status = task.get("status")
+        if status is None:
+            status = task.get("stat")
+        try:
+            status = int(status)
+        except Exception:
+            status = -1
+        percent = task.get("percent")
+        if percent is None:
+            percent = task.get("percentDone", task.get("display_percent"))
+        try:
+            percent = float(percent)
+        except Exception:
+            percent = 0.0
+        name = task.get("name") or task.get("file_name") or ""
+        if status == 2 or percent >= 100:
+            return True, False, name
+        if status in (3, 4, -1):
+            return False, True, (task.get("error_msg") or task.get("error")
+                                 or task.get("message") or "离线任务失败")
+        return False, False, name
+
+    def _offline_wait_done(self, info_hash, timeout=OFFLINE_POLL_TIMEOUT):
+        deadline = time.time() + timeout
+        last_name = ""
+        while time.time() < deadline:
+            try:
+                task = self._offline_find_task(info_hash)
+            except Exception:
+                task = None
+            done, failed, msg = self._offline_task_state(task)
+            if done:
+                return True, msg or last_name
+            if failed:
+                return False, msg
+            if msg:
+                last_name = msg
+            time.sleep(OFFLINE_POLL_INTERVAL)
+        return False, last_name
+
+    @staticmethod
+    def _guess_keyword_from_name(name):
+        if not name:
+            return ""
+        base = os.path.splitext(name)[0]
+        ext = os.path.splitext(name)[1].lower()
+        # 带视频后缀的完整文件名：直接按文件名搜（115 是子串匹配，最准）
+        if ext in (".mp4", ".mkv", ".avi", ".mov", ".flv", ".ts", ".m4v", ".wmv",
+                   ".rm", ".rmvb", ".iso", ".mpg", ".mpeg", ".3gp", ".webm"):
+            return (base.replace("_", " ").strip() or name)[:60]
+        base = base.replace("_", " ").replace(".", " ").strip()
+        m = re.search(r"(FC2)[- ]?(PPV)?[- ]?(\d{5,8})", base, re.I)
+        if m:
+            return "FC2-PPV-%s" % m.group(3)
+        m = re.search(r"([A-Za-z]{2,6})[- ]?(\d{2,5})", base)
+        if m:
+            return "%s-%s" % (m.group(1).upper(), m.group(2))
+        return base[:40]
+
+    def _find_pickcode_by_name(self, name, retries=3, interval=1, exact=""):
+        keyword = self._guess_keyword_from_name(name)
+        if not keyword:
+            return ""
+        sess = self._offline_session()
+        if sess is None:
+            return ""
+        headers = {
+            "User-Agent": WEB_UA,
+            "Referer": "https://115.com/",
+            "Origin": "https://115.com",
+            "Accept": "application/json, text/plain, */*",
+            "Cookie": self.cookie_115,
+        }
+        exact = _to_text(exact)
+        for _ in range(max(1, retries)):
+            fallback = ""
+            # type=4 视频优先，找不到再搜全部（兜底）
+            for stype in (4, 0):
+                try:
+                    r = sess.get("https://webapi.115.com/files/search", params={
+                        "search_value": keyword, "type": stype, "offset": 0,
+                        "limit": 50, "aid": 1, "cid": 0, "format": "json",
+                    }, headers=headers, timeout=20, verify=False)
+                    data = _safe_json(r.text, {})
+                    rows = data.get("data")
+                    if not isinstance(rows, list):
+                        rows = []
+                    for it in rows:
+                        if int(it.get("fc") or 0) != 1:
+                            continue
+                        pc = it.get("pc") or it.get("pick_code") or it.get("pickcode")
+                        if not pc:
+                            continue
+                        if exact and _to_text(it.get("n") or it.get("name")) == exact:
+                            return pc
+                        if not fallback:
+                            fallback = pc
+                except Exception:
+                    pass
+            if fallback:
+                return fallback
+            if interval:
+                time.sleep(interval)
+        return ""
+
+    def _resolve_pickcode(self, pickcode):
+        if not self.cookie_115:
+            return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                    "msg": "未配置115 Cookie（ext.cookie115 / Y115_COOKIE）"}
+        sess = self._offline_session()
+        if not requests or sess is None:
+            return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                    "msg": "requests 模块不可用"}
+
+        body = _build_downurl_body({"pickcode": pickcode})
+        url = "https://proapi.115.com/app/chrome/downurl?t=%d" % int(time.time())
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Content-Length": str(len(body)),
+            "Cookie": self.cookie_115,
+            "User-Agent": OFFLINE_UA,
+            "Referer": "https://115.com/",
+            "Origin": "https://115.com",
+        }
+        try:
+            r = sess.post(url, data=body, headers=headers, timeout=20, verify=False)
+        except Exception as e:
+            return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                    "msg": "115 取直链失败: %s" % e}
+
+        try:
+            decoded = _decode_downurl_response(r.text)
+        except Exception as e:
+            return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                    "msg": "115 解密失败: %s" % e}
+
+        real_url = _find_url_deep(decoded)
+        if not real_url:
+            msg = _find_msg_deep(decoded) or "未发现下载链接"
+            return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                    "msg": "115 限制: %s" % msg}
+
+        new_cookie = _set_cookie_text(
+            r.headers.get("Set-Cookie") if hasattr(r.headers, "get") else None
+        )
+        final_cookie = "; ".join(c for c in (self.cookie_115, new_cookie) if c)
+
+        fmt = ""
+        lower = real_url.lower().split("?")[0]
+        if lower.endswith(".m3u8"):
+            fmt = "application/x-mpegURL"
+        elif lower.endswith(".mp4"):
+            fmt = "video/mp4"
+        elif lower.endswith(".flv"):
+            fmt = "video/x-flv"
+
+        result = {
+            "parse": 0,
+            "jx": 0,
+            "playUrl": "",
+            "url": real_url,
+            "header": {
+                "User-Agent": OFFLINE_UA,
+                "Cookie": final_cookie,
+                "Referer": "https://115.com/",
+            },
+        }
+        if fmt:
+            result["format"] = fmt
+        return result
+
+    def _offline_finish(self, info_hash, pc, name, allow_search=True):
+        """pickcode → 播放直链。
+
+        任务对象里的 pick_code 常指向「离线任务文件夹」（多文件/单文件都可能），
+        这种情况 downurl 返回 url:false，需要按文件名搜出真正的文件再取直链。
+        成功才写 pickcode 缓存。
+        """
+        res = None
+        if pc:
+            res = self._resolve_pickcode(pc)
+            if res.get("url"):
+                self._off_cache[info_hash] = pc
+                return res
+        if allow_search and _to_text(name):
+            alt = self._find_pickcode_by_name(name, retries=2, interval=1,
+                                              exact=_to_text(name))
+            if alt and alt != pc:
+                res2 = self._resolve_pickcode(alt)
+                if res2.get("url"):
+                    self._off_cache[info_hash] = alt
+                    return res2
+                res = res2
+        return res or {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                       "msg": "取直链失败"}
+
+    def _submit_offline_115(self, magnet):
+        if not self.enable_offline_115:
+            return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                    "msg": "115离线已关闭（ext.enableOffline115）"}
+        magnet = _normalize_magnet(magnet)
+        if not self.cookie_115:
+            return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                    "msg": "未配置115 Cookie（ext.cookie115 / Y115_COOKIE），无法离线"}
+        if not requests or self._offline_session() is None:
+            return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                    "msg": "requests 模块不可用"}
+
+        info_hash = self._magnet_hash(magnet)
+        if not info_hash:
+            return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                    "msg": "无法从磁力中解析 info_hash"}
+
+        # 已经离线过：直接拿缓存的 pickcode 取直链，不再提交
+        cached = self._off_cache.get(info_hash)
+        if cached:
+            res = self._resolve_pickcode(cached)
+            if res.get("url"):
+                return res
+            self._off_cache.pop(info_hash, None)
+
+        try:
+            add = self._offline_add(magnet)
+        except Exception as e:
+            return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                    "msg": "提交离线失败：%s" % e}
+
+        # 115 把重复提交算失败（error_msg=任务已存在…），只要任务还在就继续走
+        add_msg = _to_text(add.get("message") or add.get("error_msg")
+                           or add.get("error"))
+        existed = any(k in add_msg for k in ("已存在", "重复"))
+
+        task = None
+        try:
+            task = self._offline_find_task(info_hash)
+        except Exception:
+            task = None
+
+        if not task and not add.get("state") and not existed:
+            return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                    "msg": "115离线提交失败：%s" % (add_msg or "提交失败")}
+
+        task_name = _to_text(task.get("name") or task.get("file_name") or "") if task else ""
+        early_fail = None
+
+        # 秒传 / 已下完：任务对象里直接带 pick_code，直接取直链
+        if task:
+            done0, failed0, msg0 = self._offline_task_state(task)
+            if failed0:
+                return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                        "msg": "115离线失败：%s" % msg0}
+            pc0 = self._task_pickcode(task)
+            if done0 and pc0:
+                res0 = self._offline_finish(info_hash, pc0, task_name, allow_search=True)
+                if res0.get("url"):
+                    return res0
+                early_fail = res0
+
+        done, name_or_msg = self._offline_wait_done(info_hash)
+        if not done:
+            return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                    "msg": "已提交115离线，下载中（%s），请稍后重试"
+                           % (name_or_msg or "等待完成")}
+
+        name = _to_text(name_or_msg) or task_name
+        try:
+            task = self._offline_find_task(info_hash)
+        except Exception:
+            task = None
+        pickcode = self._task_pickcode(task)
+        if pickcode:
+            res = self._offline_finish(info_hash, pickcode, name, allow_search=True)
+            if res.get("url"):
+                return res
+            if early_fail:
+                return early_fail
+            return res
+
+        pickcode = self._find_pickcode_by_name(name, retries=3, interval=1, exact=name)
+        if not pickcode:
+            return early_fail or {
+                "parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                "msg": "离线已完成，但115网盘里还没搜到文件，请稍后重试"}
+
+        res = self._offline_finish(info_hash, pickcode, "", allow_search=False)
+        if res.get("url") or not early_fail:
+            return res
+        return early_fail
+
     # ========== 搜索 ==========
     def searchContent(self, key, quick=False, pg="1"):
         page = _safe_int(pg, 1)
@@ -1346,6 +2022,33 @@ class Spider:
     # ========== 播放 ==========
     def playerContent(self, flag, ids, vipFlags=None):
         vid = str(ids[0]) if isinstance(ids, (list, tuple)) and ids else str(ids or "")
+
+        # 115 离线：http://115off/<base64(磁力)> → 提交离线 → 取播放直链
+        if vid.startswith(OFF_PREFIX_115):
+            b64 = vid[len(OFF_PREFIX_115):].strip()
+            try:
+                magnet = base64.b64decode(b64.encode("ascii")).decode("utf-8")
+            except Exception:
+                return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                        "msg": "磁力解码失败"}
+            return self._submit_offline_115(magnet)
+
+        if vid.startswith("115off:"):
+            return self._submit_offline_115(vid[len("115off:"):].strip())
+
+        # 女优列表的「115离线」源：先取该片磁力，再提交到 115
+        if vid.startswith("jav_movie115_"):
+            mid = vid[len("jav_movie115_"):]
+            try:
+                magnets = self._magnets_of(mid)
+            except Exception:
+                magnets = []
+            for g in magnets:
+                m = _normalize_magnet(g.get("magnet"))
+                if m:
+                    return self._submit_offline_115(m)
+            return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                    "msg": "该片没有可用磁力，无法115离线"}
 
         if vid.startswith("magnet:"):
             m = _normalize_magnet(vid)
@@ -1394,6 +2097,9 @@ class Spider:
     def isVideoFormat(self, url):
         u = _to_text(url).lower()
         if u.startswith("magnet:"):
+            return True
+        # 115 离线占位地址：交 playerContent 换成真实直链，别当网页去嗅探
+        if u.startswith(OFF_PREFIX_115) or u.startswith("115off:"):
             return True
         u = u.split("?")[0]
         return u.endswith((".mp4", ".m3u8", ".flv", ".mkv", ".ts", ".avi"))
