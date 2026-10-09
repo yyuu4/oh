@@ -1,4 +1,4 @@
-VERSION = "1.1.16"
+VERSION = "1.1.17"
 # -*- coding: utf-8 -*-
 import os
 import re
@@ -1891,6 +1891,12 @@ class Spider:
             result["format"] = fmt
         return result
 
+    @staticmethod
+    def _offline_note(prefix, name=""):
+        """成功提示文案：msg 是协议通用字段，客户端会当提示显示。"""
+        name = _to_text(name).strip()
+        return "%s：%s" % (prefix, name) if name else prefix
+
     def _offline_finish(self, info_hash, pc, name, allow_search=True):
         """pickcode → 播放直链。
 
@@ -1903,6 +1909,7 @@ class Spider:
             res = self._resolve_pickcode(pc)
             if res.get("url"):
                 self._off_cache[info_hash] = pc
+                res["msg"] = self._offline_note("115离线完成", name)
                 return res
         if allow_search and _to_text(name):
             alt = self._find_pickcode_by_name(name, retries=2, interval=1,
@@ -1911,6 +1918,7 @@ class Spider:
                 res2 = self._resolve_pickcode(alt)
                 if res2.get("url"):
                     self._off_cache[info_hash] = alt
+                    res2["msg"] = self._offline_note("115离线完成", name)
                     return res2
                 res = res2
         return res or {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
@@ -1938,6 +1946,7 @@ class Spider:
         if cached:
             res = self._resolve_pickcode(cached)
             if res.get("url"):
+                res["msg"] = self._offline_note("115离线命中缓存")
                 return res
             self._off_cache.pop(info_hash, None)
 
@@ -2004,7 +2013,7 @@ class Spider:
                 "parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
                 "msg": "离线已完成，但115网盘里还没搜到文件，请稍后重试"}
 
-        res = self._offline_finish(info_hash, pickcode, "", allow_search=False)
+        res = self._offline_finish(info_hash, pickcode, name, allow_search=False)
         if res.get("url") or not early_fail:
             return res
         return early_fail
