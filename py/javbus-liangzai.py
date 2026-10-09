@@ -1,4 +1,4 @@
-VERSION = "1.1.24"
+VERSION = "1.1.25"
 # -*- coding: utf-8 -*-
 import os
 import re
@@ -1528,6 +1528,9 @@ class Spider:
                 break
         if done_note:
             info_lines.insert(0, done_note)
+        # 上次点播放走到哪一步/什么结果：直接写进简介首行（一定看得见，不依赖 toast）
+        if self._off_last:
+            info_lines.insert(0, "[上次播放] " + self._off_last)
 
         item = {
             "vod_id": vid,
