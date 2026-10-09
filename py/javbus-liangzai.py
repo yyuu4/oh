@@ -1,4 +1,4 @@
-VERSION = "1.1.25"
+VERSION = "1.1.26"
 # -*- coding: utf-8 -*-
 import os
 import re
@@ -116,6 +116,25 @@ DEFAULT_COOKIE_115 = ("UID=7090991_R1_1785487771; CID=3c1a3ab03cfc92b0b7c80db6ef
 # 详情页播放地址里的 115 离线标记。
 # 新格式 base64(json{"m":磁力,"t":片名})，旧格式 base64(磁力) 也能解
 OFF_PREFIX_115 = "http://115off/"
+# 播放过程留痕：写进 Python 沙箱 home 下的小文件，跨实例/跨重启都能看到。
+# 用来判断「点播放后到底有没有走到我们的代码」。
+OFF_TRACE_FILE = os.path.join(os.path.expanduser("~"), "javbus_off_trace.txt")
+
+
+def _trace_write(text):
+    try:
+        with open(OFF_TRACE_FILE, "w", encoding="utf-8") as f:
+            f.write(_to_text(text))
+    except Exception:
+        pass
+
+
+def _trace_read():
+    try:
+        with open(OFF_TRACE_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
 
 
 def _fc(item):
@@ -136,8 +155,10 @@ def _off_id_encode(magnet, title="", label=""):
 
 def _off_id_decode(text):
     """播放地址解码 → (磁力, 片名, 小标题)。旧格式 base64(磁力) 也能解"""
+    # 地址后面可能挂着 ?t=时间戳（防 App 按播放地址缓存旧结果），base64 里没有 ?/#
+    text = _to_text(text).strip().split("#")[0].split("?")[0]
     try:
-        raw = base64.b64decode(_to_text(text).strip().encode("ascii")).decode("utf-8")
+        raw = base64.b64decode(text.encode("ascii")).decode("utf-8")
     except Exception:
         return "", "", ""
     raw = raw.strip()
@@ -1506,7 +1527,10 @@ class Spider:
             for i, (g, raw, clean, h) in enumerate(magnet_items):
                 label = self._magnet_label(g, i, num)
                 b64 = _off_id_encode(clean, vod_name, label)
-                eps.append("%s$%s%s" % (label, OFF_PREFIX_115, b64))
+                # ?t= 时间戳：App 若按播放地址缓存了旧结果（旧直链改名后就失效），
+                # 每次进详情都换个地址，强制重新走 playerContent 拿新直链
+                eps.append("%s$%s%s?t=%d" % (label, OFF_PREFIX_115, b64,
+                                             int(time.time())))
             if eps:
                 froms.append("115离线")
                 urls.append("#".join(eps))
@@ -1529,8 +1553,9 @@ class Spider:
         if done_note:
             info_lines.insert(0, done_note)
         # 上次点播放走到哪一步/什么结果：直接写进简介首行（一定看得见，不依赖 toast）
-        if self._off_last:
-            info_lines.insert(0, "[上次播放] " + self._off_last)
+        last = _to_text(self._off_last) or _trace_read()
+        if self.enable_offline_115 and last:
+            info_lines.insert(0, "[上次播放] " + last)
 
         item = {
             "vod_id": vid,
@@ -1547,9 +1572,9 @@ class Spider:
         res = {"list": [item]}
         if done_note:
             res["msg"] = done_note
-        elif self._off_last:
+        elif self.enable_offline_115 and last:
             # 兜底诊断：上次点播放卡在哪一步/结果如何，进详情页弹一次
-            res["msg"] = self._off_last
+            res["msg"] = last
         return res
 
     def _actress_detail(self, vid):
@@ -1588,7 +1613,8 @@ class Spider:
                 continue
             eps.append("%s$%s" % (label or sid, "jav_movie_" + mid))
             if self.enable_offline_115:
-                eps115.append("%s$%s" % (label or sid, "jav_movie115_" + mid))
+                eps115.append("%s$jav_movie115_%s?t=%d"
+                              % (label or sid, mid, int(time.time())))
 
         item = {
             "vod_id": vid,
@@ -2005,6 +2031,11 @@ class Spider:
         name = _to_text(name).strip()
         return "%s：%s" % (prefix, name) if name else prefix
 
+    def _set_off_last(self, text):
+        """记下上次播放走到哪一步：内存 + 文件（跨实例/重启也能看）"""
+        self._off_last = _to_text(text)
+        _trace_write(self._off_last)
+
     def _off_trace(self, phase, t0, force=False):
         """离线播放过程提示（ext.offlineDebug 控制，默认开）。
 
@@ -2013,7 +2044,7 @@ class Spider:
         """
         el = time.time() - t0
         text = "115离线：%s（%.0fs）" % (_to_text(phase), el)
-        self._off_last = text
+        self._set_off_last(text)
         if not self.offline_debug:
             return
         try:
@@ -2362,11 +2393,11 @@ class Spider:
             res = {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
                    "msg": "115离线返回异常"}
         if res.get("url"):
-            self._off_last = "115离线：成功（%.0fs）" % (time.time() - t0)
+            self._set_off_last("115离线：成功（%.0fs）" % (time.time() - t0))
             return res
         if not res.get("msg"):
             res["msg"] = "115离线取直链失败，请重试"
-        self._off_last = "115离线：失败 %s" % res.get("msg")
+        self._set_off_last("115离线：失败 %s" % res.get("msg"))
         return res
 
     def _submit_offline_115(self, magnet, title="", label=""):
@@ -2522,6 +2553,8 @@ class Spider:
     # ========== 播放 ==========
     def playerContent(self, flag, ids, vipFlags=None):
         vid = str(ids[0]) if isinstance(ids, (list, tuple)) and ids else str(ids or "")
+        # 留痕：只要 App 调过 playerContent 就一定有这行（详情页简介首行能看到）
+        self._set_off_last("收到播放请求：%s" % _to_text(vid)[:50])
 
         # 115 离线：http://115off/<base64(磁力|json)> → 提交离线 → 取播放直链
         if vid.startswith(OFF_PREFIX_115):
@@ -2536,7 +2569,7 @@ class Spider:
 
         # 女优列表的「115离线」源：先取该片磁力，再提交到 115
         if vid.startswith("jav_movie115_"):
-            mid = vid[len("jav_movie115_"):]
+            mid = vid[len("jav_movie115_"):].split("?")[0].split("#")[0]
             try:
                 magnets = self._magnets_of(mid)
             except Exception:
