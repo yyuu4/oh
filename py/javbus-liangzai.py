@@ -1,4 +1,4 @@
-VERSION = "1.2.18"
+VERSION = "1.2.15"
 # -*- coding: utf-8 -*-
 import os
 import re
@@ -190,10 +190,10 @@ OFFLINE_VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".flv", ".ts", ".m4v",
                       ".webm", ".m2ts", ".vob", ".mp2")
 OFFLINE_ADD_API = "https://115.com/web/lixian/?ct=lixian&ac=add_task_urls"
 OFFLINE_LIST_API = "https://115.com/web/lixian/?ct=lixian&ac=task_lists"
-OFFLINE_POLL_TIMEOUT = 20
+OFFLINE_POLL_TIMEOUT = 15
 OFFLINE_POLL_INTERVAL = 1
 # 整理+取直链一起最多花几秒；超了就不整理，直接走 v1.1.21 的老路径（先直链、取不到再搜）
-OFFLINE_FINISH_BUDGET = 12
+OFFLINE_FINISH_BUDGET = 9
 # 二分实验用的公开测试片（免鉴权、支持 Range），只在 ext.offlineTestMp4 打开时用
 OFFLINE_TEST_MP4 = ("https://commondatastorage.googleapis.com/gtv-videos-bucket/"
                     "sample/BigBuckBunny.mp4")
@@ -812,6 +812,8 @@ class Spider:
         self._off_name = {}
         # info_hash -> 该片原简介（详情页拿到），播放页 desc 提示时放在提示后面
         self._off_syn = {}
+        # 直链地址（去参数） -> 上次自检 206 的时间戳（10 分钟内不重复探测）
+        self._off_verified = {}
         # 删除失败的空任务文件夹 fcid 清单，下次播放时补删
         self._off_pending_trash = []
         try:
@@ -819,16 +821,11 @@ class Spider:
                 data = json.load(f)
             if isinstance(data, list):
                 self._off_pending_trash = [_to_text(x) for x in data
-                                           if _to_text(x)][:100]
+                                           if _to_text(x)][:50]
         except Exception:
             pass
         # 影片 id -> 片名（女优列表入口离线整理时用）
         self._vid_title = {}
-
-        # 115 客户端链路诊断相关（预检已移除，保留字段防框架调用顺序异常）
-        self.offline_local_proxy_cfg = ""
-        self._off_pp_base = None
-        self._off_verified = {}
 
         # filters / 默认值缓存
         self._cache_filters = {}
@@ -959,8 +956,8 @@ class Spider:
         # 客户端链路诊断：Atvp 配了 local_proxy_config 时会把它注入本 ext
         # （Atvp._compose_inner_extend），App 实际走本地分片代理改写还是直连就看它
         self.offline_local_proxy_cfg = extend.get("local_proxy_config") or ""
-        self._off_pp_base = None
-        self._off_verified = {}
+        self._off_pp_base = None      # 设备上 VideoStreamProxy 端口探测缓存（""=没有）
+        self._off_verified = {}       # 换配置/cookie 后重新自检
 
         # 自动选域名：配置了代理全走代理，否则免代理 > 最快
         self._ensure_host()
@@ -1871,6 +1868,7 @@ class Spider:
             self._off_cache.clear()
             self._off_name.clear()
             self._off_syn.clear()
+            self._off_verified.clear()
         except Exception:
             pass
         try:
@@ -2030,14 +2028,12 @@ class Spider:
             return "%s-%s" % (m.group(1).upper(), m.group(2))
         return base[:40]
 
-    def _find_pickcode_by_name(self, name, retries=3, interval=1, exact="", deadline=0):
+    def _find_pickcode_by_name(self, name, retries=3, interval=1, exact=""):
         keyword = self._guess_keyword_from_name(name)
         if not keyword:
             return ""
         exact = _to_text(exact)
         for _ in range(max(1, retries)):
-            if deadline and time.time() >= deadline:
-                return ""
             fallback = ""
             # type=4 视频优先，找不到再搜全部（兜底）；请求复用 _search_rows
             for stype in (4, 0):
@@ -2116,10 +2112,10 @@ class Spider:
         }
         if fmt:
             result["format"] = fmt
-        # v1.2.17：完全去掉 type 字段，对齐 v1.1.21 / v1.2.15。
-        # 只要带 type（哪怕非代理类型），App 端 VideoStreamProxy 就会触发 registerProxyTask
-        # 流程，导致快进时走分片代理路径 → OOM 重启（s905x4 实测必现）。
-        # 无 type 时走直载模式：直链 + header 直接给播放器，快进不重启。
+        # v1.2.15：删掉 type 字段，完全对齐 v1.1.21 的返回结构。
+        # lp=0（Atvp 未注入 local_proxy_config）时 type 无实际作用；
+        # lp≠0 时 type 会改变 Java 侧改写行为。v1.1.21 无 type、快进不重启，
+        # 保持一致最稳。
         return result
 
     @staticmethod
@@ -2146,7 +2142,7 @@ class Spider:
         self._off_cache[info_hash] = pc
         if name:
             self._off_name[info_hash] = name
-        while len(self._off_cache) > 128:
+        while len(self._off_cache) > 64:
             old = next(iter(self._off_cache))
             self._off_cache.pop(old, None)
             self._off_name.pop(old, None)
@@ -2229,7 +2225,6 @@ class Spider:
             if t not in enabled:
                 return t
         return "__off115__"
-
 
     @staticmethod
     def _offline_srt(text):
@@ -2413,7 +2408,7 @@ class Spider:
     def _pending_trash_save(self):
         try:
             with open(OFF_PENDING_FILE, "w", encoding="utf-8") as f:
-                json.dump(self._off_pending_trash[:100], f)
+                json.dump(self._off_pending_trash[:50], f)
         except Exception:
             pass
 
@@ -2423,7 +2418,7 @@ class Spider:
         if not fcid or fcid in self._off_pending_trash:
             return
         self._off_pending_trash.append(fcid)
-        self._off_pending_trash = self._off_pending_trash[:100]
+        self._off_pending_trash = self._off_pending_trash[:50]
         self._pending_trash_save()
 
     def _reap_pending_trash(self):
@@ -2781,7 +2776,7 @@ class Spider:
                     break
                 seen.add(kw)
                 self._off_trace("按名字搜索", t0)
-                alt = self._find_pickcode_by_name(kw, retries=1, interval=0, deadline=deadline)
+                alt = self._find_pickcode_by_name(kw, retries=1, interval=0)
                 if not alt or alt in (pc, play_pc):
                     continue
                 res2 = self._resolve_pickcode(alt)
@@ -2809,7 +2804,126 @@ class Spider:
                     res = res2
         return res or _play_err("取直链失败（%.0fs），可重试" % (time.time() - t0))
 
+    def _offline_preflight(self, res):
+        """返回直链后自测一次：用一模一样的 header 拉 64 字节。
 
+        App 端转圈时，简介里这行能当场分辨两种锅：
+        [自检] 206 … → 直链和 header 都没问题（锅在客户端没带 header / 网络）；
+        [自检] 403 … → 直链本身取不到（锅在 spider 这边的 cookie/签名）。
+        只报告，不改播放行为。
+        """
+        url = _to_text(res.get("url") or "")
+        if not url.lower().startswith("http"):
+            return ""
+        # 同一地址 10 分钟内验证过 206 就不再发请求（重进同一片省 ~0.4s）
+        # 值带 Cookie：换过 cookie（Set-Cookie 令牌变化）后必须重新实测，诊断行不说谎
+        base = url.split("?")[0]
+        ck_now = _to_text((res.get("header") or {}).get("Cookie") or "")
+        vt = self._off_verified.get(base)
+        if vt and time.time() - vt[0] < 600 and vt[1] == ck_now:
+            seek0 = vt[2] if len(vt) > 2 else "?"
+            return "[自检] 直链206 ✓ seek%s（10分钟内已验证）" % seek0
+        h = dict(res.get("header") or {})
+        h["Range"] = "bytes=0-63"
+        t0 = time.time()
+        # 用一次性会话：不占 s115 连接池，测完即关（4G 盒子上省连接/SSL 内存）
+        if not requests:
+            return "[自检] 无 requests"
+        sess = requests.Session()
+        sess.trust_env = False
+        code, total, body = 0, 0, ""
+        try:
+            try:
+                r = sess.get(url, headers=h, timeout=8, verify=False, stream=True)
+                code = r.status_code
+                cr = _to_text(r.headers.get("Content-Range") or "")
+                mm = re.search(r"/(\d+)", cr)
+                if mm:
+                    total = int(mm.group(1))
+                if code != 206:
+                    # 只读前几百字节：CDN 若忽略 Range 回 200，r.content 会拉完整个文件
+                    try:
+                        chunk = b""
+                        it = (r.iter_content(128) if hasattr(r, "iter_content")
+                              else [r.content[:200]])
+                        for c in it:
+                            if not c:
+                                continue
+                            chunk += c
+                            if len(chunk) >= 200:
+                                break
+                        body = _to_text(chunk[:80]).replace("\n", " ")
+                    except Exception:
+                        body = ""
+                try:
+                    r.close()
+                except Exception:
+                    pass
+            except Exception as e:
+                return "[自检] 直链探测异常 %s（%.1fs）" % (e, time.time() - t0)
+            size = ("%.2fGB" % (total / 1073741824.0)) if total > 0 else "?"
+            if code == 206:
+                # seek 探测：中部 Range，验证快进时新 Range 请求可用（只报告）
+                seek = "?"
+                if total > 0:
+                    try:
+                        mid = total // 2
+                        h2 = dict(h)
+                        h2["Range"] = "bytes=%d-%d" % (mid, mid + 63)
+                        r2 = sess.get(url, headers=h2, timeout=8, verify=False,
+                                      stream=True)
+                        seek = "✓" if r2.status_code == 206 else "✗%d" % r2.status_code
+                        try:
+                            r2.close()
+                        except Exception:
+                            pass
+                    except Exception:
+                        seek = "✗err"
+                self._off_verified[base] = (time.time(), ck_now, seek)
+                while len(self._off_verified) > 16:
+                    self._off_verified.pop(next(iter(self._off_verified)))
+                return "[自检] 直链206 ✓ seek%s %s（%.1fs）" % (
+                    seek, size, time.time() - t0)
+            return "[自检] 直链%d ✗ %s（%.1fs）" % (code, body, time.time() - t0)
+        finally:
+            try:
+                sess.close()
+            except Exception:
+                pass
+
+    def _offline_client_probe(self, res):
+        """客户端侧链路探测（只报告，不改播放结果）。
+
+        只做无副作用的检查：lp=ext 里有没有 local_proxy_config；
+        pp=设备上 VideoStreamProxy 监听的端口（5000-5009 /status 探测）。
+
+        已删除 rw 实测（POST /player + GET 改写 URL）：POST 会向本地代理注册
+        任务，GET 改写后的地址会触发 VideoStreamProxy 后台并行拉流。4G 运存
+        盒子上后台拉流 + 播放器 seek 并发 → OOM → 机器重启（v1.2.11 实测）。
+        """
+        lp_cfg = getattr(self, "offline_local_proxy_cfg", "")
+        parts = ["lp=%d" % (1 if lp_cfg else 0)]
+        if not lp_cfg or not requests:
+            return " ".join(parts)
+        if self._off_pp_base is None:
+            self._off_pp_base = ""
+            for port in range(5000, 5010):
+                try:
+                    s = requests.Session()
+                    s.trust_env = False
+                    try:
+                        r = s.get("http://127.0.0.1:%d/status" % port, timeout=0.3,
+                                  verify=False)
+                        if r.status_code == 200:
+                            self._off_pp_base = "http://127.0.0.1:%d" % port
+                            break
+                    finally:
+                        s.close()
+                except Exception:
+                    continue
+        parts.append("pp=%s" % (self._off_pp_base.rsplit(":", 1)[-1]
+                                if self._off_pp_base else "-"))
+        return " ".join(parts)
 
     def _play_offline_safe(self, magnet, title="", label=""):
         """离线播放入口兜底：任何异常都要落到 msg，绝不允许静默转圈。
@@ -2911,7 +3025,6 @@ class Spider:
             return _play_err("requests 模块不可用")
 
         t0 = time.time()
-        deadline = t0 + OFFLINE_FINISH_BUDGET
         self._off_trace("开始处理", t0)
 
         info_hash = self._magnet_hash(magnet)
@@ -3033,7 +3146,7 @@ class Spider:
                 return early_fail
             return res
 
-        pickcode = self._find_pickcode_by_name(name, retries=3, interval=1, exact=name, deadline=deadline)
+        pickcode = self._find_pickcode_by_name(name, retries=3, interval=1, exact=name)
         if not pickcode:
             return early_fail or _play_err(
                 "离线已完成，但115网盘里还没搜到文件，请稍后重试")
