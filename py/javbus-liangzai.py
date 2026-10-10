@@ -1,4 +1,4 @@
-VERSION = "1.2.16"
+VERSION = "1.2.17"
 # -*- coding: utf-8 -*-
 import os
 import re
@@ -190,10 +190,10 @@ OFFLINE_VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".flv", ".ts", ".m4v",
                       ".webm", ".m2ts", ".vob", ".mp2")
 OFFLINE_ADD_API = "https://115.com/web/lixian/?ct=lixian&ac=add_task_urls"
 OFFLINE_LIST_API = "https://115.com/web/lixian/?ct=lixian&ac=task_lists"
-OFFLINE_POLL_TIMEOUT = 15
+OFFLINE_POLL_TIMEOUT = 20
 OFFLINE_POLL_INTERVAL = 1
 # 整理+取直链一起最多花几秒；超了就不整理，直接走 v1.1.21 的老路径（先直链、取不到再搜）
-OFFLINE_FINISH_BUDGET = 9
+OFFLINE_FINISH_BUDGET = 12
 # 二分实验用的公开测试片（免鉴权、支持 Range），只在 ext.offlineTestMp4 打开时用
 OFFLINE_TEST_MP4 = ("https://commondatastorage.googleapis.com/gtv-videos-bucket/"
                     "sample/BigBuckBunny.mp4")
@@ -819,11 +819,16 @@ class Spider:
                 data = json.load(f)
             if isinstance(data, list):
                 self._off_pending_trash = [_to_text(x) for x in data
-                                           if _to_text(x)][:50]
+                                           if _to_text(x)][:100]
         except Exception:
             pass
         # 影片 id -> 片名（女优列表入口离线整理时用）
         self._vid_title = {}
+
+        # 115 客户端链路诊断相关（预检已移除，保留字段防框架调用顺序异常）
+        self.offline_local_proxy_cfg = ""
+        self._off_pp_base = None
+        self._off_verified = {}
 
         # filters / 默认值缓存
         self._cache_filters = {}
@@ -2145,7 +2150,7 @@ class Spider:
         self._off_cache[info_hash] = pc
         if name:
             self._off_name[info_hash] = name
-        while len(self._off_cache) > 64:
+        while len(self._off_cache) > 128:
             old = next(iter(self._off_cache))
             self._off_cache.pop(old, None)
             self._off_name.pop(old, None)
@@ -2412,7 +2417,7 @@ class Spider:
     def _pending_trash_save(self):
         try:
             with open(OFF_PENDING_FILE, "w", encoding="utf-8") as f:
-                json.dump(self._off_pending_trash[:50], f)
+                json.dump(self._off_pending_trash[:100], f)
         except Exception:
             pass
 
@@ -2422,7 +2427,7 @@ class Spider:
         if not fcid or fcid in self._off_pending_trash:
             return
         self._off_pending_trash.append(fcid)
-        self._off_pending_trash = self._off_pending_trash[:50]
+        self._off_pending_trash = self._off_pending_trash[:100]
         self._pending_trash_save()
 
     def _reap_pending_trash(self):
