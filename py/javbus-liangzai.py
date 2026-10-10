@@ -1,4 +1,4 @@
-VERSION = "1.2.17"
+VERSION = "1.2.18"
 # -*- coding: utf-8 -*-
 import os
 import re
@@ -2116,14 +2116,10 @@ class Spider:
         }
         if fmt:
             result["format"] = fmt
-        # 关键：给返回结果挑一个 ext.local_proxy_config 里没规则的 CloudDriveType。
-        # csp_PyProxy 链路的 Java VideoStreamProxy 按 result 的 "type" 找规则，
-        # 命中 PAN115 就把 115 直链改写成 127.0.0.1 分片代理 —— 那条改写链路在
-        # OK影视 实测会转圈/“bad http status”。type 表里没规则时 registerProxyTask
-        # 返回 null，Java 原样返回 直链+header（= 直载模式验证过能播的那条路）。
-        result["type"] = self._offline_no_proxy_type()
-        # 播放地址保持 v1.1.21 的老样子：直链 + header（alist-tvbox 实测能播），
-        # 不要改指本地代理——csp_PyProxy 那条链路会 "bad http status"。
+        # v1.2.17：完全去掉 type 字段，对齐 v1.1.21 / v1.2.15。
+        # 只要带 type（哪怕非代理类型），App 端 VideoStreamProxy 就会触发 registerProxyTask
+        # 流程，导致快进时走分片代理路径 → OOM 重启（s905x4 实测必现）。
+        # 无 type 时走直载模式：直链 + header 直接给播放器，快进不重启。
         return result
 
     @staticmethod
