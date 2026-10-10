@@ -1,4 +1,4 @@
-VERSION = "1.2.15"
+VERSION = "1.2.14"
 # -*- coding: utf-8 -*-
 import os
 import re
@@ -2112,10 +2112,14 @@ class Spider:
         }
         if fmt:
             result["format"] = fmt
-        # v1.2.15：删掉 type 字段，完全对齐 v1.1.21 的返回结构。
-        # lp=0（Atvp 未注入 local_proxy_config）时 type 无实际作用；
-        # lp≠0 时 type 会改变 Java 侧改写行为。v1.1.21 无 type、快进不重启，
-        # 保持一致最稳。
+        # 关键：给返回结果挑一个 ext.local_proxy_config 里没规则的 CloudDriveType。
+        # csp_PyProxy 链路的 Java VideoStreamProxy 按 result 的 "type" 找规则，
+        # 命中 PAN115 就把 115 直链改写成 127.0.0.1 分片代理 —— 那条改写链路在
+        # OK影视 实测会转圈/“bad http status”。type 表里没规则时 registerProxyTask
+        # 返回 null，Java 原样返回 直链+header（= 直载模式验证过能播的那条路）。
+        result["type"] = self._offline_no_proxy_type()
+        # 播放地址保持 v1.1.21 的老样子：直链 + header（alist-tvbox 实测能播），
+        # 不要改指本地代理——csp_PyProxy 那条链路会 "bad http status"。
         return result
 
     @staticmethod
@@ -2939,13 +2943,29 @@ class Spider:
         if not isinstance(res, dict):
             res = _play_err("115离线返回异常")
         if res.get("url"):
-            # v1.2.15：播前自检彻底移出播放路径。
-            # seek✓ 已证明 CDN 能处理中部 Range，但播前多打 2 次 CDN 请求
-            # 本身会干扰 CDN 对本 IP 的连接状态（限流/会话冲突），导致播放器
-            # 快进时 Range 异常 → 卡死 → 看门狗重启（s905x4 实测 v1.2.14 仍重启）。
-            # v1.1.21 无自检、无 type，快进不重启——现在对齐它。
-            self._set_off_last("115离线：成功（%.0fs）" % (time.time() - t0))
-            # URL 已就绪：释放 115 会话+缓存，把内存让给播放器
+            # 自检：把直链实测结果塞进简介（播放页 desc / 详情页 [上次播放]）
+            # 探测用一次性会话（见 _offline_preflight），不占 s115 连接池
+            chk = ""
+            try:
+                chk = self._offline_preflight(res)
+            except Exception as e:
+                chk = "[自检] 异常 %s" % e
+            if chk:
+                res["desc"] = (_to_text(res.get("desc")) + "\n" + chk).strip()
+            cli = ""
+            try:
+                cli = self._offline_client_probe(res)
+            except Exception as e:
+                cli = "err %s" % e
+            if cli:
+                res["desc"] = (_to_text(res.get("desc"))
+                               + "\n[自检2] " + cli).strip()
+            note = chk
+            if cli:
+                note = (note + "  [自检2] " + cli) if note else ("[自检2] " + cli)
+            self._set_off_last("115离线：成功（%.0fs）%s"
+                               % (time.time() - t0, (" " + note) if note else ""))
+            # URL 已就绪：释放 115 会话+缓存，把内存让给播放器（防快进 OOM 重启）
             self._release_play_memory()
             return res
         if not res.get("msg"):
