@@ -1,4 +1,4 @@
-VERSION = "1.2.13"
+VERSION = "1.2.14"
 # -*- coding: utf-8 -*-
 import os
 import re
@@ -1850,6 +1850,33 @@ class Spider:
         self.s115 = s
         return s
 
+    def _release_play_memory(self):
+        """播放 URL 已就绪 → 释放 115 会话和缓存，把内存让给播放器。
+
+        chaquo 里 Python 与播放器同进程；s115 连接池 + SSL 上下文 + 各缓存
+        合计几十 MB。4G 盒子上快进时 ExoPlayer 要新分配缓冲，叠加容易 OOM
+        → 看门狗重启（s905x4 实测连续两次快进必重启）。v1.1.21 没有这些
+        开销所以快进没事。下次播放自动重建会话，代价一次建连 <0.3s。
+        """
+        if self.s115 is not None:
+            try:
+                self.s115.close()
+            except Exception:
+                pass
+            self.s115 = None
+        try:
+            self._off_cache.clear()
+            self._off_name.clear()
+            self._off_syn.clear()
+            self._off_verified.clear()
+        except Exception:
+            pass
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+
     def _offline_headers(self):
         return {
             "Cookie": self.cookie_115,
@@ -2803,62 +2830,70 @@ class Spider:
         h = dict(res.get("header") or {})
         h["Range"] = "bytes=0-63"
         t0 = time.time()
-        sess = self._offline_session()
-        if sess is None:
-            return "[自检] 无会话"
+        # 用一次性会话：不占 s115 连接池，测完即关（4G 盒子上省连接/SSL 内存）
+        if not requests:
+            return "[自检] 无 requests"
+        sess = requests.Session()
+        sess.trust_env = False
         code, total, body = 0, 0, ""
         try:
-            r = sess.get(url, headers=h, timeout=8, verify=False, stream=True)
-            code = r.status_code
-            cr = _to_text(r.headers.get("Content-Range") or "")
-            mm = re.search(r"/(\d+)", cr)
-            if mm:
-                total = int(mm.group(1))
-            if code != 206:
-                # 只读前几百字节：CDN 若忽略 Range 回 200，r.content 会拉完整个文件
-                try:
-                    chunk = b""
-                    it = (r.iter_content(128) if hasattr(r, "iter_content")
-                          else [r.content[:200]])
-                    for c in it:
-                        if not c:
-                            continue
-                        chunk += c
-                        if len(chunk) >= 200:
-                            break
-                    body = _to_text(chunk[:80]).replace("\n", " ")
-                except Exception:
-                    body = ""
             try:
-                r.close()
+                r = sess.get(url, headers=h, timeout=8, verify=False, stream=True)
+                code = r.status_code
+                cr = _to_text(r.headers.get("Content-Range") or "")
+                mm = re.search(r"/(\d+)", cr)
+                if mm:
+                    total = int(mm.group(1))
+                if code != 206:
+                    # 只读前几百字节：CDN 若忽略 Range 回 200，r.content 会拉完整个文件
+                    try:
+                        chunk = b""
+                        it = (r.iter_content(128) if hasattr(r, "iter_content")
+                              else [r.content[:200]])
+                        for c in it:
+                            if not c:
+                                continue
+                            chunk += c
+                            if len(chunk) >= 200:
+                                break
+                        body = _to_text(chunk[:80]).replace("\n", " ")
+                    except Exception:
+                        body = ""
+                try:
+                    r.close()
+                except Exception:
+                    pass
+            except Exception as e:
+                return "[自检] 直链探测异常 %s（%.1fs）" % (e, time.time() - t0)
+            size = ("%.2fGB" % (total / 1073741824.0)) if total > 0 else "?"
+            if code == 206:
+                # seek 探测：中部 Range，验证快进时新 Range 请求可用（只报告）
+                seek = "?"
+                if total > 0:
+                    try:
+                        mid = total // 2
+                        h2 = dict(h)
+                        h2["Range"] = "bytes=%d-%d" % (mid, mid + 63)
+                        r2 = sess.get(url, headers=h2, timeout=8, verify=False,
+                                      stream=True)
+                        seek = "✓" if r2.status_code == 206 else "✗%d" % r2.status_code
+                        try:
+                            r2.close()
+                        except Exception:
+                            pass
+                    except Exception:
+                        seek = "✗err"
+                self._off_verified[base] = (time.time(), ck_now, seek)
+                while len(self._off_verified) > 16:
+                    self._off_verified.pop(next(iter(self._off_verified)))
+                return "[自检] 直链206 ✓ seek%s %s（%.1fs）" % (
+                    seek, size, time.time() - t0)
+            return "[自检] 直链%d ✗ %s（%.1fs）" % (code, body, time.time() - t0)
+        finally:
+            try:
+                sess.close()
             except Exception:
                 pass
-        except Exception as e:
-            return "[自检] 直链探测异常 %s（%.1fs）" % (e, time.time() - t0)
-        size = ("%.2fGB" % (total / 1073741824.0)) if total > 0 else "?"
-        if code == 206:
-            # seek 探测：中部 Range，验证快进时新 Range 请求可用（只报告）
-            seek = "?"
-            if total > 0:
-                try:
-                    mid = total // 2
-                    h2 = dict(h)
-                    h2["Range"] = "bytes=%d-%d" % (mid, mid + 63)
-                    r2 = sess.get(url, headers=h2, timeout=8, verify=False,
-                                  stream=True)
-                    seek = "✓" if r2.status_code == 206 else "✗%d" % r2.status_code
-                    try:
-                        r2.close()
-                    except Exception:
-                        pass
-                except Exception:
-                    seek = "✗err"
-            self._off_verified[base] = (time.time(), ck_now, seek)
-            while len(self._off_verified) > 16:
-                self._off_verified.pop(next(iter(self._off_verified)))
-            return "[自检] 直链206 ✓ seek%s %s（%.1fs）" % (
-                seek, size, time.time() - t0)
-        return "[自检] 直链%d ✗ %s（%.1fs）" % (code, body, time.time() - t0)
 
     def _offline_client_probe(self, res):
         """客户端侧链路探测（只报告，不改播放结果）。
@@ -2909,6 +2944,7 @@ class Spider:
             res = _play_err("115离线返回异常")
         if res.get("url"):
             # 自检：把直链实测结果塞进简介（播放页 desc / 详情页 [上次播放]）
+            # 探测用一次性会话（见 _offline_preflight），不占 s115 连接池
             chk = ""
             try:
                 chk = self._offline_preflight(res)
@@ -2929,6 +2965,8 @@ class Spider:
                 note = (note + "  [自检2] " + cli) if note else ("[自检2] " + cli)
             self._set_off_last("115离线：成功（%.0fs）%s"
                                % (time.time() - t0, (" " + note) if note else ""))
+            # URL 已就绪：释放 115 会话+缓存，把内存让给播放器（防快进 OOM 重启）
+            self._release_play_memory()
             return res
         if not res.get("msg"):
             res["msg"] = "115离线取直链失败，请重试"
