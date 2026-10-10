@@ -1,4 +1,4 @@
-VERSION = "1.2.15"
+VERSION = "1.2.16"
 # -*- coding: utf-8 -*-
 import os
 import re
@@ -953,6 +953,9 @@ class Spider:
         self.offline_test_mp4 = _to_text(extend.get("offlineTestMp4")).strip().lower()
         # 客户端链路诊断：Atvp 配了 local_proxy_config 时会把它注入本 ext
         # （Atvp._compose_inner_extend），App 实际走本地分片代理改写还是直连就看它
+        self.offline_local_proxy_cfg = extend.get("local_proxy_config") or ""
+        self._off_pp_base = None
+        self._off_verified = {}
 
         # 自动选域名：配置了代理全走代理，否则免代理 > 最快
         self._ensure_host()
@@ -2108,10 +2111,14 @@ class Spider:
         }
         if fmt:
             result["format"] = fmt
-        # v1.2.15：去掉 type 字段，完全对齐 v1.1.21。
-        # type 会触发 App 端 VideoStreamProxy 的 registerProxyTask 流程，
-        # 即使没命中规则，带 type 的 result 处理路径也不同，快进时容易 OOM 重启。
-        # v1.1.21 无 type，走直载模式，快进不重启。
+        # 关键：给返回结果挑一个 ext.local_proxy_config 里没规则的 CloudDriveType。
+        # csp_PyProxy 链路的 Java VideoStreamProxy 按 result 的 "type" 找规则，
+        # 命中 PAN115 就把 115 直链改写成 127.0.0.1 分片代理 —— 那条改写链路在
+        # OK影视 实测会转圈/“bad http status”。type 表里没规则时 registerProxyTask
+        # 返回 null，Java 原样返回 直链+header（= 直载模式验证过能播的那条路）。
+        result["type"] = self._offline_no_proxy_type()
+        # 播放地址保持 v1.1.21 的老样子：直链 + header（alist-tvbox 实测能播），
+        # 不要改指本地代理——csp_PyProxy 那条链路会 "bad http status"。
         return result
 
     @staticmethod
@@ -2173,6 +2180,54 @@ class Spider:
         except Exception:
             port = 0
         return "http://127.0.0.1:%d/proxy?" % port if port > 0 else "proxy://"
+
+    @staticmethod
+    def _offline_alt_types():
+        """按优先级排列的 CloudDriveType 候选（反编译 classes.dex 得来）。
+
+        引擎默认的 local_proxy_config 只开 ALI/QUARK/UC/PAN115/PAN123/PAN139/
+        BAIDU/GUANGYA；CLOUD189 在 proxyPlayerContent 里有专门分支，放最后。
+        """
+        return ("THUNDER", "PAN123", "PAN139", "BAIDU", "GUANGYA",
+                "UC", "QUARK", "ALI", "PAN115", "CLOUD189")
+
+    def _offline_no_proxy_type(self):
+        """给 playerContent 结果挑一个「本地代理不会改写」的 CloudDriveType。
+
+        Alist 注入到本 ext 的 local_proxy_config 决定 VideoStreamProxy 会改写
+        哪些网盘直链（命中规则 → 127.0.0.1 分片代理 → OK影视 会转圈/“bad http
+        status”）；表里没有的 type 则原样返回 直链+header（直载那条能播的路）。
+        这里现读配置挑一个当前没开启的类型；万一全开了，就返回非法枚举值让
+        Java 抛异常走它的兜底（catch 后照样原样返回直链）。
+        """
+        enabled = set()
+        cfg = getattr(self, "offline_local_proxy_cfg", "") or ""
+        try:
+            if isinstance(cfg, str):
+                c = cfg.strip()
+                cfg = json.loads(c) if c.startswith("{") else {}
+            if isinstance(cfg, dict):
+                for k, v in cfg.items():
+                    on = False
+                    if isinstance(v, dict):
+                        # 对齐 Java LocalProxyRule：enabled==true 且 concurrency>0
+                        # 且 chunk_size>0 才会改写（parseLocalProxyConfig 要求三键齐全，
+                        # registerProxyTask 再依次校验）。字符串 "false" 不能当 True。
+                        e = v.get("enabled")
+                        if e is True or (isinstance(e, str) and e.strip().lower() == "true"):
+                            try:
+                                on = int(v.get("concurrency") or 0) > 0 \
+                                     and int(v.get("chunk_size") or 0) > 0
+                            except Exception:
+                                on = False
+                    if on:
+                        enabled.add(_to_text(k).upper())
+        except Exception:
+            pass
+        for t in self._offline_alt_types():
+            if t not in enabled:
+                return t
+        return "__off115__"
 
 
     @staticmethod
