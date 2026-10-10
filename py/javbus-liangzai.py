@@ -1,11 +1,10 @@
-VERSION = "1.2.10"
+VERSION = "1.2.13"
 # -*- coding: utf-8 -*-
 import os
 import re
 import json
 import time
 import base64
-import ast
 import html as _html
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -122,6 +121,8 @@ OFF_PREFIX_115 = "http://115off/"
 # 播放过程留痕：写进 Python 沙箱 home 下的小文件，跨实例/跨重启都能看到。
 # 用来判断「点播放后到底有没有走到我们的代码」。
 OFF_TRACE_FILE = os.path.join(os.path.expanduser("~"), "javbus_off_trace.txt")
+# 删除失败的空任务文件夹清单（fcid 列表），下次播放时补删
+OFF_PENDING_FILE = os.path.join(os.path.expanduser("~"), "javbus_off_pending.json")
 
 
 def _trace_write(text):
@@ -410,6 +411,15 @@ def _safe_int(v, default=0):
             return int(str(v or "").strip() or default)
         except Exception:
             return default
+
+
+_SIZE_TOKEN_RE = re.compile(r"\d+(?:\.\d+)?\s*(?:TB|GB|MB|KB|B)(?![A-Za-z])", re.I)
+
+
+def _extract_size_token(text):
+    """从 label 提取体积 token（如 "1.35GB"）；没有返回 \"\"。"""
+    m = _SIZE_TOKEN_RE.search(_to_text(text) or "")
+    return m.group(0).lower() if m else ""
 
 
 def _fix_url(url, host=HOST):
@@ -802,10 +812,18 @@ class Spider:
         self._off_name = {}
         # info_hash -> 该片原简介（详情页拿到），播放页 desc 提示时放在提示后面
         self._off_syn = {}
-        # 客户端链路 [自检2] rw 实测过一次健康就不再重复（省 ~1.5s/次）
-        self._off_probe_ok = False
         # 直链地址（去参数） -> 上次自检 206 的时间戳（10 分钟内不重复探测）
         self._off_verified = {}
+        # 删除失败的空任务文件夹 fcid 清单，下次播放时补删
+        self._off_pending_trash = []
+        try:
+            with open(OFF_PENDING_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                self._off_pending_trash = [_to_text(x) for x in data
+                                           if _to_text(x)][:50]
+        except Exception:
+            pass
         # 影片 id -> 片名（女优列表入口离线整理时用）
         self._vid_title = {}
 
@@ -939,7 +957,6 @@ class Spider:
         # （Atvp._compose_inner_extend），App 实际走本地分片代理改写还是直连就看它
         self.offline_local_proxy_cfg = extend.get("local_proxy_config") or ""
         self._off_pp_base = None      # 设备上 VideoStreamProxy 端口探测缓存（""=没有）
-        self._off_probe_ok = False    # 换配置后重新实测一次 rw
         self._off_verified = {}       # 换配置/cookie 后重新自检
 
         # 自动选域名：配置了代理全走代理，否则免代理 > 最快
@@ -947,6 +964,12 @@ class Spider:
 
         # 清空缓存
         self._cache_filters = {}
+
+        # 启动即补删上一轮删除失败的空任务文件夹
+        try:
+            self._reap_pending_trash()
+        except Exception:
+            pass
 
     def set_proxy(self, value):
         """设置/清除代理，返回归一化后的代理地址"""
@@ -2359,6 +2382,44 @@ class Spider:
                 time.sleep(0.3)
         return False
 
+    def _pending_trash_save(self):
+        try:
+            with open(OFF_PENDING_FILE, "w", encoding="utf-8") as f:
+                json.dump(self._off_pending_trash[:50], f)
+        except Exception:
+            pass
+
+    def _pending_trash_add(self, fcid):
+        """登记删除失败的空任务文件夹，下次播放时补删"""
+        fcid = _to_text(fcid)
+        if not fcid or fcid in self._off_pending_trash:
+            return
+        self._off_pending_trash.append(fcid)
+        self._off_pending_trash = self._off_pending_trash[:50]
+        self._pending_trash_save()
+
+    def _reap_pending_trash(self):
+        """补删之前删除失败的空文件夹（各试一次，失败即停）"""
+        if not self._off_pending_trash:
+            return
+        remaining = list(self._off_pending_trash)
+        changed = False
+        while remaining:
+            fcid = remaining[0]
+            ok = False
+            try:
+                ok = self._offline_trash(fcid)
+            except Exception:
+                ok = False
+            if ok:
+                remaining.pop(0)
+                changed = True
+            else:
+                break  # 网络问题等：失败即停，下次再试
+        if changed:
+            self._off_pending_trash = remaining
+            self._pending_trash_save()
+
     def _offline_parent(self, info, deadline=0):
         """文件夹所在的父目录 cid；拿不到就返回 ""（宁可不移动）"""
         pid = _to_text(info.get("pid") or "")
@@ -2458,7 +2519,21 @@ class Spider:
         if not any(_to_text(k.get("fid") or "") == fid for k in kids):
             return
         if self._offline_move(parent or "0", fid):
-            self._offline_trash(fcid)
+            # 三态：确认已移出 → 删（失败登记待删）；确认没移出 → 不删不登记；
+            # get_info 失败 → 登记待删（move 已返回 True，下次补删）
+            cur = ""
+            try:
+                cur = _to_text((self._offline_info(
+                    _to_text(info.get("pc") or info.get("pick_code") or ""))
+                    or {}).get("cid") or "")
+            except Exception:
+                cur = ""
+            if cur and cur != fcid:
+                if not self._offline_trash(fcid):
+                    self._pending_trash_add(fcid)
+            elif not cur:
+                self._pending_trash_add(fcid)
+            # cur == fcid：move 没生效，文件还在文件夹里，不删不登记
 
     def _tidy_folder(self, info, name, title, label="", deadline=0):
         """文件夹种子：挑体积最大的视频 → 改名 → 移出文件夹 → 删掉文件夹（回收站）"""
@@ -2477,21 +2552,43 @@ class Spider:
         pid = "" if (deadline and time.time() >= deadline) \
             else self._offline_parent(info, deadline)
         if pid and fid and self._offline_move(pid, fid):
-            # 校验：查视频自身的 cid 是否已离开旧文件夹。不能列目录校验——
-            # 115 目录接口有缓存延迟，移出后立刻列还能看到旧数据，会误判
-            # 「没移成功」跳过删除，空文件夹就永久残留。get_info 走文件元数据
-            # 无此问题；拿不到（vpc 空/接口失败）时信任 move 的返回值直接删
-            # （回收站可恢复）
+            # 三态：确认已移出 → 删；确认没移出 → 重查一次，仍在则不动；
+            # get_info 失败 → 重查，仍拿不到则登记待删（下次补删）
             cur = ""
             if vpc:
                 try:
                     cur = _to_text((self._offline_info(vpc) or {}).get("cid") or "")
                 except Exception:
                     cur = ""
-            if cur and cur == cid:
-                pass                        # 确实没移成功，文件夹不能删
+            if cur and cur != cid:
+                if not self._offline_trash(cid):
+                    self._pending_trash_add(cid)  # 已确认离开但删失败→登记
+            elif cur and cur == cid:
+                # 疑似元数据滞后：等 0.3s 重查一次
+                time.sleep(0.3)
+                cur2 = ""
+                try:
+                    cur2 = _to_text((self._offline_info(vpc) or {}).get("cid") or "")
+                except Exception:
+                    cur2 = ""
+                if cur2 and cur2 != cid:
+                    if not self._offline_trash(cid):
+                        self._pending_trash_add(cid)  # 重查后确认离开但删失败→登记
+                # cur2 == cid：确认没移成功，不动（文件还在里面）
             else:
-                self._offline_trash(cid)     # 连子目录和其它文件一起进回收站
+                # cur 空（接口失败）：重查一次，仍拿不到则登记待删
+                time.sleep(0.3)
+                cur2 = ""
+                if vpc:
+                    try:
+                        cur2 = _to_text((self._offline_info(vpc) or {}).get("cid") or "")
+                    except Exception:
+                        cur2 = ""
+                if cur2 and cur2 != cid:
+                    if not self._offline_trash(cid):
+                        self._pending_trash_add(cid)  # 重查后确认离开但删失败→登记
+                elif not cur2:
+                    self._pending_trash_add(cid)  # 拿不到信息 → 登记待删
         return vpc or _to_text(info.get("pc") or ""), orig or _to_text(name)
 
     def _offline_tidy(self, pc, name, title="", label="", deadline=0):
@@ -2601,6 +2698,11 @@ class Spider:
         title = _to_text(title).strip()
         label = _to_text(label).strip()
         t0 = t0 or time.time()
+        # 补删上一轮删除失败的空任务文件夹（轻量，失败即停）
+        try:
+            self._reap_pending_trash()
+        except Exception:
+            pass
         # 预算从「这次开始整理」算：前面等下载可能已经花掉十几秒，
         # 拿提交时刻当起点会把整理和所有兜底一次跳光（live 实测踩过）
         deadline = time.time() + OFFLINE_FINISH_BUDGET
@@ -2696,7 +2798,8 @@ class Spider:
         ck_now = _to_text((res.get("header") or {}).get("Cookie") or "")
         vt = self._off_verified.get(base)
         if vt and time.time() - vt[0] < 600 and vt[1] == ck_now:
-            return "[自检] 直链206 ✓（10分钟内已验证）"
+            seek0 = vt[2] if len(vt) > 2 else "?"
+            return "[自检] 直链206 ✓ seek%s（10分钟内已验证）" % seek0
         h = dict(res.get("header") or {})
         h["Range"] = "bytes=0-63"
         t0 = time.time()
@@ -2734,19 +2837,38 @@ class Spider:
             return "[自检] 直链探测异常 %s（%.1fs）" % (e, time.time() - t0)
         size = ("%.2fGB" % (total / 1073741824.0)) if total > 0 else "?"
         if code == 206:
-            self._off_verified[base] = (time.time(), ck_now)
+            # seek 探测：中部 Range，验证快进时新 Range 请求可用（只报告）
+            seek = "?"
+            if total > 0:
+                try:
+                    mid = total // 2
+                    h2 = dict(h)
+                    h2["Range"] = "bytes=%d-%d" % (mid, mid + 63)
+                    r2 = sess.get(url, headers=h2, timeout=8, verify=False,
+                                  stream=True)
+                    seek = "✓" if r2.status_code == 206 else "✗%d" % r2.status_code
+                    try:
+                        r2.close()
+                    except Exception:
+                        pass
+                except Exception:
+                    seek = "✗err"
+            self._off_verified[base] = (time.time(), ck_now, seek)
             while len(self._off_verified) > 16:
                 self._off_verified.pop(next(iter(self._off_verified)))
-            return "[自检] 直链206 ✓ %s（%.1fs）" % (size, time.time() - t0)
+            return "[自检] 直链206 ✓ seek%s %s（%.1fs）" % (
+                seek, size, time.time() - t0)
         return "[自检] 直链%d ✗ %s（%.1fs）" % (code, body, time.time() - t0)
 
     def _offline_client_probe(self, res):
-        """客户端侧链路实测（只报告，不改播放结果）。
+        """客户端侧链路探测（只报告，不改播放结果）。
 
-        115 直链+header 在 spider 侧 206 但 App 转圈时，这一行分辨 App 实际拿到什么：
-        lp=ext 里有没有 local_proxy_config（Atvp/PyProxy 是否会把直链改写成本地代理）；
-        pp=设备上 VideoStreamProxy 监听的端口（5000-5009 /status 探测）；
-        rw=模拟 Atvp 的 /player 改写后，App 真正会播的地址能否拉到 206。
+        只做无副作用的检查：lp=ext 里有没有 local_proxy_config；
+        pp=设备上 VideoStreamProxy 监听的端口（5000-5009 /status 探测）。
+
+        已删除 rw 实测（POST /player + GET 改写 URL）：POST 会向本地代理注册
+        任务，GET 改写后的地址会触发 VideoStreamProxy 后台并行拉流。4G 运存
+        盒子上后台拉流 + 播放器 seek 并发 → OOM → 机器重启（v1.2.11 实测）。
         """
         lp_cfg = getattr(self, "offline_local_proxy_cfg", "")
         parts = ["lp=%d" % (1 if lp_cfg else 0)]
@@ -2770,77 +2892,6 @@ class Spider:
                     continue
         parts.append("pp=%s" % (self._off_pp_base.rsplit(":", 1)[-1]
                                 if self._off_pp_base else "-"))
-        # 上次 rw 实测健康（206 或未被改写）→ 不再重复 ~1.5s 的实测，省播放等待
-        if self._off_probe_ok:
-            parts.append("rw=ok")
-            return " ".join(parts)
-        if not self._off_pp_base:
-            return " ".join(parts)
-        url = _to_text(res.get("url") or "")
-        if not url.startswith(("http://", "https://")):
-            parts.append("rw=skip")
-            return " ".join(parts)
-        lp_obj = lp_cfg
-        if isinstance(lp_obj, str):
-            try:
-                lp_obj = json.loads(lp_obj)
-            except Exception:
-                try:
-                    lp_obj = ast.literal_eval(lp_obj)
-                except Exception:
-                    pass
-        s = requests.Session()
-        s.trust_env = False
-        t0 = time.time()
-        try:
-            # localhost 正常毫秒级；超时收紧防本地代理半死时每次播放都拖很久
-            r = s.post(self._off_pp_base + "/player", json={
-                "playerContent": json.dumps(res, ensure_ascii=False),
-                "taskSeed": "selfchk",
-                "localProxyConfig": lp_obj,
-            }, timeout=6, verify=False)
-            if r.status_code != 200:
-                parts.append("rw=http%d" % r.status_code)
-                return " ".join(parts)
-            proxied = r.json()
-            if not isinstance(proxied, dict):
-                parts.append("rw=badjson")
-                return " ".join(parts)
-            u2 = _to_text(proxied.get("url") or "")
-            if not u2:
-                parts.append("rw=nourl:%s" % _to_text(
-                    proxied.get("msg") or proxied.get("error") or "")[:40])
-                return " ".join(parts)
-            if u2 == url:
-                # 没被改写：原直链就是 App 会播的地址，preflight 已验证过 206
-                parts.append("rw=same")
-                self._off_probe_ok = True
-                return " ".join(parts)
-            mm = re.match(r"https?://([^/]+)", u2)
-            host = mm.group(1) if mm else "?"
-            if not u2.startswith(("http://", "https://")):
-                parts.append("rw=other:%s" % u2[:40])
-                return " ".join(parts)
-            try:
-                rr = s.get(u2, headers={"Range": "bytes=0-63"}, timeout=5,
-                           verify=False, stream=True)
-                parts.append("rw=%d@%s(%.1fs)" % (rr.status_code, host,
-                                                  time.time() - t0))
-                if rr.status_code == 206:
-                    self._off_probe_ok = True
-                try:
-                    rr.close()
-                except Exception:
-                    pass
-            except Exception as e:
-                parts.append("rw=err:%s@%s" % (str(e)[:30], host))
-        except Exception as e:
-            parts.append("rw=err:%s" % str(e)[:50])
-        finally:
-            try:
-                s.close()
-            except Exception:
-                pass
         return " ".join(parts)
 
     def _play_offline_safe(self, magnet, title="", label=""):
@@ -2934,9 +2985,13 @@ class Spider:
             for pc, n in rows:
                 if low in n.lower():
                     return pc, n
+        # 番号回退必须核对体积串——只认番号会把同番号任意体积的旧文件
+        # 复用成当前点击的体积，还把它改名成新标签（v1.2.12 修）
+        size_tok = _extract_size_token(label)
         for pc, n in rows:
             low = n.lower()
-            if not codes or any(c.lower() in low for c in codes):
+            if codes and any(c.lower() in low for c in codes) \
+                    and size_tok and size_tok in low:
                 return pc, n
         return "", ""
 
