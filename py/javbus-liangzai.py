@@ -1,4 +1,4 @@
-VERSION = "1.2.3"
+VERSION = "1.2.4"
 # -*- coding: utf-8 -*-
 import os
 import re
@@ -2079,6 +2079,12 @@ class Spider:
         }
         if fmt:
             result["format"] = fmt
+        # 关键：给返回结果挑一个 ext.local_proxy_config 里没规则的 CloudDriveType。
+        # csp_PyProxy 链路的 Java VideoStreamProxy 按 result 的 "type" 找规则，
+        # 命中 PAN115 就把 115 直链改写成 127.0.0.1 分片代理 —— 那条改写链路在
+        # OK影视 实测会转圈/“bad http status”。type 表里没规则时 registerProxyTask
+        # 返回 null，Java 原样返回 直链+header（= 直载模式验证过能播的那条路）。
+        result["type"] = self._offline_no_proxy_type()
         # 记下这条直链对应的完整 Cookie（含 downurl 下发的 CDN 令牌）
         self._off_ck = dict(list(self._off_ck.items())[-8:])
         self._off_ck[real_url.split("?")[0]] = final_cookie
@@ -2134,6 +2140,45 @@ class Spider:
         except Exception:
             port = 0
         return "http://127.0.0.1:%d/proxy?" % port if port > 0 else "proxy://"
+
+    @staticmethod
+    def _offline_alt_types():
+        """按优先级排列的 CloudDriveType 候选（反编译 classes.dex 得来）。
+
+        引擎默认的 local_proxy_config 只开 ALI/QUARK/UC/PAN115/PAN123/PAN139/
+        BAIDU/GUANGYA；CLOUD189 在 proxyPlayerContent 里有专门分支，放最后。
+        """
+        return ("THUNDER", "PAN123", "PAN139", "BAIDU", "GUANGYA",
+                "UC", "QUARK", "ALI", "PAN115", "CLOUD189")
+
+    def _offline_no_proxy_type(self):
+        """给 playerContent 结果挑一个「本地代理不会改写」的 CloudDriveType。
+
+        Alist 注入到本 ext 的 local_proxy_config 决定 VideoStreamProxy 会改写
+        哪些网盘直链（命中规则 → 127.0.0.1 分片代理 → OK影视 会转圈/“bad http
+        status”）；表里没有的 type 则原样返回 直链+header（直载那条能播的路）。
+        这里现读配置挑一个当前没开启的类型；万一全开了，就返回非法枚举值让
+        Java 抛异常走它的兜底（catch 后照样原样返回直链）。
+        """
+        enabled = set()
+        cfg = getattr(self, "offline_local_proxy_cfg", "") or ""
+        try:
+            if isinstance(cfg, str):
+                c = cfg.strip()
+                cfg = json.loads(c) if c.startswith("{") else {}
+            if isinstance(cfg, dict):
+                for k, v in cfg.items():
+                    on = False
+                    if isinstance(v, dict):
+                        on = bool(v.get("enabled", False))
+                    if on:
+                        enabled.add(_to_text(k).upper())
+        except Exception:
+            pass
+        for t in self._offline_alt_types():
+            if t not in enabled:
+                return t
+        return "__off115__"
 
     @staticmethod
     def _offline_srt(text):
