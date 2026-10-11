@@ -1,4 +1,4 @@
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 # -*- coding: utf-8 -*-
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 # 仿照 javbus-liangzai.py v1.2.14 重写；115 离线功能逐字节对齐，爬取层改用 JavDB JSON API。
@@ -815,30 +815,10 @@ class Spider:
 
     @staticmethod
     def _pic_proxy_base():
-        # 优先用框架 getProxyUrl()（= Proxy.getUrl()?do=py），这是 App 真正识别的图片代理地址；
-        # 退回手写 127.0.0.1:port/proxy?do=py。返回值保证以 do=py 结尾语义（& 或 ? 均可拼 kind=）。
-        try:
-            from com.github.catvod import Proxy
-            u = ""
-            try:
-                u = _to_text(Proxy.getUrl() or "")
-            except Exception:
-                u = ""
-            if not u:
-                try:
-                    port = int(Proxy.getPort() or 0)
-                except Exception:
-                    port = 0
-                if port > 0:
-                    u = "http://127.0.0.1:%d/proxy?" % port
-            if u:
-                if "do=py" in u:
-                    return u
-                sep = "&" if "?" in u and not u.endswith(("?", "&")) else ""
-                return u + sep + "do=py"
-        except Exception:
-            pass
-        return "http://127.0.0.1:9978/proxy?do=py"
+        # 图片专用：用 proxy:// 协议（FongMi 的 UrlUtil.convert 会转成正确的本地代理地址）。
+        # 部分 fork 不会把 http://127.0.0.1:.../proxy?... 的图片请求交给 localProxy（Glide 直连会拿到密文/失败），
+        # proxy:// 是显式代理信号，更兼容。115 离线字幕走 _offline_proxy_base，不受影响。
+        return "proxy://do=py"
 
     # ---------- 类别（对齐网页端导航） ----------
     @staticmethod
@@ -1056,6 +1036,7 @@ class Spider:
             "vod_name": _to_text(a.get("name") or ""),
             "vod_pic": self._proxy_pic(_to_text(a.get("avatar_url") or "")),
             "vod_remarks": "作品%d" % _safe_int(a.get("videos_count"), 0),
+            "vod_tag": "folder",
         }
 
     @staticmethod
@@ -1171,8 +1152,30 @@ class Spider:
                 "vod_name": _to_text(row.get("name") or ""),
                 "vod_pic": "",
                 "vod_remarks": "作品%d" % _safe_int(row.get("videos_count"), 0),
+                "vod_tag": "folder",
             })
         return self._page_result(out, page)
+
+    def _entity_movies_grid(self, marker, eid, page):
+        """folder 点击后的下一层：该演员(a)/系列(s)/片商(m)的影片海报网格（categoryContent 用）。
+        网页同款 filter_by 键 = 实体type:marker:实体id，支持翻页。"""
+        # 先取实体 type（演员/系列/片商详情接口）
+        if marker == "a":
+            data = self._api_get("/v1/actors/" + quote(eid, safe=""))
+            ent = data.get("actor") if isinstance(data, dict) else None
+        elif marker == "s":
+            data = self._api_get("/v1/series/" + quote(eid, safe=""))
+            ent = data.get("series") if isinstance(data, dict) else None
+        else:
+            data = self._api_get("/v1/makers/" + quote(eid, safe=""))
+            ent = data.get("maker") if isinstance(data, dict) else None
+        etype = _to_text(ent.get("type") if isinstance(ent, dict) else "") or "0"
+        movies_data = self._api_get("/v1/movies/tags", {
+            "filter_by": "%s:%s:%s" % (etype, marker, eid),
+            "sort_by": "release", "order_by": "desc", "page": page, "limit": 24,
+        })
+        lst = self._movies_to_list(movies_data.get("movies"))
+        return self._page_result(lst, page)
 
     def _latest_list(self, fs, page):
         # 首页「全部」：可用性 → /v1/movies/latest 的 filter_by（网页 movieFilter）
@@ -1245,6 +1248,14 @@ class Spider:
         if t in TYPE_NUM:
             return self._tags_list(t, fs, page)
 
+        # ---- folder 下一层：演员/系列/片商 → 该实体的影片海报网格 ----
+        if t.startswith("actor_"):
+            return self._entity_movies_grid("a", t[len("actor_"):], page)
+        if t.startswith("series_"):
+            return self._entity_movies_grid("s", t[len("series_"):], page)
+        if t.startswith("maker_"):
+            return self._entity_movies_grid("m", t[len("maker_"):], page)
+
         # ---- 兜底：其它 id 按「全部」处理 ----
         return self._latest_list(fs, page)
 
@@ -1254,13 +1265,8 @@ class Spider:
         if not vid:
             return {"list": []}
 
-        # 女優入口：actor_xxx → 列她的作品
-        if vid.startswith("actor_"):
-            return self._actor_detail(vid[len("actor_"):])
-        if vid.startswith("maker_"):
-            return self._entity_movies_detail("maker", vid[len("maker_"):])
-        if vid.startswith("series_"):
-            return self._entity_movies_detail("series", vid[len("series_"):])
+        # 注：actor_/series_/maker_ 现为 vod_tag=folder，点击进 categoryContent 的下一层海报网格，
+        # 不再走 detailContent（避免误出「选集」）。
 
         data = self._api_get("/v2/movies/" + quote(vid, safe=""))
         movie = data.get("movie") if isinstance(data, dict) else None
@@ -1370,7 +1376,7 @@ class Spider:
             "vod_pic": pic,
             "vod_content": "<br>".join(info_lines),
             "vod_play_from": "$$$".join(play_from),
-            "vod_play_url": "#".join(play_url) if play_url else "",
+            "vod_play_url": "$$$".join(play_url) if play_url else "",
         }
         return {"list": [vod]}
 
