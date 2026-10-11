@@ -1,4 +1,4 @@
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 # -*- coding: utf-8 -*-
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 # 仿照 javbus-liangzai.py v1.2.14 重写；115 离线功能逐字节对齐，爬取层改用 JavDB JSON API。
@@ -579,6 +579,9 @@ class Spider:
             self._host_locked = True
         if extend.get("img") or extend.get("imgProxy"):
             self.img_proxy = str(extend.get("img") or extend.get("imgProxy") or "").strip()
+        if "imgProxyOff" in extend or "noImgProxy" in extend or "imgOff" in extend:
+            # 关掉 localProxy 图片解密（返回原始密文 URL，仅在确实需要时用）
+            self.img_proxy_off = bool(extend.get("imgProxyOff", extend.get("noImgProxy", extend.get("imgOff"))))
         if extend.get("key") or extend.get("siteKey"):
             # 图片代理 siteKey 兜底：宿主没注入 siteKey 时用 ext 里配置的站点 key
             self._ext_site_key = str(
@@ -786,18 +789,21 @@ class Spider:
             if "{url}" in p:
                 return p.replace("{url}", quote(url, safe=""))
             return p + quote(url, safe="")
+        # 关掉解密 → 返回原始（密文）地址，交给 App / 外部代理
+        if getattr(self, "img_proxy_off", False):
+            return url
         # 封面/头像被 XOR 加密，App 直接加载是密文 → 走 localProxy 解码。
-        # 参数对齐 catemby（同站作者的成熟方案）：kind=image&token=base64(url)
+        # base=Proxy.getUrl()?do=py（对齐 catemby）+ siteKey 路由（对齐本文件已验证可用的 offnote）。
         try:
             import base64
             tok = base64.urlsafe_b64encode(
                 url.encode("utf-8")).decode("ascii").rstrip("=")
-            q = "do=py"
+            base = self._pic_proxy_base()  # 已含 do=py
+            q = base
             key = self._site_key()
-            if key:
+            if key and "siteKey=" not in q:
                 q += "&siteKey=%s" % quote(key)
-            return self._pic_proxy_base() + q + "&kind=image&token=%s" % \
-                quote(tok, safe="")
+            return q + "&kind=image&token=%s" % quote(tok, safe="")
         except Exception:
             return url
 
@@ -809,14 +815,30 @@ class Spider:
 
     @staticmethod
     def _pic_proxy_base():
+        # 优先用框架 getProxyUrl()（= Proxy.getUrl()?do=py），这是 App 真正识别的图片代理地址；
+        # 退回手写 127.0.0.1:port/proxy?do=py。返回值保证以 do=py 结尾语义（& 或 ? 均可拼 kind=）。
         try:
             from com.github.catvod import Proxy
-            port = int(Proxy.getPort() or 0)
+            u = ""
+            try:
+                u = _to_text(Proxy.getUrl() or "")
+            except Exception:
+                u = ""
+            if not u:
+                try:
+                    port = int(Proxy.getPort() or 0)
+                except Exception:
+                    port = 0
+                if port > 0:
+                    u = "http://127.0.0.1:%d/proxy?" % port
+            if u:
+                if "do=py" in u:
+                    return u
+                sep = "&" if "?" in u and not u.endswith(("?", "&")) else ""
+                return u + sep + "do=py"
         except Exception:
-            port = 0
-        if port <= 0:
-            port = 9978
-        return "http://127.0.0.1:%d/proxy?" % port
+            pass
+        return "http://127.0.0.1:9978/proxy?do=py"
 
     # ---------- 类别（对齐网页端导航） ----------
     @staticmethod
