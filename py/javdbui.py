@@ -1,4 +1,4 @@
-VERSION = "1.3.2"
+VERSION = "1.4.1"
 # -*- coding: utf-8 -*-
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 # 仿照 javbus-liangzai.py v1.2.14 重写；115 离线功能逐字节对齐，爬取层改用 JavDB JSON API。
@@ -44,6 +44,14 @@ IMG_PROXY = ""
 
 # JavDB Web UI 镜像（SPA，数据全走 JSON API）
 HOST = "https://bbjavdb.emby.edu.kg"
+# 多域名候选：host 只影响 热播榜(/api/jb/playback) + TOP250 静态 + Referer。
+# 数据 API 在 jdforrepam、图片在 tp.spfcas，均与 host 无关，故这里只做 host 层自动切换。
+# 逐个请求热播 JSON 端点：能连上 + 能出 JSON 的优先，最快者胜；返回 HTML 的（如
+# catembylegacy 前端副本）自动跳过，永不切到坏域名。可用 extend.hosts 覆盖。
+HOST_CANDIDATES = [
+    "https://bbjavdb.emby.edu.kg",
+    "https://catembylegacy.fastcdn.dpdns.org",
+]
 API_BASE = "https://jdforrepam.com/api"
 
 # API 签名常量（从前端 JS bundle 逆出）
@@ -482,6 +490,7 @@ class Spider:
         self.s115 = None       # 115 接口会话
         self.api = API_BASE
         self.host = HOST
+        self.host_candidates = list(HOST_CANDIDATES)
         self.ua = WEB_UA
         self.timeout = 15
         self.page_size = PAGE_SIZE
@@ -575,6 +584,18 @@ class Spider:
             self._host_locked = True
         if extend.get("api"):
             self.api = str(extend["api"]).rstrip("/")
+        # 多域名候选（list 或 逗号分隔字符串）：host 层自动切换用
+        hv = extend.get("hosts") or extend.get("hostList") or extend.get("hostCandidates")
+        if hv:
+            if isinstance(hv, (list, tuple)):
+                cand = [_to_text(x).rstrip("/") for x in hv]
+            else:
+                cand = [_to_text(hv).strip().rstrip("/")]
+            cand = [h for h in cand if h]
+            if cand:
+                # 用户显式配置 host 时把其排到最前，再并入内置候选
+                self.host_candidates = cand + [
+                    h for h in self.host_candidates if h not in cand]
         if extend.get("noProbe"):
             self._host_locked = True
         if extend.get("img") or extend.get("imgProxy"):
@@ -815,9 +836,16 @@ class Spider:
 
     @staticmethod
     def _pic_proxy_base():
-        # 图片专用：用 proxy:// 协议（FongMi 的 UrlUtil.convert 会转成正确的本地代理地址）。
-        # 部分 fork 不会把 http://127.0.0.1:.../proxy?... 的图片请求交给 localProxy（Glide 直连会拿到密文/失败），
-        # proxy:// 是显式代理信号，更兼容。115 离线字幕走 _offline_proxy_base，不受影响。
+        # 图片专用：对齐 offnote 字幕已验证可用的本地代理地址格式
+        # http://127.0.0.1:端口/proxy?do=py（offnote 就是这个 base，OK影视 认）。
+        # proxy:// 在 32位 OK影视 图片请求上不被转换，故回退到 http 形式。端口 0 时兜底 proxy://。
+        try:
+            from com.github.catvod import Proxy
+            port = int(Proxy.getPort() or 0)
+        except Exception:
+            port = 0
+        if port > 0:
+            return "http://127.0.0.1:%d/proxy?do=py" % port
         return "proxy://do=py"
 
     # ---------- 类别（对齐网页端导航） ----------
@@ -988,41 +1016,14 @@ class Spider:
         return {"class": classes, "filters": filters}
 
     def homeVideoContent(self):
-        # 首页「推荐」：演员头像海报 50 个（网页 推荐/本月/新人 三段 + 补足）
-        data = self._api_get("/v1/actors/recommend")
-        rows, seen, out = [], set(), []
-        for k in ("recommend_actors", "monthly_actors", "new_actors"):
-            for a in (data.get(k) or []):
-                if not isinstance(a, dict):
-                    continue
-                aid = _to_text(a.get("id") or "")
-                if not aid or aid in seen:
-                    continue
-                seen.add(aid)
-                rows.append(a)
-        for a in rows:
-            item = self._actor_item(a)
-            if item:
-                out.append(item)
-        if len(out) < 50:
-            # 补足 50：有码演员榜逐页取（推荐三段可能与榜首页重叠）
-            for pg in (1, 2, 3):
-                if len(out) >= 50:
-                    break
-                d2 = self._api_get("/v1/actors", {"type": "0", "page": pg})
-                for a in (d2.get("actors") or []):
-                    if len(out) >= 50:
-                        break
-                    if not isinstance(a, dict):
-                        continue
-                    aid = _to_text(a.get("id") or "")
-                    if not aid or aid in seen:
-                        continue
-                    seen.add(aid)
-                    item = self._actor_item(a)
-                    if item:
-                        out.append(item)
-        return {"list": out[:50]}
+        # 首页「推荐」：热播影片（可直接播）。
+        # 注：32位 OK影视 首页点击不走 categoryContent 二次查询（vod_tag=folder 不生效），
+        # 故首页放普通影片而非演员 folder；演员/系列/片商 folder 只在各自分类页用（那里能出下级网格）。
+        lst = self._hot_list()
+        if not lst:
+            data = self._api_get("/v1/movies/latest", {"page": 1, "limit": 50})
+            lst = self._movies_to_list(data.get("movies"))
+        return {"list": lst[:50]}
 
     # ---------- 分类内容（对齐网页端） ----------
     def _actor_item(self, a):
@@ -1112,25 +1113,48 @@ class Spider:
             lst = self._movies_to_list(data.get("movies"))
         return self._page_result(lst, 1, one_page=True)
 
+    def _host_pool(self):
+        """候选 host 池：当前 host + 内置/extend 候选，去重保序；
+        锁定（extend.host / noProbe）时只用当前 host。"""
+        if self._host_locked:
+            return [self.host]
+        pool = []
+        for h in ([self.host] + list(self.host_candidates or [])):
+            h = _to_text(h).rstrip("/")
+            if h and h not in pool:
+                pool.append(h)
+        return pool or [HOST]
+
     def _hot_list(self):
-        """热播 50：站点 /api/jb/playback（网页热播榜同款，60 条）取前 50；
-        接口异常时回退 /v1/movies/recommend（10 条）"""
+        """热播 50：多域名自动切换——逐个候选 host 请求 /api/jb/playback，
+        只认能返回 JSON 的，挑最快者并把 self.host 切过去；返回 HTML 的 host
+        自动跳过（永不切坏）。全失败时回退 /v1/movies/recommend（jdforrepam）。"""
         lst = []
-        try:
-            if requests and self.s is not None:
-                r = self.s.get(self.host + "/api/jb/playback",
-                               params={"period": "daily", "page": 1,
-                                       "limit": 50},
-                               headers={"User-Agent": self.ua,
-                                        "Referer": self.host + "/",
-                                        "Accept": "application/json"},
-                               timeout=self.timeout, verify=False)
-                if r.status_code == 200:
-                    data = r.json() if r.content else {}
-                    if isinstance(data, dict):
-                        lst = self._movies_to_list((data.get("data") or [])[:50])
-        except Exception:
-            lst = []
+        best = None  # (耗时, host, 原始 data)
+        if requests and self.s is not None:
+            for h in self._host_pool():
+                try:
+                    t0 = time.time()
+                    r = self.s.get(h + "/api/jb/playback",
+                                   params={"period": "daily", "page": 1,
+                                           "limit": 50},
+                                   headers={"User-Agent": self.ua,
+                                            "Referer": h + "/",
+                                            "Accept": "application/json"},
+                                   timeout=self.timeout, verify=False)
+                    dt = time.time() - t0
+                    if r.status_code != 200 or not r.content:
+                        continue
+                    data = r.json()
+                    if not isinstance(data, dict) or not data.get("data"):
+                        continue  # 非 JSON / 空 → 跳过该 host
+                    if best is None or dt < best[0]:
+                        best = (dt, h, data)
+                except Exception:
+                    continue
+        if best:
+            self.host = best[1]  # 切到最快能出 JSON 的 host
+            lst = self._movies_to_list((best[2].get("data") or [])[:50])
         if not lst:
             data = self._api_get("/v1/movies/recommend")
             lst = self._movies_to_list(data.get("movies"))
@@ -1305,12 +1329,46 @@ class Spider:
             info_lines.append("演员: %s" % "、".join(actors))
         if tags:
             info_lines.append("类别: %s" % "、".join(tags))
+        rel = self._related_lists_line(vid)
+        if rel:
+            info_lines.append(rel)
         if self.enable_offline_115:
             info_lines.append("115离线：提交到115云端，完成后自动直连播放 (v%s)" % VERSION)
 
-        # 组装播放源
+        # 组装播放源（顺序：預覽 → 磁力 → 115离线，对齐网页端播放优先级）
         play_from = []
         play_url = []
+
+        # 预览片（m3u8，网页端置顶）
+        pv = _to_text(movie.get("preview_video_url") or "")
+        if pv:
+            play_from.append("預覽")
+            play_url.append("預覽$%s" % _sanitize_play(pv))
+
+        # 磁力源（直链，交给 App 的磁力播放器）
+        if self.enable_magnet and magnets:
+            eps = []
+            for i, g in enumerate(magnets):
+                h = _to_text(g.get("hash") or "")
+                if not h:
+                    continue
+                mag = "magnet:?xt=urn:btih:" + h
+                size_mb = g.get("size")
+                size_str = _format_size_mb(size_mb)
+                hd = bool(g.get("hd"))
+                cnsub = bool(g.get("cnsub"))
+                label_parts = []
+                if hd:
+                    label_parts.append("高清")
+                if cnsub:
+                    label_parts.append("字幕")
+                if size_str:
+                    label_parts.append(size_str)
+                label = " ".join(label_parts) or ("磁力%d" % (i + 1))
+                eps.append("%s$%s" % (_sanitize_play(label), _sanitize_play(mag)))
+            if eps:
+                play_from.append("磁力")
+                play_url.append("#".join(eps))
 
         # 115离线源
         if self.enable_offline_115 and magnets:
@@ -1339,46 +1397,41 @@ class Spider:
                 play_from.append("115离线")
                 play_url.append("#".join(eps))
 
-        # 磁力源（直链，交给 App 的磁力播放器）
-        if self.enable_magnet and magnets:
-            eps = []
-            for i, g in enumerate(magnets):
-                h = _to_text(g.get("hash") or "")
-                if not h:
-                    continue
-                mag = "magnet:?xt=urn:btih:" + h
-                size_mb = g.get("size")
-                size_str = _format_size_mb(size_mb)
-                hd = bool(g.get("hd"))
-                cnsub = bool(g.get("cnsub"))
-                label_parts = []
-                if hd:
-                    label_parts.append("高清")
-                if cnsub:
-                    label_parts.append("字幕")
-                if size_str:
-                    label_parts.append(size_str)
-                label = " ".join(label_parts) or ("磁力%d" % (i + 1))
-                eps.append("%s$%s" % (_sanitize_play(label), _sanitize_play(mag)))
-            if eps:
-                play_from.append("磁力")
-                play_url.append("#".join(eps))
-
-        # 预览片（m3u8）
-        pv = _to_text(movie.get("preview_video_url") or "")
-        if pv:
-            play_from.append("預覽")
-            play_url.append("預覽$%s" % _sanitize_play(pv))
-
         vod = {
             "vod_id": vid,
             "vod_name": title,
             "vod_pic": pic,
-            "vod_content": "<br>".join(info_lines),
+            "vod_content": "\n".join(info_lines),
+            "vod_year": (date or "")[:4],
+            "vod_director": director,
+            "vod_actor": "、".join(actors),
+            "vod_genre": "、".join(tags),
+            "vod_remarks": number,
             "vod_play_from": "$$$".join(play_from),
             "vod_play_url": "$$$".join(play_url) if play_url else "",
         }
         return {"list": [vod]}
+
+    def _related_lists_line(self, mid):
+        """相关清单：/v1/lists/related 只返回清单元数据（名称/部数/浏览数），
+        清单详情 API 不返回影片列表 → 只能文字展示，做不成可点的海报网格。失败返回空。"""
+        try:
+            data = self._api_get("/v1/lists/related", {"movie_id": mid})
+            lists = data.get("lists") if isinstance(data, dict) else None
+            names = []
+            for L in (lists or [])[:5]:
+                if not isinstance(L, dict):
+                    continue
+                nm = _to_text(L.get("name") or "")
+                if not nm:
+                    continue
+                cnt = _safe_int(L.get("movies_count"), 0)
+                names.append("%s(%d部)" % (nm, cnt) if cnt else nm)
+            if names:
+                return "相关清单: %s" % "、".join(names)
+        except Exception:
+            pass
+        return ""
 
     def _actor_detail(self, aid):
         """女優详情：列她的作品"""
@@ -2539,6 +2592,16 @@ class Spider:
                 "parse": 0, "jx": 0, "playUrl": "",
                 "url": m or vid,
                 "header": {"User-Agent": self.ua, "Accept": "*/*"},
+            }
+
+        # 预览片等直链（m3u8/mp4）：直接透传播放，不再落到空 url
+        if vid.startswith(("http://", "https://")) \
+                and re.search(r"\.(m3u8|mp4|flv|mkv|ts|avi)(\?|$)", vid, re.I):
+            return {
+                "parse": 0, "jx": 0, "playUrl": "",
+                "url": vid,
+                "header": {"User-Agent": self.ua, "Referer": self.host + "/",
+                           "Accept": "*/*"},
             }
 
         # 演员/片商/系列详情里点作品 → 作品 id 走 detail 拿磁力再播
