@@ -1,4 +1,4 @@
-VERSION = "1.4.8"
+VERSION = "1.4.9"
 # -*- coding: utf-8 -*-
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 # 仿照 javbus-liangzai.py v1.2.14 重写；115 离线功能逐字节对齐，爬取层改用 JavDB JSON API。
@@ -768,6 +768,7 @@ class Spider:
         }
 
     def _movies_to_list(self, movies):
+        self._prefetch_pics(movies)  # data URI 模式下并行预取小图，避免逐张串行卡顿
         out = []
         seen = set()
         for m in movies or []:
@@ -776,6 +777,30 @@ class Spider:
                 seen.add(item["vod_id"])
                 out.append(item)
         return out
+
+    def _prefetch_pics(self, movies):
+        # 仅 data URI 模式（无 siteKey）需要预取；有 siteKey 走 localProxy，图片由 App 按需取，无需预取
+        if self._site_key():
+            return
+        urls = []
+        for m in movies or []:
+            if not isinstance(m, dict):
+                continue
+            u = _to_text(m.get("cover_url") or m.get("thumb_url") or "")
+            if u.startswith(("http://", "https://")):
+                small = u.replace("/covers/", "/small_covers/") if "/covers/" in u else u
+                if small not in urls:
+                    urls.append(small)
+        if not urls:
+            return
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            workers = min(8, len(urls))
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                # _fetch_pic 有内存缓存，预取后主循环命中缓存，不再重复下载
+                list(ex.map(self._fetch_pic, urls))
+        except Exception:
+            pass
 
     def _proxy_pic(self, url):
         if not url:
@@ -791,20 +816,41 @@ class Spider:
         # 关掉解密 → 返回原始（密文）地址，交给 App / 外部代理
         if getattr(self, "img_proxy_off", False):
             return url
-        # 封面/头像被 XOR 加密，App 直接加载是密文 → 走 localProxy 解码。
-        # base=Proxy.getUrl()?do=py（对齐 catemby）+ siteKey 路由（对齐本文件已验证可用的 offnote）。
+        # 封面/头像被 XOR 加密 → 需解码后给 App。
+        key = self._site_key()
+        # 无 siteKey（AT 场景）：localProxy 的 do=py 路由不中 → 改用 data URI 内联，
+        # App 直接渲染，彻底绕开 siteKey / 路由 / proxy:// 依赖。
+        if not key:
+            return self._pic_data_uri(url)
+        # 有 siteKey（pg 场景）：走 localProxy 解码（快、不撑大响应体积）。
         try:
             import base64
             tok = base64.urlsafe_b64encode(
                 url.encode("utf-8")).decode("ascii").rstrip("=")
             base = self._pic_proxy_base()  # 已含 do=py
             q = base
-            key = self._site_key()
-            if key and "siteKey=" not in q:
+            if "siteKey=" not in q:
                 q += "&siteKey=%s" % quote(key)
             return q + "&kind=image&token=%s" % quote(tok, safe="")
         except Exception:
             return url
+
+    def _pic_data_uri(self, url):
+        """无 siteKey 时用：下载小图解码后内联成 data URI（App 直接渲染，无需 localProxy 路由）。
+        优先 small_covers 小图（体积小，首页/列表才不卡）。"""
+        if not url:
+            return url
+        small = url.replace("/covers/", "/small_covers/") if "/covers/" in url else url
+        data, mime = b"", ""
+        if small and small != url:
+            data, mime = self._fetch_pic(small)
+        if not data:
+            data, mime = self._fetch_pic(url)
+        if data:
+            return "data:%s;base64,%s" % (
+                mime or "image/jpeg",
+                base64.b64encode(data).decode("ascii"))
+        return url  # 下载失败兜底返回原地址
 
     def _site_key(self):
         k = _to_text(getattr(self, "siteKey", "") or "")
