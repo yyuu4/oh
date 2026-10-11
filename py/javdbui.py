@@ -1,4 +1,4 @@
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 # -*- coding: utf-8 -*-
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 # 仿照 javbus-liangzai.py v1.2.14 重写；115 离线功能逐字节对齐，爬取层改用 JavDB JSON API。
@@ -579,6 +579,10 @@ class Spider:
             self._host_locked = True
         if extend.get("img") or extend.get("imgProxy"):
             self.img_proxy = str(extend.get("img") or extend.get("imgProxy") or "").strip()
+        if extend.get("key") or extend.get("siteKey"):
+            # 图片代理 siteKey 兜底：宿主没注入 siteKey 时用 ext 里配置的站点 key
+            self._ext_site_key = str(
+                extend.get("key") or extend.get("siteKey") or "").strip()
         if extend.get("cookie"):
             self.cookie = str(extend["cookie"])
         if extend.get("lang"):
@@ -782,15 +786,26 @@ class Spider:
             if "{url}" in p:
                 return p.replace("{url}", quote(url, safe=""))
             return p + quote(url, safe="")
-        # 封面/头像被 XOR 加密，App 直接加载是密文 → 走 localProxy 解码
+        # 封面/头像被 XOR 加密，App 直接加载是密文 → 走 localProxy 解码。
+        # 参数对齐 catemby（同站作者的成熟方案）：kind=image&token=base64(url)
         try:
+            import base64
+            tok = base64.urlsafe_b64encode(
+                url.encode("utf-8")).decode("ascii").rstrip("=")
             q = "do=py"
-            key = _to_text(getattr(self, "siteKey", ""))
+            key = self._site_key()
             if key:
                 q += "&siteKey=%s" % quote(key)
-            return self._pic_proxy_base() + q + "&k=img&u=%s" % quote(url, safe="")
+            return self._pic_proxy_base() + q + "&kind=image&token=%s" % \
+                quote(tok, safe="")
         except Exception:
             return url
+
+    def _site_key(self):
+        k = _to_text(getattr(self, "siteKey", "") or "")
+        if k:
+            return k
+        return _to_text(getattr(self, "_ext_site_key", "") or "")
 
     @staticmethod
     def _pic_proxy_base():
@@ -843,7 +858,10 @@ class Spider:
             gkey = _to_text(g.get("category_id") or "")
             if not gkey:
                 continue
-            vals = [{"n": "全部", "v": ""}]
+            gname = _to_text(g.get("category") or gkey)
+            # TVBox 折叠态显示选中项文案：空值项写「全部+组名」以便区分各行
+            first_n = "全部" if gkey == "main" else ("全部" + gname)
+            vals = [{"n": first_n, "v": ""}]
             for tg in (g.get("tags") or []):
                 if not isinstance(tg, dict):
                     continue
@@ -855,7 +873,7 @@ class Spider:
             if len(vals) < 2:
                 continue
             groups.append({"key": gkey,
-                           "name": _to_text(g.get("category") or gkey),
+                           "name": gname,
                            "init": "", "value": vals})
         cache[num] = groups or None
         return cache[num]
@@ -943,14 +961,6 @@ class Spider:
              ]},
             {"key": "year", "name": "TOP250年份", "init": "all",
              "value": year_vals},
-            {"key": "startRank", "name": "TOP250名次", "init": "1",
-             "value": [
-                 {"n": "1-50", "v": "1"},
-                 {"n": "51-100", "v": "51"},
-                 {"n": "101-150", "v": "101"},
-                 {"n": "151-200", "v": "151"},
-                 {"n": "201-250", "v": "201"},
-             ]},
         ]
         # 演员：网页 3 类
         filters["actors"] = [
@@ -976,12 +986,44 @@ class Spider:
         return {"class": classes, "filters": filters}
 
     def homeVideoContent(self):
-        data = self._api_get("/v1/movies/recommend")
-        return {"list": self._movies_to_list(data.get("movies"))}
+        # 首页「推荐」：演员头像海报 50 个（网页 推荐/本月/新人 三段 + 补足）
+        data = self._api_get("/v1/actors/recommend")
+        rows, seen, out = [], set(), []
+        for k in ("recommend_actors", "monthly_actors", "new_actors"):
+            for a in (data.get(k) or []):
+                if not isinstance(a, dict):
+                    continue
+                aid = _to_text(a.get("id") or "")
+                if not aid or aid in seen:
+                    continue
+                seen.add(aid)
+                rows.append(a)
+        for a in rows:
+            item = self._actor_item(a)
+            if item:
+                out.append(item)
+        if len(out) < 50:
+            # 补足 50：有码演员榜逐页取（推荐三段可能与榜首页重叠）
+            for pg in (1, 2, 3):
+                if len(out) >= 50:
+                    break
+                d2 = self._api_get("/v1/actors", {"type": "0", "page": pg})
+                for a in (d2.get("actors") or []):
+                    if len(out) >= 50:
+                        break
+                    if not isinstance(a, dict):
+                        continue
+                    aid = _to_text(a.get("id") or "")
+                    if not aid or aid in seen:
+                        continue
+                    seen.add(aid)
+                    item = self._actor_item(a)
+                    if item:
+                        out.append(item)
+        return {"list": out[:50]}
 
     # ---------- 分类内容（对齐网页端） ----------
-    @staticmethod
-    def _actor_item(a):
+    def _actor_item(self, a):
         if not isinstance(a, dict):
             return None
         aid = _to_text(a.get("id") or "")
@@ -990,14 +1032,24 @@ class Spider:
         return {
             "vod_id": "actor_" + aid,
             "vod_name": _to_text(a.get("name") or ""),
-            "vod_pic": "",
+            "vod_pic": self._proxy_pic(_to_text(a.get("avatar_url") or "")),
             "vod_remarks": "作品%d" % _safe_int(a.get("videos_count"), 0),
         }
+
+    @staticmethod
+    def _page_result(out, page, one_page=False):
+        """TVBox 分页结果：有数据才给下一页；total 给当前页条数（对齐 javbus 写法）"""
+        if one_page:
+            return {"list": out, "page": 1, "pagecount": 1,
+                    "limit": len(out), "total": len(out)}
+        return {"list": out, "page": page,
+                "pagecount": page + 1 if out else page,
+                "limit": len(out), "total": len(out)}
 
     def _actors_list(self, fs, page):
         mode = _to_text(fs.get("mode") or "recommend")
         if mode == "recommend":
-            # 网页演员页：推荐 / 本月 / 新人 三段合并去重
+            # 网页演员页：推荐 / 本月 / 新人 三段合并去重（网页显示多少就显示多少）
             data = self._api_get("/v1/actors/recommend")
             rows, seen = [], set()
             for k in ("recommend_actors", "monthly_actors", "new_actors"):
@@ -1010,22 +1062,18 @@ class Spider:
                     seen.add(aid)
                     rows.append(a)
             out = [x for x in (self._actor_item(a) for a in rows) if x]
-            return {"list": out, "page": 1, "pagecount": 1,
-                    "limit": len(out), "total": 0}
+            return self._page_result(out, 1, one_page=True)
         tv = TYPE_NUM.get(mode, "0")
         data = self._api_get("/v1/actors", {"type": tv, "page": page})
         rows = data.get("actors") or []
         out = [x for x in (self._actor_item(a) for a in rows) if x]
-        return {"list": out, "page": page, "pagecount": page + 1,
-                "limit": len(out), "total": 0}
+        return self._page_result(out, page)
 
     def _top250_list(self, fs):
-        """TOP250：/v1/movies/top 需登录，未登录同网页走站点静态快照"""
+        """TOP250：/v1/movies/top 需登录，未登录同网页走站点静态快照。
+        网页快照有多少就全量展示（不再按名次切 50 条）。"""
         year = _to_text(fs.get("year") or "all")
         vtype = _to_text(fs.get("videoType") or "all")
-        start = _safe_int(fs.get("startRank"), 1)
-        if start < 1:
-            start = 1
         if year and year != "all":
             key = "year-%s" % year
         elif vtype in ("0", "1", "2", "3"):
@@ -1042,7 +1090,6 @@ class Spider:
         if year and year != "all" and data.get("type") != "year":
             movies = [m for m in movies if isinstance(m, dict)
                       and _to_text(m.get("release_date") or "").startswith(year)]
-        movies = movies[start - 1:start + 49]
         return self._movies_to_list(movies)
 
     def _rankings_list(self, fs):
@@ -1060,8 +1107,31 @@ class Spider:
             data = self._api_get("/v1/rankings/playback",
                                  {"filter_by": fb, "period": period})
             lst = self._movies_to_list(data.get("movies"))
-        return {"list": lst, "page": 1, "pagecount": 1,
-                "limit": len(lst), "total": len(lst)}
+        return self._page_result(lst, 1, one_page=True)
+
+    def _hot_list(self):
+        """热播 50：站点 /api/jb/playback（网页热播榜同款，60 条）取前 50；
+        接口异常时回退 /v1/movies/recommend（10 条）"""
+        lst = []
+        try:
+            if requests and self.s is not None:
+                r = self.s.get(self.host + "/api/jb/playback",
+                               params={"period": "daily", "page": 1,
+                                       "limit": 50},
+                               headers={"User-Agent": self.ua,
+                                        "Referer": self.host + "/",
+                                        "Accept": "application/json"},
+                               timeout=self.timeout, verify=False)
+                if r.status_code == 200:
+                    data = r.json() if r.content else {}
+                    if isinstance(data, dict):
+                        lst = self._movies_to_list((data.get("data") or [])[:50])
+        except Exception:
+            lst = []
+        if not lst:
+            data = self._api_get("/v1/movies/recommend")
+            lst = self._movies_to_list(data.get("movies"))
+        return lst
 
     def _entity_list(self, t, fs, page):
         tv = TYPE_NUM.get(_to_text(fs.get("type") or "censored"), "0")
@@ -1080,8 +1150,7 @@ class Spider:
                 "vod_pic": "",
                 "vod_remarks": "作品%d" % _safe_int(row.get("videos_count"), 0),
             })
-        return {"list": out, "page": page, "pagecount": page + 1,
-                "limit": len(out), "total": 0}
+        return self._page_result(out, page)
 
     def _latest_list(self, fs, page):
         # 首页「全部」：可用性 → /v1/movies/latest 的 filter_by（网页 movieFilter）
@@ -1091,8 +1160,7 @@ class Spider:
         data = self._api_get("/v1/movies/latest",
                              {"page": page, "filter_by": fb})
         lst = self._movies_to_list(data.get("movies"))
-        return {"list": lst, "page": page, "pagecount": page + 1,
-                "limit": len(lst), "total": 0}
+        return self._page_result(lst, page)
 
     def _tags_list(self, t, fs, page):
         # 类别 4 类：filter_by 键串 = 类型:t:基本:分组:年份:时长:月份（网页同款）
@@ -1118,8 +1186,7 @@ class Spider:
             "order_by": "desc", "page": page, "limit": 24,
         })
         lst = self._movies_to_list(data.get("movies"))
-        return {"list": lst, "page": page, "pagecount": page + 1,
-                "limit": len(lst), "total": 0}
+        return self._page_result(lst, page)
 
     def categoryContent(self, tid, pg=1, filter=None, extend=None):
         t = _to_text(tid)
@@ -1143,12 +1210,10 @@ class Spider:
         if t in ("series", "makers"):
             return self._entity_list(t, fs, page)
 
-        # ---- 热播（网页首页 hot 页签）----
+        # ---- 热播（网页首页 hot 页签，50 部）----
         if t == "hot":
-            data = self._api_get("/v1/movies/recommend")
-            lst = self._movies_to_list(data.get("movies"))
-            return {"list": lst, "page": 1, "pagecount": 1,
-                    "limit": len(lst), "total": len(lst)}
+            lst = self._hot_list()
+            return self._page_result(lst, 1, one_page=True)
 
         # ---- 全部 ----
         if t == "all":
@@ -1159,11 +1224,7 @@ class Spider:
             return self._tags_list(t, fs, page)
 
         # ---- 兜底：其它 id 按「全部」处理 ----
-        data = self._api_get("/v1/movies/latest",
-                             {"page": page, "filter_by": "all"})
-        lst = self._movies_to_list(data.get("movies"))
-        return {"list": lst, "page": page, "pagecount": page + 1,
-                "limit": len(lst), "total": 0}
+        return self._latest_list(fs, page)
 
     # ---------- 详情 ----------
     def detailContent(self, ids):
@@ -2474,50 +2535,106 @@ class Spider:
 
         return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {}}
 
-    def localProxy(self, param):
+    @staticmethod
+    def _parse_proxy_param(param):
+        """localProxy 入参兼容：dict / JSON 字符串 / query string（值做 urldecode）"""
+        if isinstance(param, dict):
+            return param
         if isinstance(param, str):
-            raw = param
-            try:
-                param = json.loads(raw)
-            except Exception:
-                param = None
-            if not isinstance(param, dict):
-                # 兼容 query string 形式：k=img&u=...
-                param = {}
-                for kv in raw.split("&"):
-                    if "=" in kv:
-                        k, v = kv.split("=", 1)
-                        param[k] = v
-        if not isinstance(param, dict):
-            param = {}
-        if _to_text(param.get("k")) == "offnote":
+            raw = param.strip()
+            if raw.startswith("{"):
+                try:
+                    d = json.loads(raw)
+                    if isinstance(d, dict):
+                        return d
+                except Exception:
+                    pass
+            d = {}
+            for kv in raw.split("&"):
+                if "=" in kv:
+                    k, v = kv.split("=", 1)
+                    try:
+                        from urllib.parse import unquote as _unq
+                        v = _unq(v)
+                    except Exception:
+                        pass
+                    d[k] = v
+            return d
+        return {}
+
+    @staticmethod
+    def _unpack_pic_token(tok):
+        """token → 原图 URL（urlsafe base64，无 padding；失败返回空）"""
+        try:
+            import base64
+            s = _to_text(tok or "").strip()
+            if not s:
+                return ""
+            s = s.replace("-", "+").replace("_", "/")
+            s += "=" * (-len(s) % 4)
+            u = base64.b64decode(s).decode("utf-8", "ignore")
+            return u if u.startswith(("http://", "https://")) else ""
+        except Exception:
+            return ""
+
+    def localProxy(self, param):
+        param = self._parse_proxy_param(param)
+        kind = _to_text(param.get("kind") or param.get("k") or "").lower()
+        if kind == "offnote":
             body = self._offline_srt(param.get("v") or "")
             return [200, "application/x-subrip", body.encode("utf-8"), {}]
-        if _to_text(param.get("k")) == "img":
-            body, mime = self._fetch_pic(_to_text(param.get("u") or ""))
+        if kind in ("img", "image"):
+            src = _to_text(param.get("token") or param.get("u") or "")
+            if src and not src.startswith(("http://", "https://")):
+                src = self._unpack_pic_token(src) or src
+            body, mime = self._fetch_pic(src)
             if not body:
                 return [404, "text/plain", b"Not Found", {}]
-            return [200, mime, body, {}]
+            return [200, mime, body, {
+                "Cache-Control": "public, max-age=1800",
+                "Access-Control-Allow-Origin": "*",
+                "Content-Length": str(len(body)),
+                "X-Content-Type-Options": "nosniff",
+            }]
         return [404, "text/plain", b"Not Found", {}]
 
     def _fetch_pic(self, url):
-        """下载封面并解码 XOR 加密（localProxy k=img 用）"""
+        """下载封面并解码 XOR 加密（localProxy kind=image 用；带内存缓存）"""
         if not requests or not url.startswith(("http://", "https://")):
             return b"", ""
+        cache = getattr(self, "_pic_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._pic_cache = cache
+        hit = cache.get(url)
+        now = time.time()
+        if hit and now - hit[0] <= 1800:
+            # LRU touch
+            del cache[url]
+            cache[url] = hit
+            return hit[1], hit[2]
         headers = {
             "User-Agent": WEB_UA,
             "Referer": self.host + "/",
             "Accept": "image/*,*/*",
         }
+        sess = self.s
+        if sess is None:
+            return b"", ""
         try:
-            r = self.s.get(url, headers=headers, timeout=self.timeout,
-                           verify=False)
+            r = sess.get(url, headers=headers, timeout=self.timeout,
+                         verify=False)
         except Exception:
             return b"", ""
         if r.status_code != 200 or not r.content:
             return b"", ""
-        return self._decode_pic(r.content,
-                                _to_text(r.headers.get("Content-Type") or ""))
+        body, mime = self._decode_pic(
+            r.content, _to_text(r.headers.get("Content-Type") or ""))
+        if body:
+            cache[url] = (now, body, mime)
+            while len(cache) > 64:
+                cache.pop(next(iter(cache)), None)
+        return body, mime
 
     @staticmethod
     def _pic_mime(raw):
