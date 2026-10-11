@@ -1,4 +1,4 @@
-VERSION = "1.4.6"
+VERSION = "1.4.8"
 # -*- coding: utf-8 -*-
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 # 仿照 javbus-liangzai.py v1.2.14 重写；115 离线功能逐字节对齐，爬取层改用 JavDB JSON API。
@@ -26,8 +26,9 @@ except Exception:
 # ===========================================================================
 # 配置区
 # ===========================================================================
-# (1) 网页代理：只管「爬虫抓网页」，图片和播放地址由 App 自己去取
-PROXY = ""
+# (1) 网页代理：只管「爬虫抓网页/下图片」，播放地址由 App 自己去取
+# JavDB 图片源 tp.spfcas.com 需经此代理才能下载（本地 XOR 解码后经 localProxy 给 App）。
+PROXY = "http://192.168.1.8:7890"
 
 # (2) 图片反代：图片显示不出来时再开（默认关闭）
 IMG_PROXY = ""
@@ -813,16 +814,33 @@ class Spider:
 
     @staticmethod
     def _pic_proxy_base():
-        # 图片专用：对齐 offnote 字幕已验证可用的本地代理地址格式
-        # http://127.0.0.1:端口/proxy?do=py（offnote 就是这个 base，OK影视 认）。
-        # proxy:// 在 32位 OK影视 图片请求上不被转换，故回退到 http 形式。端口 0 时兜底 proxy://。
+        # 图片专用 base。32位 OK影视 图片请求不转换 proxy://，必须返回 http:// 形式才会被 App 去取。
+        # 分层（严格向后兼容 pg 本地包）：
+        #   ① Proxy.getPort()>0 → http://127.0.0.1:端口/proxy?do=py（pg 原有可用路径，保持不变）；
+        #   ② Proxy.getUrl() 若返回 http(s)://（仅当 getPort 拿不到时救援）；
+        #   ③ 兜底 proxy://do=py。
         try:
             from com.github.catvod import Proxy
+        except Exception:
+            return "proxy://do=py"
+        # ① Proxy.getPort()（pg 已验证可用路径，优先）
+        try:
             port = int(Proxy.getPort() or 0)
         except Exception:
             port = 0
         if port > 0:
             return "http://127.0.0.1:%d/proxy?do=py" % port
+        # ② Proxy.getUrl() 救援（getPort=0 时）
+        try:
+            getter = getattr(Proxy, "getUrl", None)
+            u = _to_text(getter() if getter else "")
+            if u.startswith(("http://", "https://")):
+                if "do=py" not in u:
+                    u += ("&" if "?" in u else "?") + "do=py"
+                return u
+        except Exception:
+            pass
+        # ③ 兜底
         return "proxy://do=py"
 
     # ---------- 类别（对齐网页端导航） ----------
