@@ -1,4 +1,4 @@
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 # -*- coding: utf-8 -*-
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 # 仿照 javbus-liangzai.py v1.2.14 重写；115 离线功能逐字节对齐，爬取层改用 JavDB JSON API。
@@ -1329,9 +1329,14 @@ class Spider:
             info_lines.append("演员: %s" % "、".join(actors))
         if tags:
             info_lines.append("类别: %s" % "、".join(tags))
-        rel = self._related_lists_line(vid)
-        if rel:
-            info_lines.append(rel)
+        # 相关区块（对齐网页）：TA还出演过 / 相关推荐 / 相关清单（均为文字；TVBox 详情页不支持可点海报网格）
+        for _rl in (
+            self._movie_refs_line(movie.get("actor_movies"), "TA还出演过"),
+            self._movie_refs_line(movie.get("relative_movies"), "相关推荐"),
+            self._related_lists_line(vid),
+        ):
+            if _rl:
+                info_lines.append(_rl)
         if self.enable_offline_115:
             info_lines.append("115离线：提交到115云端，完成后自动直连播放 (v%s)" % VERSION)
 
@@ -1397,11 +1402,22 @@ class Spider:
                 play_from.append("115离线")
                 play_url.append("#".join(eps))
 
+        # 一行摘要：OK影视/FongMi 标题下方「简介」多读 vod_blurb（完整描述才读 vod_content）
+        _blurb = " | ".join([b for b in (
+            number, (date or "")[:10],
+            ("评分%s" % score) if score else "",
+            maker, director, "、".join(actors[:4]),
+        ) if b])
+
         vod = {
             "vod_id": vid,
             "vod_name": title,
             "vod_pic": pic,
             "vod_content": "\n".join(info_lines),
+            "vod_blurb": _blurb,
+            "vod_desc": "\n".join(info_lines),
+            "vod_scoring": score,
+            "vod_score": score,
             "vod_year": (date or "")[:4],
             "vod_director": director,
             "vod_actor": "、".join(actors),
@@ -1411,6 +1427,18 @@ class Spider:
             "vod_play_url": "$$$".join(play_url) if play_url else "",
         }
         return {"list": [vod]}
+
+    @staticmethod
+    def _movie_refs_line(rows, label, limit=8):
+        """relative_movies / actor_movies（[{id,number,thumb}]）→ 一行文字（TVBox 详情无可点网格，只能文字）。"""
+        nums = []
+        for r in (rows or [])[:limit]:
+            if not isinstance(r, dict):
+                continue
+            n = _to_text(r.get("number") or "")
+            if n:
+                nums.append(n)
+        return "%s: %s" % (label, "、".join(nums)) if nums else ""
 
     def _related_lists_line(self, mid):
         """相关清单：/v1/lists/related 只返回清单元数据（名称/部数/浏览数），
