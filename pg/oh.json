@@ -418,6 +418,17 @@
                 }
             }
         },
+		{
+            "key": "javdbui.py",
+            "name": "javdbui.py",
+            "type": 3,
+            "api": "./py/javdbui.py",
+            "searchable": 1,
+            "quickSearch": 1,
+            "filterable": 1,
+            "order_num": 0,
+            "ext": ""
+        },
 		//{"key":"TGYunPanLocal","name":"🉑1TG频道搜索","type":3,"api":"csp_TGYunPanLocal","timeout":120, 
 			//"ext":{
 				//"token":"./lib/tokenm.json",
