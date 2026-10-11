@@ -1,4 +1,4 @@
-VERSION = "1.4.9"
+VERSION = "1.4.10"
 # -*- coding: utf-8 -*-
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 # 仿照 javbus-liangzai.py v1.2.14 重写；115 离线功能逐字节对齐，爬取层改用 JavDB JSON API。
@@ -802,7 +802,7 @@ class Spider:
         except Exception:
             pass
 
-    def _proxy_pic(self, url):
+    def _proxy_pic(self, url, large=False):
         if not url:
             return ""
         url = _to_text(url)
@@ -821,7 +821,7 @@ class Spider:
         # 无 siteKey（AT 场景）：localProxy 的 do=py 路由不中 → 改用 data URI 内联，
         # App 直接渲染，彻底绕开 siteKey / 路由 / proxy:// 依赖。
         if not key:
-            return self._pic_data_uri(url)
+            return self._pic_data_uri(url, large=large)
         # 有 siteKey（pg 场景）：走 localProxy 解码（快、不撑大响应体积）。
         try:
             import base64
@@ -835,16 +835,17 @@ class Spider:
         except Exception:
             return url
 
-    def _pic_data_uri(self, url):
-        """无 siteKey 时用：下载小图解码后内联成 data URI（App 直接渲染，无需 localProxy 路由）。
-        优先 small_covers 小图（体积小，首页/列表才不卡）。"""
+    def _pic_data_uri(self, url, large=False):
+        """无 siteKey 时用：下载解码后内联成 data URI（App 直接渲染，无需 localProxy 路由）。
+        large=False（首页/列表网格）用 small_covers 小图，体积小、响应快；
+        large=True（详情页大图）用原始 covers 大图，清晰度优先。"""
         if not url:
             return url
-        small = url.replace("/covers/", "/small_covers/") if "/covers/" in url else url
-        data, mime = b"", ""
-        if small and small != url:
-            data, mime = self._fetch_pic(small)
-        if not data:
+        target = url
+        if not large:
+            target = url.replace("/covers/", "/small_covers/") if "/covers/" in url else url
+        data, mime = self._fetch_pic(target)
+        if not data and target != url:
             data, mime = self._fetch_pic(url)
         if data:
             return "data:%s;base64,%s" % (
@@ -1375,7 +1376,9 @@ class Spider:
 
         title = _to_text(movie.get("title") or movie.get("number") or "")
         number = _to_text(movie.get("number") or "")
-        pic = self._proxy_pic(_to_text(movie.get("cover_url") or movie.get("thumb_url") or ""))
+        pic = self._proxy_pic(
+            _to_text(movie.get("cover_url") or movie.get("thumb_url") or ""),
+            large=True)
         date = _to_text(movie.get("release_date") or "")
         score = _to_text(movie.get("score") or "")
         dur = _safe_int(movie.get("duration"), 0)
