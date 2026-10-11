@@ -1,4 +1,4 @@
-VERSION = "1.4.2"
+VERSION = "1.4.6"
 # -*- coding: utf-8 -*-
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 # 仿照 javbus-liangzai.py v1.2.14 重写；115 离线功能逐字节对齐，爬取层改用 JavDB JSON API。
@@ -8,9 +8,8 @@ import json
 import time
 import base64
 import hashlib
-import html as _html
 import warnings
-from urllib.parse import quote, urljoin, unquote
+from urllib.parse import quote, unquote
 
 try:
     import requests
@@ -97,14 +96,6 @@ def _trace_write(text):
             f.write(_to_text(text))
     except Exception:
         pass
-
-
-def _trace_read():
-    try:
-        with open(OFF_TRACE_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except Exception:
-        return ""
 
 
 def _fc(item):
@@ -201,23 +192,24 @@ def _extract_size_token(text):
     return m.group(0).lower() if m else ""
 
 
-def _fix_url(url, host=HOST):
-    if not url:
-        return ""
-    url = _to_text(url)
-    if url.startswith("//"):
-        return "https:" + url
-    if url.startswith("http://") or url.startswith("https://"):
-        return url
-    return urljoin(host.rstrip("/") + "/", url)
+# 公共 tracker：磁力直连播放时附加，加速 DHT 找 peer（救活低种子片）。
+# API 磁力字段不含 tracker/seed 数，播放器只能靠 DHT/PEX，慢且易超时失败。
+MAGNET_TRACKERS = (
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.demonii.com:1337/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://tracker.bt4g.com:2095/announce",
+)
 
 
-def _clean_text(s):
-    if not s:
-        return ""
-    s = re.sub(r"<[^>]+>", "", str(s))
-    s = _html.unescape(s)
-    return re.sub(r"\s+", " ", s).strip()
+def _magnet_with_trackers(infohash):
+    """infohash → 带公共 tracker 的磁力链接（加速 peer 发现）。"""
+    m = "magnet:?xt=urn:btih:" + _to_text(infohash)
+    for tr in MAGNET_TRACKERS:
+        m += "&tr=" + quote(tr, safe=":/")
+    return m
 
 
 def _normalize_magnet(magnet):
@@ -226,7 +218,11 @@ def _normalize_magnet(magnet):
     m = re.search(r"btih:([0-9a-fA-F]{40}|[0-9a-zA-Z]{32})", magnet)
     if not m:
         return magnet
-    return "magnet:?xt=urn:btih:" + m.group(1)
+    base = "magnet:?xt=urn:btih:" + m.group(1)
+    # 保留 tr=（tracker）以加速 peer 发现；其它参数（dn 等）仍丢弃
+    for tr in re.findall(r"[?&]tr=([^&]+)", magnet):
+        base += "&tr=" + tr
+    return base
 
 
 def _sanitize_play(v):
@@ -714,25 +710,6 @@ class Spider:
                 return {}
         return {}
 
-    def _api_get_raw(self, path, params=None, timeout=None):
-        """同 _api_get 但返回完整响应 dict（含 success/message）"""
-        if not requests:
-            return {}
-        url = self.api + path
-        headers = {
-            "Accept": "application/json",
-            "jdsignature": _jd_signature(),
-            "Referer": self.host + "/",
-        }
-        t = timeout or self.timeout
-        try:
-            r = self.s.get(url, params=params or {}, headers=headers,
-                           timeout=t, verify=False)
-            data = r.json()
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
-
     def _site_json(self, path):
         """站点静态 json（TOP250 快照）：走 self.host，不带 API 签名"""
         if not requests:
@@ -945,8 +922,9 @@ class Spider:
         ]
 
         filters = {}
-        # 热播：网页端该页签的筛选不参与请求，不给筛选项
+        # 热播 / 全部：同款筛选（可用性 + 排序），均走 /v1/movies/latest
         filters["all"] = list(avail_opts) + list(sort_opts)
+        filters["hot"] = list(avail_opts) + list(sort_opts)
         # 类别 4 类：网页「类别」页的完整筛选组
         for tid in MOVIE_TYPES:
             if tid == "uncensored" and not self.enable_uncensored:
@@ -1211,6 +1189,41 @@ class Spider:
         lst = self._movies_to_list(data.get("movies"))
         return self._page_result(lst, page)
 
+    def _hot_grid(self, fs, page):
+        # 热播：对齐网页首页「热播」页签。
+        # 无筛选：第1页用 /v1/movies/recommend（网页同款 10 部海报），
+        #         第2页起用 /v1/movies/latest 继续（无限翻页）。
+        # 有筛选（avail/sort）：全程走 /v1/movies/latest + filter_by/sort_by（可分页）。
+        av = _to_text(fs.get("avail") or "all")
+        sort = _to_text(fs.get("sort") or "")
+        fb = {"can_play": "can_play", "subtitle-playable": "can_play",
+              "magnets": "magnets", "subtitle": "subtitle"}.get(av, "all")
+        has_filter = bool(av and av != "all") or bool(sort and sort != "released")
+        if has_filter:
+            sb = "update" if sort == "magnet-updated" else "release"
+            data = self._api_get("/v1/movies/latest", {
+                "page": page, "filter_by": fb, "sort_by": sb, "order_by": "desc"})
+            lst = self._movies_to_list(data.get("movies"))
+            return self._page_result(lst, page)
+        if page <= 1:
+            data = self._api_get("/v1/movies/recommend")
+            lst = self._movies_to_list(
+                data.get("movies") if isinstance(data, dict) else None)
+            if not lst:
+                return {"list": [], "page": 1, "pagecount": 1,
+                        "limit": 0, "total": 0}
+            return {"list": lst, "page": 1, "pagecount": 2,
+                    "limit": len(lst), "total": len(lst)}
+        data = self._api_get("/v1/movies/latest",
+                             {"page": page - 1, "filter_by": "all"})
+        lst = self._movies_to_list(
+            data.get("movies") if isinstance(data, dict) else None)
+        if not lst:
+            return {"list": [], "page": page, "pagecount": page,
+                    "limit": 0, "total": 0}
+        return {"list": lst, "page": page, "pagecount": page + 1,
+                "limit": len(lst), "total": len(lst)}
+
     def _tags_list(self, t, fs, page):
         # 类别 4 类：filter_by 键串 = 类型:t:基本:分组:年份:时长:月份（网页同款）
         sort = _to_text(fs.get("sort") or "released")
@@ -1259,10 +1272,9 @@ class Spider:
         if t in ("series", "makers"):
             return self._entity_list(t, fs, page)
 
-        # ---- 热播（网页首页 hot 页签，50 部）----
+        # ---- 热播（网页首页「热播」页签）----
         if t == "hot":
-            lst = self._hot_list()
-            return self._page_result(lst, 1, one_page=True)
+            return self._hot_grid(fs, page)
 
         # ---- 全部 ----
         if t == "all":
@@ -1357,7 +1369,7 @@ class Spider:
                 h = _to_text(g.get("hash") or "")
                 if not h:
                     continue
-                mag = "magnet:?xt=urn:btih:" + h
+                mag = _magnet_with_trackers(h)
                 size_mb = g.get("size")
                 size_str = _format_size_mb(size_mb)
                 hd = bool(g.get("hd"))
@@ -2740,11 +2752,9 @@ class Spider:
         sess = self.s
         if sess is None:
             return b"", ""
-        # 硬编码图片代理
-        img_proxies = {"http": "http://192.168.1.8:7890", "https": "http://192.168.1.8:7890"}
         try:
             r = sess.get(url, headers=headers, timeout=self.timeout,
-                         verify=False, proxies=img_proxies)
+                         verify=False)
         except Exception:
             return b"", ""
         if r.status_code != 200 or not r.content:
