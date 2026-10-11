@@ -834,21 +834,38 @@ class Spider:
             return k
         return _to_text(getattr(self, "_ext_site_key", "") or "")
 
-    @staticmethod
-    def _pic_proxy_base():
+    def _pic_proxy_base(self):
         # 图片专用：对齐 offnote 字幕已验证可用的本地代理地址格式
         # http://127.0.0.1:端口/proxy?do=py（offnote 就是这个 base，OK影视 认）。
         # proxy:// 在 32位 OK影视 图片请求上不被转换，故回退到 http 形式。端口 0 时兜底 proxy://。
+        # 方案3：运行时探测可用端口（最稳健）
+        if hasattr(self, "_pic_proxy_port") and self._pic_proxy_port:
+            return "http://127.0.0.1:%d/proxy?do=py" % self._pic_proxy_port
+
+        # 1. 先试 Proxy.getPort()
         try:
             from com.github.catvod import Proxy
             port = int(Proxy.getPort() or 0)
         except Exception:
             port = 0
         if port > 0:
+            self._pic_proxy_port = port
             return "http://127.0.0.1:%d/proxy?do=py" % port
-        # 修复：32位 OK影视 不认 proxy://，强制用 HTTP + 常用端口
-        for p in (9978, 9979, 8080, 19999, 9977):
-            return "http://127.0.0.1:%d/proxy?do=py" % p
+
+        # 2. 再试常见端口（实际发 HTTP 请求探测）
+        import requests
+        for p in (9978, 9979, 8080, 19999, 9977, 9980, 9981):
+            try:
+                r = requests.get("http://127.0.0.1:%d/proxy?do=py" % p, timeout=0.3)
+                if r.status_code < 500:  # 能连通即可（404也算通）
+                    self._pic_proxy_port = p
+                    return "http://127.0.0.1:%d/proxy?do=py" % p
+            except Exception:
+                continue
+
+        # 3. 最后兜底：相对路径让 App 自己解析
+        self._pic_proxy_port = 0
+        return "/proxy?do=py"
 
     # ---------- 类别（对齐网页端导航） ----------
     @staticmethod
