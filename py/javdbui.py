@@ -2731,9 +2731,11 @@ class Spider:
         sess = self.s
         if sess is None:
             return b"", ""
+        # 硬编码图片代理
+        img_proxies = {"http": "http://192.168.1.8:7890", "https": "http://192.168.1.8:7890"}
         try:
             r = sess.get(url, headers=headers, timeout=self.timeout,
-                         verify=False)
+                         verify=False, proxies=img_proxies)
         except Exception:
             return b"", ""
         if r.status_code != 200 or not r.content:
