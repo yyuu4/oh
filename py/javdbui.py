@@ -1,4 +1,4 @@
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 # -*- coding: utf-8 -*-
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 # 仿照 javbus-liangzai.py v1.2.14 重写；115 离线功能逐字节对齐，爬取层改用 JavDB JSON API。
@@ -53,6 +53,12 @@ JD_SECRET = ("71cf27bb3c0bcdf207b64abecddc970098c7421ee7203b9cdae54478478a199e7d
 
 PAGE_SIZE = 30
 SEARCH_LIMIT = 30
+
+# 网页端类型 → 上游 type 数值（/v2/tags、/v1/rankings、/v1/series、/v1/makers 通用）
+TYPE_NUM = {"censored": "0", "uncensored": "1", "western": "2", "fc2": "3",
+            "anime": "4"}
+MOVIE_TYPES = ("censored", "uncensored", "western", "fc2")
+TOP250_SINCE = 2008
 
 HTTP_RETRY = 1
 HTTP_RETRY_DELAY = 0.5
@@ -699,6 +705,32 @@ class Spider:
         except Exception:
             return {}
 
+    def _site_json(self, path):
+        """站点静态 json（TOP250 快照）：走 self.host，不带 API 签名"""
+        if not requests:
+            return {}
+        url = self.host + path
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": WEB_UA,
+            "Referer": self.host + "/",
+        }
+        for attempt in range(HTTP_RETRY + 1):
+            try:
+                r = self.s.get(url, headers=headers, timeout=self.timeout,
+                               verify=False)
+                if r.status_code in HTTP_RETRY_STATUS and attempt < HTTP_RETRY:
+                    time.sleep(HTTP_RETRY_DELAY)
+                    continue
+                data = r.json()
+                return data if isinstance(data, dict) else {}
+            except Exception:
+                if attempt < HTTP_RETRY:
+                    time.sleep(HTTP_RETRY_DELAY)
+                    continue
+                return {}
+        return {}
+
     # ---------- movie 对象 → vod item ----------
     def _movie_item(self, m):
         if not isinstance(m, dict):
@@ -743,12 +775,33 @@ class Spider:
         if not url:
             return ""
         url = _to_text(url)
-        p = _to_text(self.img_proxy)
-        if not p:
+        if not url.startswith(("http://", "https://")):
             return url
-        if "{url}" in p:
-            return p.replace("{url}", quote(url, safe=""))
-        return p + quote(url, safe="")
+        p = _to_text(self.img_proxy)
+        if p:
+            if "{url}" in p:
+                return p.replace("{url}", quote(url, safe=""))
+            return p + quote(url, safe="")
+        # 封面/头像被 XOR 加密，App 直接加载是密文 → 走 localProxy 解码
+        try:
+            q = "do=py"
+            key = _to_text(getattr(self, "siteKey", ""))
+            if key:
+                q += "&siteKey=%s" % quote(key)
+            return self._pic_proxy_base() + q + "&k=img&u=%s" % quote(url, safe="")
+        except Exception:
+            return url
+
+    @staticmethod
+    def _pic_proxy_base():
+        try:
+            from com.github.catvod import Proxy
+            port = int(Proxy.getPort() or 0)
+        except Exception:
+            port = 0
+        if port <= 0:
+            port = 9978
+        return "http://127.0.0.1:%d/proxy?" % port
 
     # ---------- 类别（对齐网页端导航） ----------
     @staticmethod
@@ -766,20 +819,63 @@ class Spider:
             {"type_id": "makers",      "type_name": "片商"},
         ]
 
+    def _tags_filter_groups(self, t):
+        """/v2/tags?type=n → 网页「类别」页的完整筛选组（实例缓存；失败返回 None）"""
+        num = TYPE_NUM.get(_to_text(t), "0")
+        cache = getattr(self, "_tags_filters", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._tags_filters = cache
+        if num in cache:
+            return cache[num]
+        data = self._api_get("/v2/tags", {"type": num})
+        rows = data.get("tags") if isinstance(data, dict) else None
+        if not isinstance(rows, list) or not rows:
+            cache[num] = None
+            return None
+        core = ("main", "year", "month", "duration")
+        core_rows = [g for cid in core for g in rows
+                     if isinstance(g, dict) and g.get("category_id") == cid]
+        rest_rows = [g for g in rows
+                     if isinstance(g, dict) and g.get("category_id") not in core]
+        groups = []
+        for g in core_rows + rest_rows:
+            gkey = _to_text(g.get("category_id") or "")
+            if not gkey:
+                continue
+            vals = [{"n": "全部", "v": ""}]
+            for tg in (g.get("tags") or []):
+                if not isinstance(tg, dict):
+                    continue
+                nm = _to_text(tg.get("name") or "")
+                tg_id = _to_text(tg.get("id") or "")
+                if not nm or not tg_id:
+                    continue
+                vals.append({"n": nm, "v": tg_id})
+            if len(vals) < 2:
+                continue
+            groups.append({"key": gkey,
+                           "name": _to_text(g.get("category") or gkey),
+                           "init": "", "value": vals})
+        cache[num] = groups or None
+        return cache[num]
+
     def homeContent(self, filter=None):
         classes = []
         for c in self._classes():
             if c["type_id"] == "uncensored" and not self.enable_uncensored:
                 continue
             classes.append(dict(c))
-        # 筛选对齐网页端：可用性 + 排序
-        availability = [
-            {"key": "main", "name": "可用性", "init": "",
+
+        # 首页「全部」页签：可用性（网页 movieFilter）+ 排序
+        avail_opts = [
+            {"key": "avail", "name": "可用性", "init": "",
              "value": [
-                 {"n": "全部", "v": ""},
-                 {"n": "可播放", "v": "p"},
-                 {"n": "含磁链", "v": "m"},
-                 {"n": "含字幕", "v": "c"},
+                 {"n": "可播放", "v": "can_play"},
+                 {"n": "中文字幕可播放", "v": "subtitle-playable"},
+                 {"n": "含磁链", "v": "magnets"},
+                 {"n": "含字幕", "v": "subtitle"},
+                 {"n": "全部", "v": "all"},
              ]},
         ]
         sort_opts = [
@@ -789,38 +885,94 @@ class Spider:
                  {"n": "磁链更新", "v": "magnet-updated"},
              ]},
         ]
-        rank_opts = [
-            {"key": "period", "name": "周期", "init": "daily",
+        # 网页「类别」页的备用基本组（/v2/tags 失败时降级）
+        basic_main = [
+            {"key": "main", "name": "基本", "init": "",
              "value": [
-                 {"n": "每日", "v": "daily"},
-                 {"n": "每周", "v": "weekly"},
-                 {"n": "每月", "v": "monthly"},
+                 {"n": "全部", "v": ""},
+                 {"n": "可播放", "v": "p"},
+                 {"n": "可下載", "v": "m"},
+                 {"n": "含字幕", "v": "c"},
              ]},
         ]
-        actor_opts = [
-            {"key": "amode", "name": "模式", "init": "recommend",
+
+        filters = {}
+        # 热播：网页端该页签的筛选不参与请求，不给筛选项
+        filters["all"] = list(avail_opts) + list(sort_opts)
+        # 类别 4 类：网页「类别」页的完整筛选组
+        for tid in MOVIE_TYPES:
+            if tid == "uncensored" and not self.enable_uncensored:
+                continue
+            groups = self._tags_filter_groups(tid)
+            filters[tid] = list(sort_opts) + (
+                list(groups) if groups else list(basic_main))
+
+        # 排行榜：网页 6 类（热播/TOP250/有码/无码/欧美/FC2）+ 各自筛选
+        now_year = time.localtime().tm_year
+        year_vals = [{"n": "全部", "v": "all"}]
+        for y in range(now_year, TOP250_SINCE - 1, -1):
+            year_vals.append({"n": str(y), "v": str(y)})
+        filters["rankings"] = [
+            {"key": "mode", "name": "榜单", "init": "playback",
+             "value": [
+                 {"n": "热播", "v": "playback"},
+                 {"n": "TOP250", "v": "top250"},
+                 {"n": "有码", "v": "censored"},
+                 {"n": "无码", "v": "uncensored"},
+                 {"n": "欧美", "v": "western"},
+                 {"n": "FC2", "v": "fc2"},
+             ]},
+            {"key": "period", "name": "周期", "init": "daily",
+             "value": [
+                 {"n": "日榜", "v": "daily"},
+                 {"n": "周榜", "v": "weekly"},
+                 {"n": "月榜", "v": "monthly"},
+             ]},
+            {"key": "filterBy", "name": "热播榜", "init": "all",
+             "value": [
+                 {"n": "全部", "v": "all"},
+                 {"n": "高分", "v": "high_score"},
+             ]},
+            {"key": "videoType", "name": "TOP250类型", "init": "all",
+             "value": [
+                 {"n": "全部", "v": "all"},
+                 {"n": "有码", "v": "0"},
+                 {"n": "无码", "v": "1"},
+                 {"n": "欧美", "v": "2"},
+                 {"n": "FC2", "v": "3"},
+             ]},
+            {"key": "year", "name": "TOP250年份", "init": "all",
+             "value": year_vals},
+            {"key": "startRank", "name": "TOP250名次", "init": "1",
+             "value": [
+                 {"n": "1-50", "v": "1"},
+                 {"n": "51-100", "v": "51"},
+                 {"n": "101-150", "v": "101"},
+                 {"n": "151-200", "v": "151"},
+                 {"n": "201-250", "v": "201"},
+             ]},
+        ]
+        # 演员：网页 3 类
+        filters["actors"] = [
+            {"key": "mode", "name": "模式", "init": "recommend",
              "value": [
                  {"n": "推荐", "v": "recommend"},
                  {"n": "有码", "v": "censored"},
                  {"n": "无码", "v": "uncensored"},
              ]},
         ]
-        series_opts = [
-            {"key": "stype", "name": "类型", "init": "censored",
+        # 系列 / 片商：网页 4 个类型页签
+        type_opts = [
+            {"key": "type", "name": "类型", "init": "censored",
              "value": [
                  {"n": "有码", "v": "censored"},
                  {"n": "无码", "v": "uncensored"},
-                 {"n": "全部", "v": "all"},
+                 {"n": "欧美", "v": "western"},
+                 {"n": "FC2", "v": "fc2"},
              ]},
         ]
-        filters = {}
-        for tid in ("all", "censored", "uncensored", "western", "fc2"):
-            filters[tid] = list(availability) + list(sort_opts)
-        filters["hot"] = list(availability)
-        filters["rankings"] = list(rank_opts)
-        filters["actors"] = list(actor_opts)
-        filters["series"] = list(series_opts)
-        filters["makers"] = list(series_opts)
+        filters["series"] = list(type_opts)
+        filters["makers"] = list(type_opts)
         return {"class": classes, "filters": filters}
 
     def homeVideoContent(self):
@@ -828,101 +980,187 @@ class Spider:
         return {"list": self._movies_to_list(data.get("movies"))}
 
     # ---------- 分类内容（对齐网页端） ----------
+    @staticmethod
+    def _actor_item(a):
+        if not isinstance(a, dict):
+            return None
+        aid = _to_text(a.get("id") or "")
+        if not aid:
+            return None
+        return {
+            "vod_id": "actor_" + aid,
+            "vod_name": _to_text(a.get("name") or ""),
+            "vod_pic": "",
+            "vod_remarks": "作品%d" % _safe_int(a.get("videos_count"), 0),
+        }
+
+    def _actors_list(self, fs, page):
+        mode = _to_text(fs.get("mode") or "recommend")
+        if mode == "recommend":
+            # 网页演员页：推荐 / 本月 / 新人 三段合并去重
+            data = self._api_get("/v1/actors/recommend")
+            rows, seen = [], set()
+            for k in ("recommend_actors", "monthly_actors", "new_actors"):
+                for a in (data.get(k) or []):
+                    if not isinstance(a, dict):
+                        continue
+                    aid = _to_text(a.get("id") or "")
+                    if not aid or aid in seen:
+                        continue
+                    seen.add(aid)
+                    rows.append(a)
+            out = [x for x in (self._actor_item(a) for a in rows) if x]
+            return {"list": out, "page": 1, "pagecount": 1,
+                    "limit": len(out), "total": 0}
+        tv = TYPE_NUM.get(mode, "0")
+        data = self._api_get("/v1/actors", {"type": tv, "page": page})
+        rows = data.get("actors") or []
+        out = [x for x in (self._actor_item(a) for a in rows) if x]
+        return {"list": out, "page": page, "pagecount": page + 1,
+                "limit": len(out), "total": 0}
+
+    def _top250_list(self, fs):
+        """TOP250：/v1/movies/top 需登录，未登录同网页走站点静态快照"""
+        year = _to_text(fs.get("year") or "all")
+        vtype = _to_text(fs.get("videoType") or "all")
+        start = _safe_int(fs.get("startRank"), 1)
+        if start < 1:
+            start = 1
+        if year and year != "all":
+            key = "year-%s" % year
+        elif vtype in ("0", "1", "2", "3"):
+            key = vtype
+        else:
+            key = "all"
+        data = self._site_json("/top250/%s.json" % key)
+        movies = data.get("movies") if isinstance(data, dict) else None
+        if not movies and key != "all":
+            data = self._site_json("/top250/all.json")
+            movies = data.get("movies") if isinstance(data, dict) else None
+        movies = movies or []
+        # 快照不是按年生成的 → 网页端同样按年份本地过滤
+        if year and year != "all" and data.get("type") != "year":
+            movies = [m for m in movies if isinstance(m, dict)
+                      and _to_text(m.get("release_date") or "").startswith(year)]
+        movies = movies[start - 1:start + 49]
+        return self._movies_to_list(movies)
+
+    def _rankings_list(self, fs):
+        mode = _to_text(fs.get("mode") or "playback")
+        period = _to_text(fs.get("period") or "daily")
+        if mode == "top250":
+            lst = self._top250_list(fs)
+        elif mode in MOVIE_TYPES:
+            data = self._api_get("/v1/rankings",
+                                 {"type": TYPE_NUM.get(mode, "0"),
+                                  "period": period})
+            lst = self._movies_to_list(data.get("movies"))
+        else:
+            fb = _to_text(fs.get("filterBy") or "all")
+            data = self._api_get("/v1/rankings/playback",
+                                 {"filter_by": fb, "period": period})
+            lst = self._movies_to_list(data.get("movies"))
+        return {"list": lst, "page": 1, "pagecount": 1,
+                "limit": len(lst), "total": len(lst)}
+
+    def _entity_list(self, t, fs, page):
+        tv = TYPE_NUM.get(_to_text(fs.get("type") or "censored"), "0")
+        data = self._api_get("/v1/%s" % t, {"type": tv, "page": page})
+        rows = data.get("series" if t == "series" else "makers") or []
+        out = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            eid = _to_text(row.get("id") or "")
+            if not eid:
+                continue
+            out.append({
+                "vod_id": "%s_%s" % ("maker" if t == "makers" else t, eid),
+                "vod_name": _to_text(row.get("name") or ""),
+                "vod_pic": "",
+                "vod_remarks": "作品%d" % _safe_int(row.get("videos_count"), 0),
+            })
+        return {"list": out, "page": page, "pagecount": page + 1,
+                "limit": len(out), "total": 0}
+
+    def _latest_list(self, fs, page):
+        # 首页「全部」：可用性 → /v1/movies/latest 的 filter_by（网页 movieFilter）
+        av = _to_text(fs.get("avail") or "all")
+        fb = {"can_play": "can_play", "subtitle-playable": "can_play",
+              "magnets": "magnets", "subtitle": "subtitle"}.get(av, "all")
+        data = self._api_get("/v1/movies/latest",
+                             {"page": page, "filter_by": fb})
+        lst = self._movies_to_list(data.get("movies"))
+        return {"list": lst, "page": page, "pagecount": page + 1,
+                "limit": len(lst), "total": 0}
+
+    def _tags_list(self, t, fs, page):
+        # 类别 4 类：filter_by 键串 = 类型:t:基本:分组:年份:时长:月份（网页同款）
+        sort = _to_text(fs.get("sort") or "released")
+        num = TYPE_NUM.get(t, "0")
+        main = _to_text(fs.get("main") or "")
+        year = _to_text(fs.get("year") or "")
+        month = _to_text(fs.get("month") or "")
+        duration = _to_text(fs.get("duration") or "")
+        extra = ""
+        for g in (self._tags_filter_groups(t) or []):
+            gk = _to_text(g.get("key") or "")
+            if not gk or gk in ("main", "year", "month", "duration"):
+                continue
+            v = _to_text(fs.get(gk) or "")
+            if v:
+                extra = v
+                break
+        key = "%s:t:%s:%s:%s:%s:%s" % (num, main, extra, year, duration, month)
+        data = self._api_get("/v1/movies/tags", {
+            "filter_by": key,
+            "sort_by": "update" if sort == "magnet-updated" else "release",
+            "order_by": "desc", "page": page, "limit": 24,
+        })
+        lst = self._movies_to_list(data.get("movies"))
+        return {"list": lst, "page": page, "pagecount": page + 1,
+                "limit": len(lst), "total": 0}
+
     def categoryContent(self, tid, pg=1, filter=None, extend=None):
         t = _to_text(tid)
         page = _safe_int(pg, 1)
+        if page < 1:
+            page = 1
         fs = {}
         for src in (filter, extend):
             if isinstance(src, dict):
                 fs.update(src)
-        main = _to_text(fs.get("main") or "")
 
-        # ---- 排行榜 ----
+        # ---- 排行榜（网页 6 类）----
         if t == "rankings":
-            period = _to_text(fs.get("period") or "daily")
-            # 网页端排行榜有 6 种模式，TVBox 里用热播(playback) 作为默认
-            data = self._api_get("/v1/rankings",
-                                 {"type": "playback", "period": period})
-            lst = self._movies_to_list(data.get("movies") or [])
-            return {"list": lst, "page": 1, "pagecount": 1,
-                    "limit": len(lst), "total": len(lst)}
+            return self._rankings_list(fs)
 
-        # ---- 演员 ----
+        # ---- 演员（网页 3 类）----
         if t == "actors":
-            amode = _to_text(fs.get("amode") or "recommend")
-            data = self._api_get("/v1/actors", {"type": amode, "page": page})
-            out = []
-            for a in data.get("actors") or []:
-                aid = _to_text(a.get("id") or "")
-                if not aid:
-                    continue
-                out.append({
-                    "vod_id": "actor_" + aid,
-                    "vod_name": _to_text(a.get("name") or ""),
-                    "vod_pic": self._proxy_pic(_to_text(a.get("avatar_url") or "")),
-                    "vod_remarks": "作品%d" % _safe_int(a.get("videos_count"), 0),
-                })
-            return {"list": out, "page": page, "pagecount": page + 1,
-                    "limit": len(out), "total": 0}
+            return self._actors_list(fs, page)
 
-        # ---- 系列 ----
-        if t == "series":
-            stype = _to_text(fs.get("stype") or "censored")
-            data = self._api_get("/v1/series", {"type": stype, "page": page})
-            out = []
-            for sr in (data.get("series") or data.get("list") or []):
-                sid = _to_text(sr.get("id") or "")
-                if not sid:
-                    continue
-                out.append({
-                    "vod_id": "series_" + sid,
-                    "vod_name": _to_text(sr.get("name") or ""),
-                    "vod_pic": "",
-                    "vod_remarks": "作品%d" % _safe_int(sr.get("videos_count"), 0),
-                })
-            return {"list": out, "page": page, "pagecount": page + 1,
-                    "limit": len(out), "total": 0}
+        # ---- 系列 / 片商（网页 4 类型页签）----
+        if t in ("series", "makers"):
+            return self._entity_list(t, fs, page)
 
-        # ---- 片商（API 当前 500，留接口） ----
-        if t == "makers":
-            stype = _to_text(fs.get("stype") or "censored")
-            data = self._api_get("/v1/makers", {"type": stype, "page": page})
-            out = []
-            for mk in (data.get("makers") or data.get("list") or []):
-                mid = _to_text(mk.get("id") or "")
-                if not mid:
-                    continue
-                out.append({
-                    "vod_id": "maker_" + mid,
-                    "vod_name": _to_text(mk.get("name") or ""),
-                    "vod_pic": "",
-                    "vod_remarks": "作品%d" % _safe_int(mk.get("videos_count"), 0),
-                })
-            return {"list": out, "page": page, "pagecount": page + 1,
-                    "limit": len(out), "total": 0}
-
-        # ---- 热播（推荐） ----
+        # ---- 热播（网页首页 hot 页签）----
         if t == "hot":
             data = self._api_get("/v1/movies/recommend")
-            lst = self._movies_to_list(data.get("movies") or [])
+            lst = self._movies_to_list(data.get("movies"))
             return {"list": lst, "page": 1, "pagecount": 1,
                     "limit": len(lst), "total": len(lst)}
 
-        # ---- 全部/有码/无码/欧美/FC2 ----
-        fb = t if t in ("all", "censored", "uncensored", "western", "fc2") else "all"
-        sort = _to_text(fs.get("sort") or "released")
-        params = {"page": page, "filter_by": fb}
-        if main:
-            params["main"] = main
-        if sort == "magnet-updated":
-            # 磁链更新排序走 /v1/movies/tags
-            tag_params = {"filter_by": fb, "sort_by": "magnets",
-                          "order_by": "desc", "page": page, "limit": 30}
-            if main:
-                tag_params["filter_by_tags"] = main
-            data = self._api_get("/v1/movies/tags", tag_params)
-        else:
-            data = self._api_get("/v1/movies/latest", params)
+        # ---- 全部 ----
+        if t == "all":
+            return self._latest_list(fs, page)
+
+        # ---- 类别 4 类 ----
+        if t in TYPE_NUM:
+            return self._tags_list(t, fs, page)
+
+        # ---- 兜底：其它 id 按「全部」处理 ----
+        data = self._api_get("/v1/movies/latest",
+                             {"page": page, "filter_by": "all"})
         lst = self._movies_to_list(data.get("movies"))
         return {"list": lst, "page": page, "pagecount": page + 1,
                 "limit": len(lst), "total": 0}
@@ -1059,9 +1297,11 @@ class Spider:
         actor = data.get("actor") if isinstance(data, dict) else None
         name = _to_text(actor.get("name") if isinstance(actor, dict) else "") or aid
         pic = self._proxy_pic(_to_text(actor.get("avatar_url") if isinstance(actor, dict) else ""))
-        # 作品列表：/v1/movies/latest?actor_id=X&page=N
-        movies_data = self._api_get("/v1/movies/latest", {
-            "page": 1, "filter_by": "all", "actor_id": aid,
+        # 作品列表：网页同款 filter_by 键 = 实体type:a:演员id
+        etype = _to_text(actor.get("type")) if isinstance(actor, dict) else ""
+        movies_data = self._api_get("/v1/movies/tags", {
+            "filter_by": "%s:a:%s" % (etype or "0", aid),
+            "sort_by": "release", "order_by": "desc", "page": 1, "limit": 24,
         })
         movies = movies_data.get("movies") or []
         eps = []
@@ -1088,8 +1328,12 @@ class Spider:
         data = self._api_get(path + quote(eid, safe=""))
         ent = data.get(kind) if isinstance(data, dict) else None
         name = _to_text(ent.get("name") if isinstance(ent, dict) else "") or eid
-        movies_data = self._api_get("/v1/movies/latest", {
-            "page": 1, "filter_by": "all", kind + "_id": eid,
+        # 作品列表：网页同款 filter_by 键 = 实体type:m|s:实体id
+        etype = _to_text(ent.get("type")) if isinstance(ent, dict) else ""
+        movies_data = self._api_get("/v1/movies/tags", {
+            "filter_by": "%s:%s:%s" % (etype or "0",
+                                       "m" if kind == "maker" else "s", eid),
+            "sort_by": "release", "order_by": "desc", "page": 1, "limit": 24,
         })
         movies = movies_data.get("movies") or []
         eps = []
@@ -2163,16 +2407,33 @@ class Spider:
 
     # ==================== 播放 ====================
 
+    def _offline_test_result(self):
+        """二分实验：ext.offlineTestMp4 打开时，115 离线入口直接回公开测试片。
+
+        noheader → url + format，不带 header（判断 result 结构本身能不能播）
+        header   → 再带上 UA/Referer（判断 header 通道有没有被 App 吞掉）
+        """
+        mode = self.offline_test_mp4
+        with_header = mode in ("header", "withheader", "1", "true", "yes")
+        res = {"parse": 0, "jx": 0, "playUrl": "", "url": OFFLINE_TEST_MP4,
+               "format": "video/mp4", "header": dict(OFFLINE_TEST_HEADER)
+               if with_header else {}}
+        res["desc"] = ("[实验] offlineTestMp4=%s（公开测试片，未走115）\n"
+                       "能播 → result 结构没问题，锅在 115 直链/header；"
+                       "不能播 → 结构/被 App 处理坏了" % mode)
+        self._set_off_last("实验直链 offlineTestMp4=%s" % mode)
+        return res
+
     def playerContent(self, flag, ids, vipFlags=None):
         vid = str(ids[0]) if isinstance(ids, (list, tuple)) and ids else str(ids or "")
         self._set_off_last("收到播放请求：%s" % _to_text(vid)[:50])
 
+        # 二分实验：只劫持 115 离线入口（占位 id / 演员列表的裸番号），其它一律不碰
         if self.offline_test_mp4 and (vid.startswith(OFF_PREFIX_115)
-                                      or vid.startswith("115off:")):
-            return {
-                "parse": 0, "jx": 0, "playUrl": "",
-                "url": OFFLINE_TEST_MP4, "header": OFFLINE_TEST_HEADER,
-            }
+                                      or vid.startswith("115off:")
+                                      or (len(vid) <= 12
+                                          and re.match(r"^[A-Za-z0-9]+$", vid))):
+            return self._offline_test_result()
 
         if vid.startswith(OFF_PREFIX_115):
             magnet, title, label = _off_id_decode(vid[len(OFF_PREFIX_115):])
@@ -2215,16 +2476,89 @@ class Spider:
 
     def localProxy(self, param):
         if isinstance(param, str):
+            raw = param
             try:
-                param = json.loads(param)
+                param = json.loads(raw)
             except Exception:
+                param = None
+            if not isinstance(param, dict):
+                # 兼容 query string 形式：k=img&u=...
                 param = {}
+                for kv in raw.split("&"):
+                    if "=" in kv:
+                        k, v = kv.split("=", 1)
+                        param[k] = v
         if not isinstance(param, dict):
             param = {}
         if _to_text(param.get("k")) == "offnote":
             body = self._offline_srt(param.get("v") or "")
             return [200, "application/x-subrip", body.encode("utf-8"), {}]
+        if _to_text(param.get("k")) == "img":
+            body, mime = self._fetch_pic(_to_text(param.get("u") or ""))
+            if not body:
+                return [404, "text/plain", b"Not Found", {}]
+            return [200, mime, body, {}]
         return [404, "text/plain", b"Not Found", {}]
+
+    def _fetch_pic(self, url):
+        """下载封面并解码 XOR 加密（localProxy k=img 用）"""
+        if not requests or not url.startswith(("http://", "https://")):
+            return b"", ""
+        headers = {
+            "User-Agent": WEB_UA,
+            "Referer": self.host + "/",
+            "Accept": "image/*,*/*",
+        }
+        try:
+            r = self.s.get(url, headers=headers, timeout=self.timeout,
+                           verify=False)
+        except Exception:
+            return b"", ""
+        if r.status_code != 200 or not r.content:
+            return b"", ""
+        return self._decode_pic(r.content,
+                                _to_text(r.headers.get("Content-Type") or ""))
+
+    @staticmethod
+    def _pic_mime(raw):
+        if raw[:3] == b"\xff\xd8\xff":
+            return "image/jpeg"
+        if raw[:8] == b"\x89PNG\r\n\x1a\n":
+            return "image/png"
+        if raw[:6] in (b"GIF87a", b"GIF89a"):
+            return "image/gif"
+        if len(raw) > 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+            return "image/webp"
+        if raw[:2] == b"BM":
+            return "image/bmp"
+        return ""
+
+    @classmethod
+    def _decode_pic(cls, raw, ctype=""):
+        """网页端同款解码：① 首字节为 XOR 密钥 ② 0x7F 定值密钥（跳过 0..2）。
+        解不出且 Content-Type 是图片则原样返回；否则返回空（404）。"""
+        raw = bytes(raw or b"")
+        if not raw:
+            return b"", ""
+        mime = cls._pic_mime(raw)
+        if mime:
+            return raw, mime
+        if len(raw) > 16:
+            key = raw[0]
+            head = bytes(raw[i] ^ key for i in range(1, min(len(raw), 14)))
+            if cls._pic_mime(head):
+                dec = bytes(b ^ key for b in raw[1:])
+                return dec, cls._pic_mime(dec)
+            for skip in (0, 1, 2):
+                head = bytes(raw[i] ^ 0x7F
+                             for i in range(skip, min(len(raw), skip + 13)))
+                if cls._pic_mime(head):
+                    dec = bytes(raw[i] ^ 0x7F for i in range(skip, len(raw)))
+                    return dec, cls._pic_mime(dec)
+        ct = _to_text(ctype).split(";")[0].strip().lower()
+        if ct.startswith("image/"):
+            return raw, ct
+        return b"", ""
 
     @staticmethod
     def _in_atvp():
