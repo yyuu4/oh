@@ -846,7 +846,9 @@ class Spider:
             port = 0
         if port > 0:
             return "http://127.0.0.1:%d/proxy?do=py" % port
-        return "proxy://do=py"
+        # 修复：32位 OK影视 不认 proxy://，强制用 HTTP + 常用端口
+        for p in (9978, 9979, 8080, 19999, 9977):
+            return "http://127.0.0.1:%d/proxy?do=py" % p
 
     # ---------- 类别（对齐网页端导航） ----------
     @staticmethod
