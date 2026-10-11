@@ -1,4 +1,4 @@
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 # -*- coding: utf-8 -*-
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 # 仿照 javbus-liangzai.py v1.2.14 重写；115 离线功能逐字节对齐，爬取层改用 JavDB JSON API。
@@ -750,19 +750,20 @@ class Spider:
             return p.replace("{url}", quote(url, safe=""))
         return p + quote(url, safe="")
 
-    # ---------- 类别 ----------
+    # ---------- 类别（对齐网页端导航） ----------
     @staticmethod
     def _classes():
         return [
-            {"type_id": "latest",       "type_name": "最新"},
-            {"type_id": "uncensored",   "type_name": "無碼"},
-            {"type_id": "western",      "type_name": "西方"},
-            {"type_id": "hentai",       "type_name": "動畫"},
-            {"type_id": "chinese",      "type_name": "中文"},
-            {"type_id": "rankings",     "type_name": "排行榜"},
-            {"type_id": "actors",       "type_name": "女優"},
-            {"type_id": "makers",       "type_name": "片商"},
-            {"type_id": "series",       "type_name": "系列"},
+            {"type_id": "hot",         "type_name": "热播"},
+            {"type_id": "all",         "type_name": "全部"},
+            {"type_id": "censored",    "type_name": "有码"},
+            {"type_id": "uncensored",  "type_name": "无码"},
+            {"type_id": "western",     "type_name": "欧美"},
+            {"type_id": "fc2",         "type_name": "FC2"},
+            {"type_id": "rankings",    "type_name": "排行榜"},
+            {"type_id": "actors",      "type_name": "演员"},
+            {"type_id": "series",      "type_name": "系列"},
+            {"type_id": "makers",      "type_name": "片商"},
         ]
 
     def homeContent(self, filter=None):
@@ -771,44 +772,62 @@ class Spider:
             if c["type_id"] == "uncensored" and not self.enable_uncensored:
                 continue
             classes.append(dict(c))
-        filters = {
-            "latest": [
-                {"key": "sort", "name": "排序", "init": "release",
-                 "value": [
-                     {"n": "发行日期", "v": "release"},
-                     {"n": "磁力数量", "v": "magnets"},
-                     {"n": "评分", "v": "score"},
-                 ]},
-                {"key": "order", "name": "顺序", "init": "desc",
-                 "value": [
-                     {"n": "降序", "v": "desc"},
-                     {"n": "升序", "v": "asc"},
-                 ]},
-            ],
-            "rankings": [
-                {"key": "period", "name": "周期", "init": "daily",
-                 "value": [
-                     {"n": "每日", "v": "daily"},
-                     {"n": "每周", "v": "weekly"},
-                     {"n": "每月", "v": "monthly"},
-                 ]},
-                {"key": "rtype", "name": "类型", "init": "all",
-                 "value": [
-                     {"n": "全部", "v": "all"},
-                     {"n": "有碼", "v": "censored"},
-                     {"n": "無碼", "v": "uncensored"},
-                     {"n": "西方", "v": "western"},
-                     {"n": "動畫", "v": "hentai"},
-                 ]},
-            ],
-        }
+        # 筛选对齐网页端：可用性 + 排序
+        availability = [
+            {"key": "main", "name": "可用性", "init": "",
+             "value": [
+                 {"n": "全部", "v": ""},
+                 {"n": "可播放", "v": "p"},
+                 {"n": "含磁链", "v": "m"},
+                 {"n": "含字幕", "v": "c"},
+             ]},
+        ]
+        sort_opts = [
+            {"key": "sort", "name": "排序", "init": "released",
+             "value": [
+                 {"n": "发布日期", "v": "released"},
+                 {"n": "磁链更新", "v": "magnet-updated"},
+             ]},
+        ]
+        rank_opts = [
+            {"key": "period", "name": "周期", "init": "daily",
+             "value": [
+                 {"n": "每日", "v": "daily"},
+                 {"n": "每周", "v": "weekly"},
+                 {"n": "每月", "v": "monthly"},
+             ]},
+        ]
+        actor_opts = [
+            {"key": "amode", "name": "模式", "init": "recommend",
+             "value": [
+                 {"n": "推荐", "v": "recommend"},
+                 {"n": "有码", "v": "censored"},
+                 {"n": "无码", "v": "uncensored"},
+             ]},
+        ]
+        series_opts = [
+            {"key": "stype", "name": "类型", "init": "censored",
+             "value": [
+                 {"n": "有码", "v": "censored"},
+                 {"n": "无码", "v": "uncensored"},
+                 {"n": "全部", "v": "all"},
+             ]},
+        ]
+        filters = {}
+        for tid in ("all", "censored", "uncensored", "western", "fc2"):
+            filters[tid] = list(availability) + list(sort_opts)
+        filters["hot"] = list(availability)
+        filters["rankings"] = list(rank_opts)
+        filters["actors"] = list(actor_opts)
+        filters["series"] = list(series_opts)
+        filters["makers"] = list(series_opts)
         return {"class": classes, "filters": filters}
 
     def homeVideoContent(self):
-        data = self._api_get("/v1/movies/latest", {"page": 1, "filter_by": "all"})
+        data = self._api_get("/v1/movies/recommend")
         return {"list": self._movies_to_list(data.get("movies"))}
 
-    # ---------- 分类内容 ----------
+    # ---------- 分类内容（对齐网页端） ----------
     def categoryContent(self, tid, pg=1, filter=None, extend=None):
         t = _to_text(tid)
         page = _safe_int(pg, 1)
@@ -816,19 +835,22 @@ class Spider:
         for src in (filter, extend):
             if isinstance(src, dict):
                 fs.update(src)
+        main = _to_text(fs.get("main") or "")
 
+        # ---- 排行榜 ----
         if t == "rankings":
-            rtype = _to_text(fs.get("rtype") or "all")
             period = _to_text(fs.get("period") or "daily")
-            data = self._api_get("/v1/rankings", {"type": rtype, "period": period})
-            movies = data.get("movies") or []
-            # 排行榜不分页，一次 60 条
-            lst = self._movies_to_list(movies)
+            # 网页端排行榜有 6 种模式，TVBox 里用热播(playback) 作为默认
+            data = self._api_get("/v1/rankings",
+                                 {"type": "playback", "period": period})
+            lst = self._movies_to_list(data.get("movies") or [])
             return {"list": lst, "page": 1, "pagecount": 1,
                     "limit": len(lst), "total": len(lst)}
 
+        # ---- 演员 ----
         if t == "actors":
-            data = self._api_get("/v1/actors", {"type": "all", "page": page})
+            amode = _to_text(fs.get("amode") or "recommend")
+            data = self._api_get("/v1/actors", {"type": amode, "page": page})
             out = []
             for a in data.get("actors") or []:
                 aid = _to_text(a.get("id") or "")
@@ -843,24 +865,10 @@ class Spider:
             return {"list": out, "page": page, "pagecount": page + 1,
                     "limit": len(out), "total": 0}
 
-        if t == "makers":
-            data = self._api_get("/v1/makers", {"type": "all", "page": page})
-            out = []
-            for mk in (data.get("makers") or data.get("list") or []):
-                mid = _to_text(mk.get("id") or "")
-                if not mid:
-                    continue
-                out.append({
-                    "vod_id": "maker_" + mid,
-                    "vod_name": _to_text(mk.get("name") or ""),
-                    "vod_pic": "",
-                    "vod_remarks": "作品%d" % _safe_int(mk.get("videos_count"), 0),
-                })
-            return {"list": out, "page": page, "pagecount": page + 1,
-                    "limit": len(out), "total": 0}
-
+        # ---- 系列 ----
         if t == "series":
-            data = self._api_get("/v1/series", {"type": "all", "page": page})
+            stype = _to_text(fs.get("stype") or "censored")
+            data = self._api_get("/v1/series", {"type": stype, "page": page})
             out = []
             for sr in (data.get("series") or data.get("list") or []):
                 sid = _to_text(sr.get("id") or "")
@@ -875,20 +883,46 @@ class Spider:
             return {"list": out, "page": page, "pagecount": page + 1,
                     "limit": len(out), "total": 0}
 
-        # 最新 / 無碼 / 西方 / 動畫 / 中文
-        fb = t if t in ("all", "uncensored", "western", "hentai", "chinese") else "all"
-        sort_by = _to_text(fs.get("sort") or "release")
-        order_by = _to_text(fs.get("order") or "desc")
-        # /v1/movies/latest 只支持 filter_by；排序走 /v1/movies/tags
-        if sort_by != "release":
-            data = self._api_get("/v1/movies/tags", {
-                "filter_by": fb, "sort_by": sort_by, "order_by": order_by,
-                "page": page, "limit": 30,
-            })
+        # ---- 片商（API 当前 500，留接口） ----
+        if t == "makers":
+            stype = _to_text(fs.get("stype") or "censored")
+            data = self._api_get("/v1/makers", {"type": stype, "page": page})
+            out = []
+            for mk in (data.get("makers") or data.get("list") or []):
+                mid = _to_text(mk.get("id") or "")
+                if not mid:
+                    continue
+                out.append({
+                    "vod_id": "maker_" + mid,
+                    "vod_name": _to_text(mk.get("name") or ""),
+                    "vod_pic": "",
+                    "vod_remarks": "作品%d" % _safe_int(mk.get("videos_count"), 0),
+                })
+            return {"list": out, "page": page, "pagecount": page + 1,
+                    "limit": len(out), "total": 0}
+
+        # ---- 热播（推荐） ----
+        if t == "hot":
+            data = self._api_get("/v1/movies/recommend")
+            lst = self._movies_to_list(data.get("movies") or [])
+            return {"list": lst, "page": 1, "pagecount": 1,
+                    "limit": len(lst), "total": len(lst)}
+
+        # ---- 全部/有码/无码/欧美/FC2 ----
+        fb = t if t in ("all", "censored", "uncensored", "western", "fc2") else "all"
+        sort = _to_text(fs.get("sort") or "released")
+        params = {"page": page, "filter_by": fb}
+        if main:
+            params["main"] = main
+        if sort == "magnet-updated":
+            # 磁链更新排序走 /v1/movies/tags
+            tag_params = {"filter_by": fb, "sort_by": "magnets",
+                          "order_by": "desc", "page": page, "limit": 30}
+            if main:
+                tag_params["filter_by_tags"] = main
+            data = self._api_get("/v1/movies/tags", tag_params)
         else:
-            data = self._api_get("/v1/movies/latest", {
-                "page": page, "filter_by": fb,
-            })
+            data = self._api_get("/v1/movies/latest", params)
         lst = self._movies_to_list(data.get("movies"))
         return {"list": lst, "page": page, "pagecount": page + 1,
                 "limit": len(lst), "total": 0}
