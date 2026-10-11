@@ -422,7 +422,7 @@
             "key": "javdbui.py",
             "name": "javdbui.py",
             "type": 3,
-            "api": "./py/javdbui.py",
+            "api": "https://v6.gh-proxy.org/https://raw.githubusercontent.com/yyuu4/oh/refs/heads/main/py/javdbui.py",
             "searchable": 1,
             "quickSearch": 1,
             "filterable": 1,
