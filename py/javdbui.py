@@ -1,4 +1,4 @@
-VERSION = "1.4.13"
+VERSION = "1.4.14"
 # -*- coding: utf-8 -*-
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 import os
@@ -108,12 +108,14 @@ def _fc(item):
     return "" if v is None else str(v).strip()
 
 
-def _off_id_encode(magnet, title="", label=""):
+def _off_id_encode(magnet, title="", label="", number=""):
     payload = {"m": _to_text(magnet)}
     if _to_text(title):
         payload["t"] = _to_text(title)
     if _to_text(label):
         payload["l"] = _to_text(label)
+    if _to_text(number):
+        payload["n"] = _to_text(number)
     raw = json.dumps(payload, ensure_ascii=False)
     return base64.b64encode(raw.encode("utf-8")).decode("ascii")
 
@@ -123,7 +125,7 @@ def _off_id_decode(text):
     try:
         raw = base64.b64decode(text.encode("ascii")).decode("utf-8")
     except Exception:
-        return "", "", ""
+        return "", "", "", ""
     raw = raw.strip()
     if raw.startswith("{"):
         try:
@@ -133,8 +135,9 @@ def _off_id_decode(text):
         if isinstance(data, dict):
             return (_to_text(data.get("m") or ""),
                     _to_text(data.get("t") or ""),
-                    _to_text(data.get("l") or ""))
-    return raw, "", ""
+                    _to_text(data.get("l") or ""),
+                    _to_text(data.get("n") or ""))
+    return raw, "", "", ""
 
 
 def _play_err(msg):
@@ -1471,7 +1474,7 @@ class Spider:
                 if size_str:
                     label_parts.append(size_str)
                 label = " ".join(label_parts) or ("磁力%d" % (i + 1))
-                b64 = _off_id_encode(mag, title, label)
+                b64 = _off_id_encode(mag, title, label, number)
                 eps.append("%s$%s%s?t=%d" % (
                     _sanitize_play(label), OFF_PREFIX_115, b64, int(time.time())))
             if eps:
@@ -2061,26 +2064,34 @@ class Spider:
         return n.strip()[:120].strip(" .")
 
     @classmethod
-    def _offline_new_name(cls, title, orig, label=""):
+    def _offline_new_name(cls, title, orig, label="", number=""):
         title = cls._safe_name(title)
         orig = cls._safe_name(orig)
         label = cls._safe_name(label)
+        number = cls._safe_name(number)
         if not title:
-            return orig
-        if label:
+            name = orig
+        elif label:
             ext = os.path.splitext(orig)[1]
             tail = label if (not ext or label.lower().endswith(ext.lower())) \
                 else label + ext
             if tail == title:
-                return orig
-            name = "%s_%s" % (title, tail)
-            if len(name) > 140:
-                room = max(8, 140 - len(tail) - 1)
-                name = "%s_%s" % (title[:room], tail)
-            return orig if name == orig else name
-        if orig == title or orig.startswith(title + "_"):
-            return orig
-        return "%s_%s" % (title, orig)
+                name = orig
+            else:
+                name = "%s_%s" % (title, tail)
+                if len(name) > 140:
+                    room = max(8, 140 - len(tail) - 1)
+                    name = "%s_%s" % (title[:room], tail)
+                if name == orig:
+                    name = orig
+        elif orig == title or orig.startswith(title + "_"):
+            name = orig
+        else:
+            name = "%s_%s" % (title, orig)
+        # 番号前置（ABF-390_xxx）；已带该番号则不重复加
+        if number and name and not name.startswith(number):
+            name = "%s_%s" % (number, name)
+        return name
 
     def _offline_rename(self, fid, new_name):
         if not fid or not new_name:
@@ -2155,11 +2166,12 @@ class Spider:
                 return "0"
         return ""
 
-    def _tidy_file(self, info, name, title="", label="", deadline=0):
+    def _tidy_file(self, info, name, title="", label="", deadline=0,
+                   number=""):
         pc = info.get("pc") or info.get("pick_code") or ""
         fid = _to_text(info.get("fid") or "")
         orig = _to_text(info.get("n") or info.get("name") or name)
-        new = self._offline_new_name(title, orig, label)
+        new = self._offline_new_name(title, orig, label, number)
         if new and new != orig and self._offline_rename(fid, new):
             orig = new
         try:
@@ -2241,7 +2253,8 @@ class Spider:
             elif not cur:
                 self._pending_trash_add(fcid)
 
-    def _tidy_folder(self, info, name, title, label="", deadline=0):
+    def _tidy_folder(self, info, name, title, label="", deadline=0,
+                     number=""):
         cid = _to_text(info.get("cid") or info.get("fid") or "")
         if deadline and time.time() >= deadline:
             return "", _to_text(name)
@@ -2251,7 +2264,7 @@ class Spider:
         fid = _to_text(video.get("fid") or "")
         vpc = _to_text(video.get("pc") or video.get("pick_code") or "")
         orig = _to_text(video.get("n") or video.get("name") or "")
-        new = self._offline_new_name(title, orig, label)
+        new = self._offline_new_name(title, orig, label, number)
         if new and new != orig and self._offline_rename(fid, new):
             orig = new
         pid = "" if (deadline and time.time() >= deadline) \
@@ -2291,7 +2304,8 @@ class Spider:
                     self._pending_trash_add(cid)
         return vpc or _to_text(info.get("pc") or ""), orig or _to_text(name)
 
-    def _offline_tidy(self, pc, name, title="", label="", deadline=0):
+    def _offline_tidy(self, pc, name, title="", label="", deadline=0,
+                      number=""):
         try:
             info = self._offline_info(pc) or {}
         except Exception:
@@ -2302,9 +2316,10 @@ class Spider:
         is_dir = (fc == "0") if fc else (not bool(info.get("fid")))
         try:
             if is_dir:
-                return self._tidy_folder(info, name, title, label, deadline=deadline)
+                return self._tidy_folder(info, name, title, label,
+                                         deadline=deadline, number=number)
             return self._tidy_file(info, name, title, label,
-                                   deadline=deadline)
+                                   deadline=deadline, number=number)
         except Exception:
             return pc, _to_text(name)
 
@@ -2369,10 +2384,11 @@ class Spider:
         return ""
 
     def _offline_finish(self, info_hash, pc, name, title="", label="",
-                        allow_search=True, t0=None):
+                        allow_search=True, t0=None, number=""):
         name = _to_text(name).strip()
         title = _to_text(title).strip()
         label = _to_text(label).strip()
+        number = _to_text(number).strip()
         t0 = t0 or time.time()
         try:
             self._reap_pending_trash()
@@ -2384,7 +2400,7 @@ class Spider:
             self._off_trace("整理网盘", t0)
             try:
                 got = self._offline_tidy(pc, name, title, label,
-                                         deadline=deadline)
+                                         deadline=deadline, number=number)
                 if got and got[0]:
                     play_pc, display = got[0], got[1]
                     tidied = True
@@ -2450,10 +2466,10 @@ class Spider:
                     res = res2
         return res or _play_err("取直链失败（%.0fs），可重试" % (time.time() - t0))
 
-    def _play_offline_safe(self, magnet, title="", label=""):
+    def _play_offline_safe(self, magnet, title="", label="", number=""):
         t0 = time.time()
         try:
-            res = self._submit_offline_115(magnet, title, label)
+            res = self._submit_offline_115(magnet, title, label, number)
         except Exception as e:
             res = _play_err("115离线出错：%s" % e)
         if not isinstance(res, dict):
@@ -2515,7 +2531,7 @@ class Spider:
                 return pc, n
         return "", ""
 
-    def _submit_offline_115(self, magnet, title="", label=""):
+    def _submit_offline_115(self, magnet, title="", label="", number=""):
         if not self.enable_offline_115:
             return _play_err("115离线已关闭（ext.enableOffline115）")
         dn_hint = self._magnet_dn(magnet)
@@ -2556,7 +2572,8 @@ class Spider:
                 self._off_cache_put(info_hash, pc1, name1)
                 res1 = self._offline_finish(info_hash, pc1, name1,
                                             title=title, label=label,
-                                            allow_search=True, t0=t0)
+                                            allow_search=True, t0=t0,
+                                            number=number)
                 if res1.get("url"):
                     return res1
                 if res1.get("msg"):
@@ -2576,7 +2593,8 @@ class Spider:
                 self._off_trace("任务已完成，整理并取直链", t0)
                 res0 = self._offline_finish(info_hash, pc0, task_name,
                                             title=title, label=label,
-                                            allow_search=True, t0=t0)
+                                            allow_search=True, t0=t0,
+                                            number=number)
                 if res0.get("url"):
                     return res0
                 early_fail = res0
@@ -2614,7 +2632,8 @@ class Spider:
                     self._off_trace("任务已完成，整理并取直链", t0)
                     res0 = self._offline_finish(info_hash, pc0, task_name,
                                                 title=title, label=label,
-                                                allow_search=True, t0=t0)
+                                                allow_search=True, t0=t0,
+                                                number=number)
                     if res0.get("url"):
                         return res0
                     early_fail = res0
@@ -2633,7 +2652,8 @@ class Spider:
         pickcode = self._task_pickcode(task)
         if pickcode:
             res = self._offline_finish(info_hash, pickcode, name,
-                                       title=title, label=label, allow_search=True, t0=t0)
+                                       title=title, label=label, allow_search=True, t0=t0,
+                                       number=number)
             if res.get("url"):
                 return res
             if early_fail:
@@ -2646,7 +2666,8 @@ class Spider:
                 "离线已完成，但115网盘里还没搜到文件，请稍后重试")
 
         res = self._offline_finish(info_hash, pickcode, name,
-                                   title=title, label=label, allow_search=False, t0=t0)
+                                   title=title, label=label, allow_search=False, t0=t0,
+                                   number=number)
         if res.get("url") or not early_fail:
             return res
         return early_fail
@@ -2682,10 +2703,10 @@ class Spider:
             return self._offline_test_result()
 
         if vid.startswith(OFF_PREFIX_115):
-            magnet, title, label = _off_id_decode(vid[len(OFF_PREFIX_115):])
+            magnet, title, label, number = _off_id_decode(vid[len(OFF_PREFIX_115):])
             if not magnet:
                 return _play_err("磁力解码失败")
-            return self._play_offline_safe(magnet, title, label)
+            return self._play_offline_safe(magnet, title, label, number)
 
         if vid.startswith("115off:"):
             return self._play_offline_safe(vid[len("115off:"):].strip())
@@ -2721,10 +2742,10 @@ class Spider:
                     for ep in sources:
                         if OFF_PREFIX_115 in ep:
                             _, ep_id = ep.split("$", 1)
-                            magnet, title, label = _off_id_decode(
+                            magnet, title, label, number = _off_id_decode(
                                 ep_id[len(OFF_PREFIX_115):].split("?")[0])
                             if magnet:
-                                return self._play_offline_safe(magnet, title, label)
+                                return self._play_offline_safe(magnet, title, label, number)
             except Exception:
                 pass
 
