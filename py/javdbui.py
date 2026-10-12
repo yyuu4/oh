@@ -1,7 +1,6 @@
 VERSION = "1.4.13"
 # -*- coding: utf-8 -*-
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
-# 仿照 javbus-liangzai.py v1.2.14 重写；115 离线功能逐字节对齐，爬取层改用 JavDB JSON API。
 import os
 import re
 import json
@@ -29,7 +28,7 @@ except Exception:
 # (1) 网页代理：只管「爬虫抓网页/下图片」，播放地址由 App 自己去取。
 # 默认留空（直连即可）：tp.spfcas.com 实测可直连下载（v1.4.6 pg 无代理曾出图证明）。
 # 电影封面走 c0.jdbstatic.com 明文直链，连解密都不需要；仅演员头像等加密图需经此代理下载。
-# 需要时可在此填 "http://IP:PORT"，或不改文件、在源 ext 里加 "proxy": "http://IP:PORT"（ext 优先）。
+# 如演员头像不能出图，在此填入代理，或在插件扩展配置填入 {"proxy": "http://192.8.8.8:8888"}
 PROXY = ""
 
 # (2) 图片反代：图片显示不出来时再开（默认关闭）
