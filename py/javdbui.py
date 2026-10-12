@@ -1,5 +1,6 @@
-VERSION = "1.4.14"
 # -*- coding: utf-8 -*-
+VERSION = "1.4.15"
+# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 import os
 import re
@@ -269,6 +270,19 @@ def _format_size_mb(mb):
     return ""
 
 
+def _magnet_label(g, idx):
+    """磁力条目 → 播放列表显示名（高清/字幕/大小）；磁力源与 115 离线源共用"""
+    parts = []
+    if bool(g.get("hd")):
+        parts.append("高清")
+    if bool(g.get("cnsub")):
+        parts.append("字幕")
+    s = _format_size_mb(g.get("size"))
+    if s:
+        parts.append(s)
+    return " ".join(parts) or ("磁力%d" % (idx + 1))
+
+
 # ==================== JavDB API 签名 ====================
 
 def _jd_signature():
@@ -506,6 +520,8 @@ class Spider:
         self.proxy = PROXY
         self.lang = "zh"
         self.verify = False
+        self.img_proxy_off = False
+        self._ext_site_key = ""
 
         # 115 离线
         self.cookie_115 = DEFAULT_COOKIE_115
@@ -619,6 +635,8 @@ class Spider:
             self.enable_magnet = bool(extend["enableMagnet"])
         if "enableUncensored" in extend:
             self.enable_uncensored = bool(extend["enableUncensored"])
+        if "verify" in extend:
+            self.verify = bool(extend["verify"])
 
         if "proxy" in extend:
             self.set_proxy(extend.get("proxy"))
@@ -703,7 +721,7 @@ class Spider:
         for attempt in range(HTTP_RETRY + 1):
             try:
                 r = self.s.get(url, params=params or {}, headers=headers,
-                               timeout=t, verify=False)
+                               timeout=t, verify=self.verify)
                 if r.status_code in HTTP_RETRY_STATUS and attempt < HTTP_RETRY:
                     time.sleep(HTTP_RETRY_DELAY)
                     continue
@@ -731,7 +749,7 @@ class Spider:
         for attempt in range(HTTP_RETRY + 1):
             try:
                 r = self.s.get(url, headers=headers, timeout=self.timeout,
-                               verify=False)
+                               verify=self.verify)
                 if r.status_code in HTTP_RETRY_STATUS and attempt < HTTP_RETRY:
                     time.sleep(HTTP_RETRY_DELAY)
                     continue
@@ -812,7 +830,6 @@ class Spider:
             return self._pic_data_uri(url)
         # 有 siteKey（pg 场景）：走 localProxy 解码（快、不撑大响应体积）。
         try:
-            import base64
             tok = base64.urlsafe_b64encode(
                 url.encode("utf-8")).decode("ascii").rstrip("=")
             base = self._pic_proxy_base()  # 已含 do=py
@@ -1185,7 +1202,7 @@ class Spider:
                                    headers={"User-Agent": self.ua,
                                             "Referer": h + "/",
                                             "Accept": "application/json"},
-                                   timeout=self.timeout, verify=False)
+                                   timeout=self.timeout, verify=self.verify)
                     dt = time.time() - t0
                     if r.status_code != 200 or not r.content:
                         continue
@@ -1437,18 +1454,7 @@ class Spider:
                 if not h:
                     continue
                 mag = _magnet_with_trackers(h)
-                size_mb = g.get("size")
-                size_str = _format_size_mb(size_mb)
-                hd = bool(g.get("hd"))
-                cnsub = bool(g.get("cnsub"))
-                label_parts = []
-                if hd:
-                    label_parts.append("高清")
-                if cnsub:
-                    label_parts.append("字幕")
-                if size_str:
-                    label_parts.append(size_str)
-                label = " ".join(label_parts) or ("磁力%d" % (i + 1))
+                label = _magnet_label(g, i)
                 eps.append("%s$%s" % (_sanitize_play(label), _sanitize_play(mag)))
             if eps:
                 play_from.append("磁力")
@@ -1462,18 +1468,7 @@ class Spider:
                 if not h:
                     continue
                 mag = "magnet:?xt=urn:btih:" + h
-                size_mb = g.get("size")
-                size_str = _format_size_mb(size_mb)
-                hd = bool(g.get("hd"))
-                cnsub = bool(g.get("cnsub"))
-                label_parts = []
-                if hd:
-                    label_parts.append("高清")
-                if cnsub:
-                    label_parts.append("字幕")
-                if size_str:
-                    label_parts.append(size_str)
-                label = " ".join(label_parts) or ("磁力%d" % (i + 1))
+                label = _magnet_label(g, i)
                 b64 = _off_id_encode(mag, title, label, number)
                 eps.append("%s$%s%s?t=%d" % (
                     _sanitize_play(label), OFF_PREFIX_115, b64, int(time.time())))
@@ -1540,68 +1535,6 @@ class Spider:
             pass
         return ""
 
-    def _actor_detail(self, aid):
-        """女優详情：列她的作品"""
-        data = self._api_get("/v1/actors/" + quote(aid, safe=""))
-        actor = data.get("actor") if isinstance(data, dict) else None
-        name = _to_text(actor.get("name") if isinstance(actor, dict) else "") or aid
-        pic = self._proxy_pic(_to_text(actor.get("avatar_url") if isinstance(actor, dict) else ""))
-        # 作品列表：网页同款 filter_by 键 = 实体type:a:演员id
-        etype = _to_text(actor.get("type")) if isinstance(actor, dict) else ""
-        movies_data = self._api_get("/v1/movies/tags", {
-            "filter_by": "%s:a:%s" % (etype or "0", aid),
-            "sort_by": "release", "order_by": "desc", "page": 1, "limit": 24,
-        })
-        movies = movies_data.get("movies") or []
-        eps = []
-        for m in movies:
-            mid = _to_text(m.get("id") or "")
-            num = _to_text(m.get("number") or "")
-            t = _to_text(m.get("title") or num)
-            if not mid:
-                continue
-            eps.append("%s$%s" % (_sanitize_play(num or t[:30]), mid))
-        vod = {
-            "vod_id": "actor_" + aid,
-            "vod_name": name,
-            "vod_pic": pic,
-            "vod_content": "演员作品列表",
-            "vod_play_from": "作品",
-            "vod_play_url": "#".join(eps) if eps else "",
-        }
-        return {"list": [vod]}
-
-    def _entity_movies_detail(self, kind, eid):
-        """片商/系列详情：列作品"""
-        path = "/v1/makers/" if kind == "maker" else "/v1/series/"
-        data = self._api_get(path + quote(eid, safe=""))
-        ent = data.get(kind) if isinstance(data, dict) else None
-        name = _to_text(ent.get("name") if isinstance(ent, dict) else "") or eid
-        # 作品列表：网页同款 filter_by 键 = 实体type:m|s:实体id
-        etype = _to_text(ent.get("type")) if isinstance(ent, dict) else ""
-        movies_data = self._api_get("/v1/movies/tags", {
-            "filter_by": "%s:%s:%s" % (etype or "0",
-                                       "m" if kind == "maker" else "s", eid),
-            "sort_by": "release", "order_by": "desc", "page": 1, "limit": 24,
-        })
-        movies = movies_data.get("movies") or []
-        eps = []
-        for m in movies:
-            mid = _to_text(m.get("id") or "")
-            num = _to_text(m.get("number") or "")
-            if not mid:
-                continue
-            eps.append("%s$%s" % (_sanitize_play(num or mid), mid))
-        vod = {
-            "vod_id": kind + "_" + eid,
-            "vod_name": name,
-            "vod_pic": "",
-            "vod_content": "%s作品列表" % ("片商" if kind == "maker" else "系列"),
-            "vod_play_from": "作品",
-            "vod_play_url": "#".join(eps) if eps else "",
-        }
-        return {"list": [vod]}
-
     # ---------- 搜索 ----------
     def searchContent(self, key, quick=False, pg="1"):
         page = _safe_int(pg, 1)
@@ -1613,8 +1546,9 @@ class Spider:
             "q": keyword, "page": page, "type": "movie", "limit": self.search_limit,
         })
         lst = self._movies_to_list(data.get("movies"))
-        return {"list": lst, "page": page, "pagecount": page + 1,
-                "limit": len(lst), "total": 0}
+        return {"list": lst, "page": page,
+                "pagecount": page + 1 if lst else page,
+                "limit": len(lst), "total": len(lst)}
 
     # ==================== 115 离线 ====================
 
@@ -1685,7 +1619,7 @@ class Spider:
             "appVer": self.offline_app_ver,
         }
         r = sess.post(OFFLINE_ADD_API, data=data, headers=self._offline_headers(),
-                      timeout=self.offline_timeout, verify=False)
+                      timeout=self.offline_timeout, verify=self.verify)
         try:
             return r.json()
         except Exception:
@@ -1697,7 +1631,7 @@ class Spider:
             return {}
         data = {"page": page, "appVer": self.offline_app_ver}
         r = sess.post(OFFLINE_LIST_API, data=data, headers=self._offline_headers(),
-                      timeout=self.offline_timeout, verify=False)
+                      timeout=self.offline_timeout, verify=self.verify)
         try:
             return r.json()
         except Exception:
@@ -1835,7 +1769,7 @@ class Spider:
             "Origin": "https://115.com",
         }
         try:
-            r = sess.post(url, data=body, headers=headers, timeout=12, verify=False)
+            r = sess.post(url, data=body, headers=headers, timeout=12, verify=self.verify)
         except Exception as e:
             return _play_err("115 取直链失败: %s" % e)
 
@@ -1990,10 +1924,10 @@ class Spider:
             if data is not None:
                 headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
                 r = sess.post(url, data=data, headers=headers, timeout=timeout,
-                              verify=False)
+                              verify=self.verify)
             else:
                 r = sess.get(url, params=params or {}, headers=headers,
-                             timeout=timeout, verify=False)
+                             timeout=timeout, verify=self.verify)
         except Exception:
             return {}
         out = _safe_json(r.text, {})
@@ -2195,7 +2129,7 @@ class Spider:
             r = sess.get("https://webapi.115.com/files/search", params={
                 "search_value": keyword, "type": stype, "offset": 0,
                 "limit": limit, "aid": 1, "cid": 0, "format": "json",
-            }, headers=headers, timeout=10, verify=False)
+            }, headers=headers, timeout=10, verify=self.verify)
             chunk = _safe_json(r.text, {}).get("data")
             return chunk if isinstance(chunk, list) else []
         except Exception:
@@ -2770,8 +2704,7 @@ class Spider:
                 if "=" in kv:
                     k, v = kv.split("=", 1)
                     try:
-                        from urllib.parse import unquote as _unq
-                        v = _unq(v)
+                        v = unquote(v)
                     except Exception:
                         pass
                     d[k] = v
@@ -2782,7 +2715,6 @@ class Spider:
     def _unpack_pic_token(tok):
         """token → 原图 URL（urlsafe base64，无 padding；失败返回空）"""
         try:
-            import base64
             s = _to_text(tok or "").strip()
             if not s:
                 return ""
@@ -2839,7 +2771,7 @@ class Spider:
             return b"", ""
         try:
             r = sess.get(url, headers=headers, timeout=self.timeout,
-                         verify=False)
+                         verify=self.verify)
         except Exception:
             return b"", ""
         if r.status_code != 200 or not r.content:
@@ -2927,3 +2859,24 @@ class Spider:
         except Exception:
             pass
         return None
+
+
+# 命令行自检：python3 javdbui.py（不影响宿主加载）
+if __name__ == "__main__":
+    sp = Spider()
+    sp.init("")
+    print("VERSION", VERSION)
+    hc = sp.homeContent()
+    print("classes", len(hc.get("class") or []),
+          "filters", list((hc.get("filters") or {}).keys()))
+    for tid in ("hot", "all", "censored", "uncensored", "western", "fc2",
+                "rankings", "actors", "series", "makers"):
+        try:
+            print(tid, len((sp.categoryContent(tid, "1", {}, {}) or {})
+                           .get("list") or []))
+        except Exception as e:
+            print(tid, "ERR", type(e).__name__, str(e)[:60])
+    try:
+        print("search", len((sp.searchContent("三上") or {}).get("list") or []))
+    except Exception as e:
+        print("search ERR", type(e).__name__, str(e)[:60])
