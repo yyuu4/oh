@@ -1,4 +1,4 @@
-VERSION = "1.4.12"
+VERSION = "1.4.13"
 # -*- coding: utf-8 -*-
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 # 仿照 javbus-liangzai.py v1.2.14 重写；115 离线功能逐字节对齐，爬取层改用 JavDB JSON API。
@@ -26,12 +26,17 @@ except Exception:
 # ===========================================================================
 # 配置区
 # ===========================================================================
-# (1) 网页代理：只管「爬虫抓网页/下图片」，播放地址由 App 自己去取
-# JavDB 图片源 tp.spfcas.com 需经此代理才能下载（本地 XOR 解码后经 localProxy 给 App）。
-PROXY = "http://192.168.1.8:7890"
+# (1) 网页代理：只管「爬虫抓网页/下图片」，播放地址由 App 自己去取。
+# 默认留空（直连即可）：tp.spfcas.com 实测可直连下载（v1.4.6 pg 无代理曾出图证明）。
+# 电影封面走 c0.jdbstatic.com 明文直链，连解密都不需要；仅演员头像等加密图需经此代理下载。
+# 需要时可在此填 "http://IP:PORT"，或不改文件、在源 ext 里加 "proxy": "http://IP:PORT"（ext 优先）。
+PROXY = ""
 
 # (2) 图片反代：图片显示不出来时再开（默认关闭）
 IMG_PROXY = ""
+
+# 电影封面明文图床（与 2222av.py 同源，无需解密/代理，App 直接加载）
+C0_IMG_BASE = "https://c0.jdbstatic.com"
 
 # 站点 ext（TVBox 源里 ext 字段传 JSON）可覆盖上面两项及其它开关：
 #   {
@@ -747,8 +752,7 @@ class Spider:
         title = _to_text(m.get("title") or m.get("number") or "")
         number = _to_text(m.get("number") or "")
         pic = self._proxy_pic(
-            _to_text(m.get("cover_url") or m.get("thumb_url") or ""),
-            large=False)  # data URI 内联：大图会让首页 50 张到 ~12MB/20s，网格用小图
+            _to_text(m.get("cover_url") or m.get("thumb_url") or ""))
         magnets = _safe_int(m.get("magnets_count"), 0)
         score = _to_text(m.get("score") or "")
         date = _to_text(m.get("release_date") or "")
@@ -770,7 +774,6 @@ class Spider:
         }
 
     def _movies_to_list(self, movies):
-        self._prefetch_pics(movies)  # data URI 模式下并行预取小图，避免逐张串行卡顿
         out = []
         seen = set()
         for m in movies or []:
@@ -780,36 +783,17 @@ class Spider:
                 out.append(item)
         return out
 
-    def _prefetch_pics(self, movies):
-        # 仅 data URI 模式（无 siteKey）需要预取；有 siteKey 走 localProxy，图片由 App 按需取，无需预取
-        if self._site_key():
-            return
-        urls = []
-        for m in movies or []:
-            if not isinstance(m, dict):
-                continue
-            u = _to_text(m.get("cover_url") or m.get("thumb_url") or "")
-            if u.startswith(("http://", "https://")):
-                small = u.replace("/covers/", "/small_covers/") if "/covers/" in u else u
-                if small not in urls:
-                    urls.append(small)
-        if not urls:
-            return
-        try:
-            from concurrent.futures import ThreadPoolExecutor
-            workers = min(8, len(urls))
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                # _fetch_pic 有内存缓存，预取后主循环命中缓存，不再重复下载
-                list(ex.map(self._fetch_pic, urls))
-        except Exception:
-            pass
-
-    def _proxy_pic(self, url, large=False):
+    def _proxy_pic(self, url):
         if not url:
             return ""
         url = _to_text(url)
         if not url.startswith(("http://", "https://")):
             return url
+        # 电影封面 → c0.jdbstatic.com 明文直链：不需解密、不需代理、不占爬虫带宽，
+        # App 原生并行加载，两环境都流畅。
+        plain = self._c0_cover_url(url)
+        if plain:
+            return plain
         p = _to_text(self.img_proxy)
         if p:
             if "{url}" in p:
@@ -818,12 +802,12 @@ class Spider:
         # 关掉解密 → 返回原始（密文）地址，交给 App / 外部代理
         if getattr(self, "img_proxy_off", False):
             return url
-        # 封面/头像被 XOR 加密 → 需解码后给 App。
+        # 演员头像等加密图（c0 不提供）→ 需解码后给 App。
         key = self._site_key()
         # 无 siteKey（AT 场景）：localProxy 的 do=py 路由不中 → 改用 data URI 内联，
         # App 直接渲染，彻底绕开 siteKey / 路由 / proxy:// 依赖。
         if not key:
-            return self._pic_data_uri(url, large=large)
+            return self._pic_data_uri(url)
         # 有 siteKey（pg 场景）：走 localProxy 解码（快、不撑大响应体积）。
         try:
             import base64
@@ -837,18 +821,31 @@ class Spider:
         except Exception:
             return url
 
-    def _pic_data_uri(self, url, large=False):
+    @staticmethod
+    def _c0_cover_url(url):
+        """tp.spfcas 电影封面 → c0.jdbstatic.com 明文直链（2222av.py 同款）。
+        covers/small_covers 统一映射到明文 covers；非 tp.spfcas 或路径不符返回 None。"""
+        if not url or "tp.spfcas.com/" not in url:
+            return None
+        idx = url.find("/small_covers/")
+        if idx >= 0:
+            rest = url[idx + len("/small_covers/"):]
+        else:
+            idx = url.find("/covers/")
+            if idx < 0:
+                return None
+            rest = url[idx + len("/covers/"):]
+        rest = rest.split("?")[0].strip("/")
+        if not rest or not rest.lower().endswith(".jpg"):
+            return None
+        return "%s/covers/%s" % (C0_IMG_BASE, rest)
+
+    def _pic_data_uri(self, url):
         """无 siteKey 时用：下载解码后内联成 data URI（App 直接渲染，无需 localProxy 路由）。
-        large=False（首页/列表网格）用 small_covers 小图，体积小、响应快；
-        large=True（详情页大图）用原始 covers 大图，清晰度优先。"""
+        现仅用于演员头像等 c0 不提供的加密图（量小，每页 1 张，开销可接受）。"""
         if not url:
             return url
-        target = url
-        if not large:
-            target = url.replace("/covers/", "/small_covers/") if "/covers/" in url else url
-        data, mime = self._fetch_pic(target)
-        if not data and target != url:
-            data, mime = self._fetch_pic(url)
+        data, mime = self._fetch_pic(url)
         if data:
             return "data:%s;base64,%s" % (
                 mime or "image/jpeg",
@@ -1379,8 +1376,7 @@ class Spider:
         title = _to_text(movie.get("title") or movie.get("number") or "")
         number = _to_text(movie.get("number") or "")
         pic = self._proxy_pic(
-            _to_text(movie.get("cover_url") or movie.get("thumb_url") or ""),
-            large=False)  # 本版详情页不显示封面，用小图避免无谓大下载
+            _to_text(movie.get("cover_url") or movie.get("thumb_url") or ""))
         date = _to_text(movie.get("release_date") or "")
         score = _to_text(movie.get("score") or "")
         dur = _safe_int(movie.get("duration"), 0)
