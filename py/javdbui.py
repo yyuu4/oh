@@ -1,4 +1,4 @@
-VERSION = "1.4.10"
+VERSION = "1.4.12"
 # -*- coding: utf-8 -*-
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 # 仿照 javbus-liangzai.py v1.2.14 重写；115 离线功能逐字节对齐，爬取层改用 JavDB JSON API。
@@ -746,7 +746,9 @@ class Spider:
             return None
         title = _to_text(m.get("title") or m.get("number") or "")
         number = _to_text(m.get("number") or "")
-        pic = self._proxy_pic(_to_text(m.get("cover_url") or m.get("thumb_url") or ""))
+        pic = self._proxy_pic(
+            _to_text(m.get("cover_url") or m.get("thumb_url") or ""),
+            large=False)  # data URI 内联：大图会让首页 50 张到 ~12MB/20s，网格用小图
         magnets = _safe_int(m.get("magnets_count"), 0)
         score = _to_text(m.get("score") or "")
         date = _to_text(m.get("release_date") or "")
@@ -1378,7 +1380,7 @@ class Spider:
         number = _to_text(movie.get("number") or "")
         pic = self._proxy_pic(
             _to_text(movie.get("cover_url") or movie.get("thumb_url") or ""),
-            large=True)
+            large=False)  # 本版详情页不显示封面，用小图避免无谓大下载
         date = _to_text(movie.get("release_date") or "")
         score = _to_text(movie.get("score") or "")
         dur = _safe_int(movie.get("duration"), 0)
