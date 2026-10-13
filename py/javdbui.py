@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.4.16"
-# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商海报网格加「可用性」筛选（对齐网页 EntityMoviesPage，filter_by 第4段；靠盒子文件夹继承显示）+修复「全部」分类排序筛选失效（_latest_list 补传 sort_by）；
+VERSION = "1.4.17"
+# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商海报网格加「可用性」筛选——网页原样筛选（网页 EntityMoviesPage 实体页只有这一组：全部/可播放/含磁链/含字幕；filter_by 第4段；盒子上先在列表选好再点进实体即生效）+修复「全部」分类排序筛选失效（_latest_list 补传 sort_by）；v1.4.17，实体网格筛选补全为可用性+时长+标签组（标签取四类并集修跨类型返空；时长客户端过滤+按(base,dur)缓存）；
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 import os
 import re
@@ -281,6 +281,27 @@ def _magnet_label(g, idx):
     if s:
         parts.append(s)
     return " ".join(parts) or ("磁力%d" % (idx + 1))
+
+
+def _dur_match(d, bucket):
+    """时长档客户端判定（服务端实体 key 不支持时长 → _entity_grid_dur 用）。
+    档位边界对齐服务端实测：lt-45=10~44 / 45-90=45~90 / 90-120=91~120 / gt-120=121~。
+    d<=0（缺时长）一律不命中，避免脏数据混入。"""
+    try:
+        d = int(d)
+    except (TypeError, ValueError):
+        return False
+    if d <= 0:
+        return False
+    if bucket == "lt-45":
+        return d < 45
+    if bucket == "45-90":
+        return 45 <= d <= 90
+    if bucket == "90-120":
+        return 90 < d <= 120
+    if bucket == "gt-120":
+        return d > 120
+    return False
 
 
 # ==================== JavDB API 签名 ====================
@@ -978,6 +999,42 @@ class Spider:
                           {"n": "含磁链", "v": "m"},
                           {"n": "含字幕", "v": "c"}]}
 
+    def _entity_tag_groups(self):
+        """实体网格标签组：取 4 类（有码/无码/欧美/FC2）标签的**并集**（按 key 去重）。
+        原先只用 censored 的 id，用在无码/欧美/FC2 实体上会大量返空（跨类型 id 不匹配）；
+        标签 id 实为全局唯一，故并集可覆盖所有实体，选到实体没有的标签则正确返空。
+        排除 main/year/month（经 filter_by_tags 被服务端拒）与 duration（走客户端 _entity_grid_dur）。"""
+        exclude = ("main", "year", "month", "duration")
+        merged = {}
+        for t in MOVIE_TYPES:
+            for g in (self._tags_filter_groups(t) or []):
+                if not isinstance(g, dict):
+                    continue
+                k = _to_text(g.get("key") or "")
+                if k and k not in exclude and k not in merged:
+                    merged[k] = g
+        return list(merged.values())
+
+    def _duration_group(self):
+        """实体网格「时长」筛选：档位取类别页同款（/v2/tags 的 duration 组）。
+        服务端实体 key 不支持时长 → 客户端过滤（_entity_grid_dur + _dur_match）。"""
+        for g in (self._tags_filter_groups("censored") or []):
+            if isinstance(g, dict) and _to_text(g.get("key") or "") == "duration":
+                return g
+        return {"key": "duration", "name": "時長", "init": "",
+                "value": [{"n": "全部", "v": ""},
+                          {"n": "45分鍾以內", "v": "lt-45"},
+                          {"n": "45-90分鍾", "v": "45-90"},
+                          {"n": "90-120分鍾", "v": "90-120"},
+                          {"n": "120分鍾以上", "v": "gt-120"}]}
+
+    def _entity_grid_filters(self):
+        """演员/系列/片商点头像后的海报网格筛选：可用性 + 时长 + 标签组。
+        选项挂父分类（TVBox 按 type_id 下发筛选；演员 id 动态无法预注册），
+        盒子上「先在列表选好再点进实体」即生效（选项值会传进文件夹）。"""
+        return ([self._avail_group(), self._duration_group()]
+                + list(self._entity_tag_groups() or []))
+
     def homeContent(self, filter=None):
         classes = []
         for c in self._classes():
@@ -1063,9 +1120,8 @@ class Spider:
             {"key": "year", "name": "TOP250年份", "init": "all",
              "value": year_vals},
         ]
-        # 演员：网页 3 类
-        # 演员：网页 3 类（mode 供列表用）+ 点头像后海报网格的「可用性」筛选
-        # （网页 EntityMoviesPage 同款；选项挂父分类，靠盒子文件夹继承显示）
+        # 演员：网页 3 类（mode 供列表用）+ 点头像后海报网格筛选（可用性/时长/标签）
+        # 选项挂父分类（演员 id 动态无法预注册）；盒子上先在列表选好再点进实体即生效
         filters["actors"] = [
             {"key": "mode", "name": "模式", "init": "recommend",
              "value": [
@@ -1073,8 +1129,8 @@ class Spider:
                  {"n": "有码", "v": "censored"},
                  {"n": "无码", "v": "uncensored"},
              ]},
-        ] + [self._avail_group()]
-        # 系列 / 片商：网页 4 个类型页签 + 网格「可用性」
+        ] + self._entity_grid_filters()
+        # 系列 / 片商：网页 4 个类型页签（type 供列表用）+ 网格筛选
         type_opts = [
             {"key": "type", "name": "类型", "init": "censored",
              "value": [
@@ -1084,8 +1140,8 @@ class Spider:
                  {"n": "FC2", "v": "fc2"},
              ]},
         ]
-        filters["series"] = list(type_opts) + [self._avail_group()]
-        filters["makers"] = list(type_opts) + [self._avail_group()]
+        filters["series"] = list(type_opts) + self._entity_grid_filters()
+        filters["makers"] = list(type_opts) + self._entity_grid_filters()
         return {"class": classes, "filters": filters}
 
     def homeVideoContent(self):
@@ -1256,7 +1312,8 @@ class Spider:
     def _entity_movies_grid(self, marker, eid, page, fs=None):
         """folder 点击后的下一层：该演员(a)/系列(s)/片商(m)的影片海报网格（categoryContent 用）。
         网页同款 filter_by 键 = 实体type:marker:实体id[:可用性 p|m|c]，支持翻页。
-        可用性筛选 → filter_by 第4段（网页 EntityMoviesPage 同款：全部/可播放/含磁链/含字幕）。"""
+        筛选：avail → filter_by 第4段；标签组 → filter_by_tags（逗号连接=AND）；
+        时长 → 服务端实体 key 与 filter_by_tags 均不支持 → 客户端过滤（_entity_grid_dur）。"""
         fs = fs if isinstance(fs, dict) else {}
         # 先取实体 type（演员/系列/片商详情接口）
         if marker == "a":
@@ -1274,12 +1331,58 @@ class Spider:
         avail = _to_text(fs.get("avail") or "")
         if avail in ("p", "m", "c"):
             fb += ":" + avail
-        movies_data = self._api_get("/v1/movies/tags", {
-            "filter_by": fb,
-            "sort_by": "release", "order_by": "desc", "page": page, "limit": 24,
-        })
+        # 时长单独摘出（服务端实体不支持 → 走客户端）；其余标签走 filter_by_tags
+        dur = _to_text(fs.get("duration") or "")
+        tag_ids = []
+        for g in (self._entity_tag_groups() or []):
+            gk = _to_text(g.get("key") or "")
+            v = _to_text(fs.get(gk) or "")
+            if v:
+                tag_ids.append(v)
+        base = {"filter_by": fb, "sort_by": "release", "order_by": "desc", "limit": 24}
+        if tag_ids:
+            base["filter_by_tags"] = ",".join(tag_ids)
+        if dur:
+            return self._entity_grid_dur(base, dur, page)
+        movies_data = self._api_get("/v1/movies/tags", dict(base, page=page))
         lst = self._movies_to_list(movies_data.get("movies"))
         return self._page_result(lst, page)
+
+    def _entity_grid_dur(self, base, dur, page, limit=24, cap=20):
+        """时长档客户端过滤：服务端实体 key 不支持 → 逐页回扫累加到够 page*limit，再切片当页。
+        base 里已含 filter_by/tags（其它筛选仍走服务端）。
+        按 (base,dur) 缓存已扫描结果，翻页复用、避免每页都从服务端第 1 页重扫。
+        缓存用 getattr 懒加载（不随 init() 重置），并限量防膨胀。"""
+        ck = (json.dumps(base, sort_keys=True, ensure_ascii=False), dur)
+        store = getattr(self, "_entdur", None)
+        if not isinstance(store, dict):
+            store = {}
+            self._entdur = store
+        ent = store.get(ck)
+        if ent is None:
+            if len(store) >= 32:  # 容量上限：只保留最近的筛选组合
+                store.clear()
+            ent = [[], 1, False]  # [已匹配, 下一个服务端页, 是否已扫完]
+            store[ck] = ent
+        matched, sp, end = ent
+        need = page * limit + 1
+        while not end and sp <= cap and len(matched) < need:
+            data = self._api_get("/v1/movies/tags", dict(base, page=sp))
+            movies = data.get("movies") or []
+            if not movies:
+                end = True
+                break
+            matched.extend(x for x in movies if _dur_match(x.get("duration"), dur))
+            if len(movies) < limit:
+                end = True  # 服务端已到底
+            sp += 1
+        ent[1], ent[2] = sp, end  # matched 是同一对象，extend 已就地写回缓存
+        start = (page - 1) * limit
+        lst = self._movies_to_list(matched[start:start + limit])
+        has_more = (not end) or len(matched) > start + limit
+        return {"list": lst, "page": page,
+                "pagecount": page + 1 if (lst and has_more) else page,
+                "limit": len(lst), "total": len(lst)}
 
     def _latest_list(self, fs, page):
         # 首页「全部」：可用性 → filter_by，排序 → sort_by（对齐 _tags_list/_hot_grid；
