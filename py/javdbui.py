@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 VERSION = "1.4.17"
-# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商影片网格加筛选（可用性+标签，filter_by_tags）；v1.4.17，修复时长筛选（实体key服务端不支持→客户端过滤，对齐服务端档位边界）；
+# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商影片网格加筛选（可用性+标签，filter_by_tags）；v1.4.17，修复时长筛选（实体key服务端不支持→客户端过滤，对齐服务端档位边界）+「全部」分类排序筛选失效（_latest_list 补传 sort_by）；
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 import os
 import re
@@ -1345,12 +1345,15 @@ class Spider:
                 "limit": len(lst), "total": len(lst)}
 
     def _latest_list(self, fs, page):
-        # 首页「全部」：可用性 → /v1/movies/latest 的 filter_by（网页 movieFilter）
+        # 首页「全部」：可用性 → filter_by，排序 → sort_by（对齐 _tags_list/_hot_grid）
         av = _to_text(fs.get("avail") or "all")
+        sort = _to_text(fs.get("sort") or "released")
         fb = {"can_play": "can_play", "subtitle-playable": "can_play",
               "magnets": "magnets", "subtitle": "subtitle"}.get(av, "all")
+        sb = "update" if sort == "magnet-updated" else "release"
         data = self._api_get("/v1/movies/latest",
-                             {"page": page, "filter_by": fb})
+                             {"page": page, "filter_by": fb,
+                              "sort_by": sb, "order_by": "desc"})
         lst = self._movies_to_list(data.get("movies"))
         return self._page_result(lst, page)
 
