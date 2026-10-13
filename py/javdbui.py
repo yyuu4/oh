@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.4.17"
-# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商影片网格加筛选（可用性+标签，filter_by_tags）；v1.4.17，修复时长筛选（实体key服务端不支持→客户端过滤，对齐服务端档位边界）+「全部」分类排序筛选失效（_latest_list 补传 sort_by）；
+VERSION = "1.4.18"
+# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商影片网格加筛选（可用性+标签，filter_by_tags）；v1.4.17，修复时长筛选（实体key服务端不支持→客户端过滤，对齐服务端档位边界）+「全部」分类排序筛选失效（_latest_list 补传 sort_by）；v1.4.18，实体网格筛选改名标作用域（作品·前缀）+时长回扫按(base,dur)缓存翻页复用；
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 import os
 import re
@@ -1005,8 +1005,16 @@ class Spider:
                           {"n": "含字幕", "v": "c"}]}
 
     def _entity_grid_filters(self):
-        """演员/系列/片商点头像后的海报网格筛选：可用性 + 标签组（filter_by_tags 可用）"""
-        return [self._avail_group()] + list(self._entity_tag_groups() or [])
+        """演员/系列/片商点头像后的海报网格筛选：可用性 + 标签组（filter_by_tags 可用）。
+        这些筛选挂在类级 filters（TVBox 打开 folder 时复用父级筛选栏），所以也会显示在
+        演员/系列/片商「列表页」；而列表页只认 mode/type —— 故加「作品·」前缀标注作用域，
+        让用户知道它们是点开实体后的作品筛选（key 不变，_entity_movies_grid 取值不受影响）。"""
+        out = [dict(self._avail_group(), name="作品·可用性")]
+        for g in (self._entity_tag_groups() or []):
+            gg = dict(g)
+            gg["name"] = "作品·" + _to_text(g.get("name") or g.get("key") or "")
+            out.append(gg)
+        return out
 
     def homeContent(self, filter=None):
         classes = []
@@ -1323,23 +1331,38 @@ class Spider:
         lst = self._movies_to_list(data.get("movies"))
         return self._page_result(lst, page)
 
-    def _entity_grid_dur(self, base, dur, page, limit=24):
-        """时长档客户端过滤：服务端实体 key 不支持 → 逐页回扫累加到够 page*limit，
-        再切片当页。base 里已含 filter_by/tags（其它筛选仍走服务端）。"""
-        matched = []
-        sp, cap = 1, 20  # 最多回扫20个服务端页，防跑飞
-        while sp <= cap and len(matched) < page * limit + 1:
+    def _entity_grid_dur(self, base, dur, page, limit=24, cap=20):
+        """时长档客户端过滤：服务端实体 key 不支持 → 逐页回扫累加到够 page*limit，再切片当页。
+        base 里已含 filter_by/tags（其它筛选仍走服务端）。
+        按 (base,dur) 缓存已扫描结果，翻页复用、避免每页都从服务端第 1 页重扫（深层翻页 O(page)）。
+        缓存用 getattr 懒加载（不随 init() 重置，学 _tags_filters），并限量防膨胀。"""
+        ck = (json.dumps(base, sort_keys=True, ensure_ascii=False), dur)
+        store = getattr(self, "_entdur", None)
+        if not isinstance(store, dict):
+            store = {}
+            self._entdur = store
+        ent = store.get(ck)
+        if ent is None:
+            if len(store) >= 32:  # 容量上限：只保留最近的筛选组合
+                store.clear()
+            ent = [[], 1, False]  # [已匹配, 下一个服务端页, 是否已扫完]
+            store[ck] = ent
+        matched, sp, end = ent
+        need = page * limit + 1
+        while not end and sp <= cap and len(matched) < need:
             data = self._api_get("/v1/movies/tags", dict(base, page=sp))
             movies = data.get("movies") or []
             if not movies:
+                end = True
                 break
             matched.extend(x for x in movies if _dur_match(x.get("duration"), dur))
             if len(movies) < limit:
-                break  # 服务端已到底
+                end = True  # 服务端已到底
             sp += 1
+        ent[1], ent[2] = sp, end  # matched 是同一对象，extend 已就地写回缓存
         start = (page - 1) * limit
         lst = self._movies_to_list(matched[start:start + limit])
-        has_more = len(matched) > start + limit
+        has_more = (not end) or len(matched) > start + limit
         return {"list": lst, "page": page,
                 "pagecount": page + 1 if (lst and has_more) else page,
                 "limit": len(lst), "total": len(lst)}
