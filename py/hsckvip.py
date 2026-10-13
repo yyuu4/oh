@@ -1,17 +1,20 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 # v1.0.0 初版：MacCMS 采集 API（list/detail/search），封面+详情+分页；hsckm3u8 直链 / hsckyun 分享页解 m3u8；分类筛选/搜索/详情/播放自检通过；
 # v1.0.1 筛选修正：站点 API 实测仅 year 有效（filter_by/sort_by/area 等均被忽略），改为年份筛选——子类直查 year，父类经子类 API 合并；
 # v1.1.0 三域名候选（hsckzy.vip / hsckzy.xyz / hsckzy001.com）自动测速切换——API 探测挑最快可用域名，失败自动跳过，extend.hosts 可覆盖；
 # v1.1.1 多域名健壮性：校验 MacCMS 响应结构（排除 Cloudflare 错误页误判成功），坏域名失败自动切换下一候选；extend.hosts 保留用户指定顺序；
 # v1.2.0 分类重构：只保留顶级分类，子分类（网红主播/国产传媒等）改为父分类下的「子分类」筛选组——选中子类直接 API 直查，选全部走父类聚合；
+# v1.3.0 去广告：CDN 在正片 m3u8 头/尾拼接广告分片（独立 path+AES key，片头~22s/片尾固定~19s）——playerContent 走 localProxy 重写播放列表，
+#          按主路径过滤只保留正片段；ext.stripAds=false 可关回直链；
 # hsckvip.py —— 黄色仓库资源站 (MacCMS) 爬虫
 # 数据走 /api.php/provide/vod/ 标准采集 API；播放源为 m3u8 直链（hsckm3u8）或分享页（hsckyun，播放时解出 m3u8）。
 import os
 import re
 import json
 import time
-from urllib.parse import quote, unquote
+import base64
+from urllib.parse import quote, unquote, urljoin
 
 try:
     import requests
@@ -134,6 +137,7 @@ class Spider:
         self.verify = False
         self.proxy = ""
         self.prefer_m3u8 = True
+        self.strip_ads = True
         self._class_cache = []
         self._host_locked = False
         self._probed = False
@@ -210,6 +214,8 @@ class Spider:
             self.verify = bool(extend["verify"])
         if "preferM3u8" in extend:
             self.prefer_m3u8 = bool(extend["preferM3u8"])
+        if "stripAds" in extend:
+            self.strip_ads = bool(extend["stripAds"])
         if "proxy" in extend:
             self.set_proxy(extend.get("proxy"))
         elif "proxyPort" in extend or "proxy_port" in extend:
@@ -698,6 +704,137 @@ class Spider:
                 "limit": len(lst), "total": len(lst)}
 
     # ---------- 播放 ----------
+    def _proxy_base(self):
+        """localProxy 基址：优先 Proxy.getPort()，退回 proxy://do=py"""
+        try:
+            from com.github.catvod import Proxy
+            p = Proxy.getPort()
+            port = int(p) if str(p).isdigit() else 0
+        except Exception:
+            port = 0
+        if port > 0:
+            return "http://127.0.0.1:%s/proxy?do=py" % port
+        try:
+            from com.github.catvod import Proxy
+            q = Proxy.getUrl()
+            if q and ("do=py" in str(q) or str(q).startswith("proxy://")):
+                return str(q)
+        except Exception:
+            pass
+        return "proxy://do=py"
+
+    def _m3u8_proxy_url(self, src):
+        """包装 m3u8 为 localProxy URL（token=urlsafe-b64）"""
+        tok = base64.urlsafe_b64encode(_to_text(src).encode("utf-8")).decode("ascii")
+        return "%s&kind=m3u8&token=%s" % (self._proxy_base(), quote(tok, safe=""))
+
+    @staticmethod
+    def _main_path_from_m3u8(url):
+        """由 m3u8 URL 推导正片段路径前缀（不含文件名），如 /a3/20261013/HwsaAFv7"""
+        try:
+            from urllib.parse import urlparse
+            path = urlparse(_to_text(url).split("?")[0]).path or ""
+        except Exception:
+            path = _to_text(url).split("?")[0]
+        if not path or "/" not in path:
+            return ""
+        path = path.rsplit("/", 1)[0]  # 去掉文件名
+        parts = [p for p in path.split("/") if p]
+        if len(parts) >= 3 and parts[0] == "a3":
+            return "/" + "/".join(parts[:3])
+        if parts:
+            return "/" + "/".join(parts)
+        return ""
+
+    @staticmethod
+    def _strip_m3u8_ads(text, main_path):
+        """过滤 m3u8：只保留路径含 main_path 的分片；无匹配则原样返回。
+        广告段特征：路径不含正片 /a3/{date}/{id}/，独立 AES key。"""
+        if not text or not main_path:
+            return text
+        lines = text.splitlines()
+        header = []
+        segs = []  # [(tags, url)]
+        cur_tags = []
+        for line in lines:
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith("#EXTINF") or s.startswith("#EXT-X-DISCONTINUITY") \
+                    or s.startswith("#EXT-X-KEY"):
+                cur_tags.append(s)
+            elif s.startswith("#"):
+                # VERSION/STREAM-INF/MEDIA-SEQUENCE 等放 header（流独立时）
+                if not segs:
+                    header.append(s)
+                else:
+                    cur_tags.append(s)
+            else:
+                segs.append((cur_tags, s))
+                cur_tags = []
+        kept = [(tags, url) for tags, url in segs if main_path in url]
+        if not kept:
+            return text
+        out = header[:]
+        prev_key = None
+        emitted = False
+        for tags, url in kept:
+            for t in tags:
+                if t.startswith("#EXT-X-KEY"):
+                    if t == prev_key:
+                        continue
+                    prev_key = t
+                if t.startswith("#EXT-X-DISCONTINUITY") and not emitted:
+                    continue
+                out.append(t)
+            out.append(url)
+            emitted = True
+        if any(l.strip() == "#EXT-X-ENDLIST" for l in lines):
+            out.append("#EXT-X-ENDLIST")
+        return "\n".join(out) + "\n"
+
+    def _clean_m3u8(self, src):
+        """拉取 m3u8（master 则跟到首个 media），按主路径去广告分片。
+        失败返回 None（调用方回退直链）。"""
+        if not requests or not self.s:
+            return None
+        headers = {
+            "User-Agent": self.ua,
+            "Accept": "application/vnd.apple.mpegurl,application/x-mpegURL,*/*",
+            "Referer": self.host + "/",
+        }
+        try:
+            r = self.s.get(src, headers=headers, timeout=self.timeout,
+                           verify=self.verify)
+            if r.status_code != 200 or not r.content:
+                return None
+            text = r.content.decode("utf-8", "ignore")
+        except Exception:
+            return None
+        if "#EXT-X-STREAM-INF" in text:
+            # master → 解析首个媒体 m3u8
+            media = ""
+            for line in text.splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    media = line if line.startswith("http") else urljoin(src, line)
+                    break
+            if not media:
+                return None
+            try:
+                r2 = self.s.get(media, headers=headers, timeout=self.timeout,
+                                verify=self.verify)
+                if r2.status_code != 200 or not r2.content:
+                    return None
+                media_text = r2.content.decode("utf-8", "ignore")
+            except Exception:
+                return None
+            main_path = self._main_path_from_m3u8(media)
+            cleaned = self._strip_m3u8_ads(media_text, main_path)
+            return cleaned
+        main_path = self._main_path_from_m3u8(src)
+        return self._strip_m3u8_ads(text, main_path)
+
     def _fetch_m3u8_from_share(self, url):
         """hsckyun 分享页 → 解析内嵌 m3u8（失败返回空）"""
         if not requests:
@@ -735,22 +872,85 @@ class Spider:
             if low.endswith((".m3u8", ".mp4", ".flv", ".mkv", ".ts", ".avi", ".m4v")):
                 header = {"User-Agent": self.ua, "Referer": self.host + "/",
                           "Accept": "*/*"}
+                # m3u8 默认走 localProxy 去广告（ext.stripAds=false 关回直链）
+                if self.strip_ads and low.endswith(".m3u8"):
+                    return {"parse": 0, "jx": 0, "playUrl": "",
+                            "url": self._m3u8_proxy_url(vid), "header": header}
                 return {"parse": 0, "jx": 0, "playUrl": "", "url": vid,
                         "header": header}
             # 分享页/其它网页：尝试解出 m3u8；成功则直链，失败交给 App 解析
             if "share" in vid or low.endswith((".html", ".htm", "/")):
                 m3u8 = self._fetch_m3u8_from_share(vid)
                 if m3u8:
+                    header = {"User-Agent": self.ua,
+                              "Referer": self.host + "/",
+                              "Accept": "*/*"}
+                    if self.strip_ads:
+                        return {"parse": 0, "jx": 0, "playUrl": "",
+                                "url": self._m3u8_proxy_url(m3u8),
+                                "header": header}
                     return {"parse": 0, "jx": 0, "playUrl": "", "url": m3u8,
-                            "header": {"User-Agent": self.ua,
-                                       "Referer": self.host + "/",
-                                       "Accept": "*/*"}}
+                            "header": header}
             return {"parse": 1, "jx": 0, "playUrl": "", "url": vid,
                     "header": {"User-Agent": self.ua, "Referer": self.host + "/"}}
         return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {}}
 
+    def _parse_proxy_param(self, param):
+        if isinstance(param, dict):
+            return {str(k): _to_text(v) for k, v in param.items()}
+        s = _to_text(param or "").strip()
+        if not s:
+            return {}
+        if s.startswith("{"):
+            try:
+                d = json.loads(s)
+                if isinstance(d, dict):
+                    return {str(k): _to_text(v) for k, v in d.items()}
+            except Exception:
+                pass
+        s = s.lstrip("?")
+        out = {}
+        for part in s.split("&"):
+            if not part:
+                continue
+            if "=" in part:
+                k, v = part.split("=", 1)
+            else:
+                k, v = part, ""
+            k = unquote(k.strip())
+            if not k:
+                continue
+            out[k] = unquote(v.strip())
+        return out
+
     def localProxy(self, param):
-        return [404, "text/plain", b"Not Found", {}]
+        """kind=m3u8：token=base64(原始 m3u8 URL) → 返回去广告后的媒体列表"""
+        try:
+            p = self._parse_proxy_param(param)
+            kind = _to_text(p.get("kind") or "").lower()
+            if kind != "m3u8":
+                return [404, "text/plain", b"Not Found", {}]
+            token = _to_text(p.get("token") or "")
+            if not token:
+                return [400, "text/plain", b"missing token", {}]
+            # base64.urlsafe 解码（补齐 padding）
+            pad = "=" * (-len(token) % 4)
+            try:
+                src = base64.urlsafe_b64decode(token + pad).decode("utf-8")
+            except Exception:
+                return [400, "text/plain", b"bad token", {}]
+            if not src.startswith(("http://", "https://")):
+                return [400, "text/plain", b"bad src", {}]
+            cleaned = self._clean_m3u8(src)
+            if cleaned is None:
+                # 清洗失败：回退直链内容不可得，返回空列表引导 App 重试
+                return [502, "text/plain", b"upstream failed", {}]
+            body = cleaned.encode("utf-8")
+            return [200, "application/vnd.apple.mpegurl", body,
+                    {"Cache-Control": "no-cache",
+                     "Access-Control-Allow-Origin": "*"}]
+        except Exception:
+            return [404, "text/plain", b"Not Found", {}]
 
     def manualVideoCheck(self):
         return False
