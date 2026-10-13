@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.4.18"
-# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商影片网格加筛选（可用性+标签，filter_by_tags）；v1.4.17，修复时长筛选（实体key服务端不支持→客户端过滤，对齐服务端档位边界）+「全部」分类排序筛选失效（_latest_list 补传 sort_by）；v1.4.18，实体网格筛选改名标作用域（作品·前缀）+时长回扫按(base,dur)缓存翻页复用；
+VERSION = "1.4.19"
+# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商影片网格加筛选（可用性+标签，filter_by_tags）；v1.4.17，修复时长筛选（实体key服务端不支持→客户端过滤，对齐服务端档位边界）+「全部」分类排序筛选失效（_latest_list 补传 sort_by）；v1.4.18，实体网格筛选改名标作用域（作品·前缀）+时长回扫按(base,dur)缓存翻页复用；v1.4.19，摘除演员/系列/片商列表页的实体网格筛选选项（客户端文件夹不显示父级筛选，32位盒子往返后丢列表筛选栏）；
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 import os
 import re
@@ -995,27 +995,6 @@ class Spider:
                 if isinstance(g, dict)
                 and _to_text(g.get("key") or "") not in exclude]
 
-    @staticmethod
-    def _avail_group():
-        """实体网格「可用性」筛选（网页 EntityMoviesPage 同款）→ filter_by 第4段"""
-        return {"key": "avail", "name": "可用性", "init": "",
-                "value": [{"n": "全部", "v": ""},
-                          {"n": "可播放", "v": "p"},
-                          {"n": "含磁链", "v": "m"},
-                          {"n": "含字幕", "v": "c"}]}
-
-    def _entity_grid_filters(self):
-        """演员/系列/片商点头像后的海报网格筛选：可用性 + 标签组（filter_by_tags 可用）。
-        这些筛选挂在类级 filters（TVBox 打开 folder 时复用父级筛选栏），所以也会显示在
-        演员/系列/片商「列表页」；而列表页只认 mode/type —— 故加「作品·」前缀标注作用域，
-        让用户知道它们是点开实体后的作品筛选（key 不变，_entity_movies_grid 取值不受影响）。"""
-        out = [dict(self._avail_group(), name="作品·可用性")]
-        for g in (self._entity_tag_groups() or []):
-            gg = dict(g)
-            gg["name"] = "作品·" + _to_text(g.get("name") or g.get("key") or "")
-            out.append(gg)
-        return out
-
     def homeContent(self, filter=None):
         classes = []
         for c in self._classes():
@@ -1101,7 +1080,10 @@ class Spider:
             {"key": "year", "name": "TOP250年份", "init": "all",
              "value": year_vals},
         ]
-        # 演员：网页 3 类（mode 供列表用）+ 实体网格筛选（点头像后的海报网格用）
+        # 演员：网页 3 类（mode 供列表用）。
+        # 注：曾把实体网格筛选（作品·可用性/主题…）也挂这里，想靠「TVBox 文件夹继承父分类筛选」
+        # 在点头像后的网格里用；实测客户端文件夹内并不显示父级筛选，且从文件夹点回分类后
+        # 32位盒子还会丢失列表页筛选栏 → 已摘除（网格侧 _entity_movies_grid 仍支持过滤，留作后用）。
         filters["actors"] = [
             {"key": "mode", "name": "模式", "init": "recommend",
              "value": [
@@ -1109,8 +1091,8 @@ class Spider:
                  {"n": "有码", "v": "censored"},
                  {"n": "无码", "v": "uncensored"},
              ]},
-        ] + self._entity_grid_filters()
-        # 系列 / 片商：网页 4 个类型页签（type 供列表用）+ 实体网格筛选
+        ]
+        # 系列 / 片商：网页 4 个类型页签（type 供列表用）
         type_opts = [
             {"key": "type", "name": "类型", "init": "censored",
              "value": [
@@ -1120,8 +1102,8 @@ class Spider:
                  {"n": "FC2", "v": "fc2"},
              ]},
         ]
-        filters["series"] = list(type_opts) + self._entity_grid_filters()
-        filters["makers"] = list(type_opts) + self._entity_grid_filters()
+        filters["series"] = list(type_opts)
+        filters["makers"] = list(type_opts)
         return {"class": classes, "filters": filters}
 
     def homeVideoContent(self):
