@@ -137,7 +137,7 @@ class Spider:
         self.verify = False
         self.proxy = ""
         self.prefer_m3u8 = True
-        self.strip_ads = false
+        self.strip_ads = False
         self._class_cache = []
         self._host_locked = False
         self._probed = False
