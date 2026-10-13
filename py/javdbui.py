@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.4.16"
-# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商影片网格加筛选（可用性+标签，filter_by_tags）；
+VERSION = "1.4.17"
+# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商影片网格加筛选（可用性+标签，filter_by_tags）；v1.4.17，修复时长筛选（实体key服务端不支持→客户端过滤，对齐服务端档位边界）；
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 import os
 import re
@@ -281,6 +281,24 @@ def _magnet_label(g, idx):
     if s:
         parts.append(s)
     return " ".join(parts) or ("磁力%d" % (idx + 1))
+
+
+def _dur_match(d, bucket):
+    """时长档客户端匹配——边界对齐服务端 filter_by duration（类型页实测：
+    lt-45=10~44, 45-90=45~90, 90-120=91~120, gt-120=121~）。
+    实体网格时长服务端不支持，故本地过滤。"""
+    d = _safe_int(d, 0)
+    if d <= 0:
+        return False
+    if bucket == "lt-45":
+        return d < 45
+    if bucket == "45-90":
+        return 45 <= d <= 90
+    if bucket == "90-120":
+        return 90 < d <= 120
+    if bucket == "gt-120":
+        return d > 120
+    return True
 
 
 # ==================== JavDB API 签名 ====================
@@ -1266,7 +1284,8 @@ class Spider:
     def _entity_movies_grid(self, marker, eid, page, fs=None):
         """folder 点击后的下一层：该演员(a)/系列(s)/片商(m)的影片海报网格（categoryContent 用）。
         网页同款 filter_by 键 = 实体type:marker:实体id[:可用性 p|m|c]，支持翻页。
-        筛选：avail → filter_by 第4段；标签组 → filter_by_tags（逗号连接=AND）。"""
+        筛选：avail → filter_by 第4段；标签组 → filter_by_tags（逗号连接=AND）；
+        时长 → 实体 key 与 filter_by_tags 均不支持 → 客户端过滤（_entity_grid_dur）。"""
         fs = fs if isinstance(fs, dict) else {}
         # 先取实体 type（演员/系列/片商详情接口）
         if marker == "a":
@@ -1284,19 +1303,46 @@ class Spider:
         avail = _to_text(fs.get("avail") or "")
         if avail in ("p", "m", "c"):
             fb += ":" + avail
-        # 标签组 → filter_by_tags（逗号连接 = AND；main/year/month 不被接受故已排除）
+        # 时长单独摘出（服务端实体不支持，走客户端）；其余标签走 filter_by_tags
+        dur = _to_text(fs.get("duration") or "")
         tag_ids = []
         for g in (self._entity_tag_groups() or []):
-            v = _to_text(fs.get(_to_text(g.get("key") or "")) or "")
+            gk = _to_text(g.get("key") or "")
+            if gk == "duration":
+                continue
+            v = _to_text(fs.get(gk) or "")
             if v:
                 tag_ids.append(v)
-        params = {"filter_by": fb, "sort_by": "release", "order_by": "desc",
-                  "page": page, "limit": 24}
+        base = {"filter_by": fb, "sort_by": "release", "order_by": "desc",
+                "limit": 24}
         if tag_ids:
-            params["filter_by_tags"] = ",".join(tag_ids)
-        movies_data = self._api_get("/v1/movies/tags", params)
-        lst = self._movies_to_list(movies_data.get("movies"))
+            base["filter_by_tags"] = ",".join(tag_ids)
+        if dur:
+            return self._entity_grid_dur(base, dur, page)
+        data = self._api_get("/v1/movies/tags", dict(base, page=page))
+        lst = self._movies_to_list(data.get("movies"))
         return self._page_result(lst, page)
+
+    def _entity_grid_dur(self, base, dur, page, limit=24):
+        """时长档客户端过滤：服务端实体 key 不支持 → 逐页回扫累加到够 page*limit，
+        再切片当页。base 里已含 filter_by/tags（其它筛选仍走服务端）。"""
+        matched = []
+        sp, cap = 1, 20  # 最多回扫20个服务端页，防跑飞
+        while sp <= cap and len(matched) < page * limit + 1:
+            data = self._api_get("/v1/movies/tags", dict(base, page=sp))
+            movies = data.get("movies") or []
+            if not movies:
+                break
+            matched.extend(x for x in movies if _dur_match(x.get("duration"), dur))
+            if len(movies) < limit:
+                break  # 服务端已到底
+            sp += 1
+        start = (page - 1) * limit
+        lst = self._movies_to_list(matched[start:start + limit])
+        has_more = len(matched) > start + limit
+        return {"list": lst, "page": page,
+                "pagecount": page + 1 if (lst and has_more) else page,
+                "limit": len(lst), "total": len(lst)}
 
     def _latest_list(self, fs, page):
         # 首页「全部」：可用性 → /v1/movies/latest 的 filter_by（网页 movieFilter）
