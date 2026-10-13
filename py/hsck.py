@@ -22,7 +22,7 @@ VERSION = "1.0.5"
 # v1.0.5，ATVP 适配：无 siteKey 时图片直接返回原图地址（pic.892539.xyz 明文直链，
 #   App 可直接加载，绕开 localProxy 路由）；有 siteKey 仍走 localProxy。
 #   热播筛选同步到 "all" 键（部分 ATVP 版本读 all 而非 hot）；115离线选集保持现状
-#   （TVBox 只在同源 2+ 集时显示选集）。
+#   （TVBox 只在同源 2+ 集时显示选集）；分类硬编码兜底（_fetch 失败时不再只剩热播）。
 import os
 import re
 import json
@@ -83,6 +83,20 @@ OFFLINE_POLL_INTERVAL = 1
 OFFLINE_VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".flv", ".ts", ".m4v",
                       ".wmv", ".rm", ".rmvb", ".iso", ".mpg", ".mpeg", ".3gp",
                       ".webm", ".m2ts", ".vob", ".mp2")
+
+# 站点分类兜底（_fetch 失败时使用，tid 与导航一致）
+FALLBACK_CATS = [
+    {"type_id": "39765797", "type_name": "国产专区"},
+    {"type_id": "39775797", "type_name": "日本有码"},
+    {"type_id": "39785797", "type_name": "日本无码"},
+    {"type_id": "39795797", "type_name": "欧美情色"},
+    {"type_id": "39805797", "type_name": "传媒作品"},
+    {"type_id": "39815797", "type_name": "探花直播"},
+    {"type_id": "39825797", "type_name": "中文字幕"},
+    {"type_id": "39835797", "type_name": "卡通动漫"},
+    {"type_id": "39755828", "type_name": "国产磁力"},
+    {"type_id": "39765828", "type_name": "日本磁力"},
+]
 
 
 def _to_text(v):
@@ -579,6 +593,9 @@ class Spider:
                 self._load_categories(home)
         except Exception:
             pass
+        # 预加载失败 → 硬编码兜底
+        if not self._categories_cache:
+            self._categories_cache = list(FALLBACK_CATS)
 
     def set_proxy(self, value):
         self.proxy = _norm_proxy(value)
@@ -934,7 +951,11 @@ class Spider:
                 classes = self._load_categories(text)
         except Exception:
             pass
-        if not classes:
+        # _fetch 失败（ATVP 网络受限等）→ 用硬编码分类兜底
+        if len(classes) <= 1:
+            classes = [{"type_id": "hot", "type_name": "热播"}] + list(FALLBACK_CATS)
+            self._categories_cache = list(FALLBACK_CATS)
+        elif not classes:
             classes = [{"type_id": "hot", "type_name": "热播"}]
         # 热播筛选：热门视频 / 热门磁力（名称对应网页导航）
         # 其余分类：在线 / 磁力
