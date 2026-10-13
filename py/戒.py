@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 TVBox Spider - jdforrepam.com (JavDB 系镜像)
-分类：有码/无码/欧美/FC2（网页「类别」4 类）
-filter_by：{类型}:t:{main}:{extra}:{year}:{duration}:{month}（网页同款）
+分类：有码/无码/欧美/FC2/动漫
+filter_by：{分类}:t:{main}:{subject}:{year}:
 """
 import json
 import time
@@ -31,31 +31,26 @@ PAGE_SIZE = 48
 MAGNET_LIMIT = 40
 
 CLASSES = [
-    {"type_id": "censored", "type_name": "有码"},
-    {"type_id": "uncensored", "type_name": "无码"},
-    {"type_id": "western", "type_name": "欧美"},
-    {"type_id": "fc2", "type_name": "FC2"},
+    {"type_id": "jav_tag0", "type_name": "有码"},
+    {"type_id": "jav_tag1", "type_name": "无码"},
+    {"type_id": "jav_tag2", "type_name": "欧美"},
+    {"type_id": "jav_tag3", "type_name": "FC2"},
+    {"type_id": "jav_tag4", "type_name": "动漫"},
 ]
 
-TYPE_NUM = {"censored": "0", "uncensored": "1", "western": "2", "fc2": "3",
-            "anime": "4"}
-
 SORT_FILTER = [
-    {"n": "发布日期", "v": "released"},
+    {"n": "最新上市", "v": "release"},
+    {"n": "评分最高", "v": "score"},
     {"n": "磁链更新", "v": "magnet-updated"},
 ]
 
-CORE_DIMS = ("main", "year", "month", "duration")
-
-BASIC_MAIN = [{
-    "key": "main", "name": "基本", "init": "",
-    "value": [
-        {"n": "全部", "v": ""},
-        {"n": "可播放", "v": "p"},
-        {"n": "可下載", "v": "m"},
-        {"n": "含字幕", "v": "c"},
-    ],
-}]
+MAIN_DIM = "main"
+SUBJECT_DIMS = (
+    "subject", "role", "cloth", "body",
+    "behavior", "play_method", "category",
+)
+YEAR_DIMS = ("year",)
+HIDDEN_DIMS = ("month", "duration")
 
 
 class Spider:
@@ -98,13 +93,16 @@ class Spider:
         filters = {}
         for c in classes:
             tid = c["type_id"]
-            type_n = TYPE_NUM.get(tid, "0")
+            type_n = "0"
+            if tid.startswith("jav_tag") and tid[7:].isdigit():
+                type_n = tid[7:]
             items = self._get_filters(type_n)
             if not items:
-                items = [dict(x) for x in BASIC_MAIN]
-            filters[tid] = ([{"key": "sort", "name": "排序", "init": "released",
-                              "value": [dict(x) for x in SORT_FILTER]}]
-                            + items)
+                items = [{
+                    "key": "sort_by", "name": "排序", "init": "release",
+                    "value": [dict(x) for x in SORT_FILTER],
+                }]
+            filters[tid] = items
         return {"class": classes, "filters": filters}
 
     def homeVideoContent(self):
@@ -133,30 +131,21 @@ class Spider:
             return str(v).strip() if v not in (None, "") else ""
 
         t = str(tid or "")
-        sort = pick("sort") or "released"
-        n = TYPE_NUM.get(t, t[7:] if (t.startswith("jav_tag") and t[7:].isdigit()) else "0")
+        sort_by = pick("sort_by") or "release"
+        n = t[7:] if (t.startswith("jav_tag") and t[7:].isdigit()) else "0"
 
-        main_val = pick("main")
-        year_val = pick("year")
-        month_val = pick("month")
-        duration_val = pick("duration")
-        extra = ""
-        for g in (self._get_filters(n) or []):
-            gk = str(g.get("key") or "")
-            if not gk or gk in CORE_DIMS:
-                continue
-            v = pick(gk)
-            if v:
-                extra = v
-                break
+        main_val = pick(MAIN_DIM)
+        subj_vals = [pick(k) for k in SUBJECT_DIMS]
+        subject_val = ",".join([v for v in subj_vals if v])
+        year_vals = [pick(k) for k in YEAR_DIMS]
+        year_val = ",".join([v for v in year_vals if v])
 
-        fb = "%s:t:%s:%s:%s:%s:%s" % (n, main_val, extra, year_val,
-                                      duration_val, month_val)
+        seg = [n, "t", main_val, subject_val, year_val, ""]
+        fb = ":".join(seg) + ":"
 
         params = {
             "filter_by": fb, "page": page, "limit": PAGE_SIZE,
-            "sort_by": "update" if sort == "magnet-updated" else "release",
-            "order_by": "desc",
+            "sort_by": sort_by, "order_by": "desc",
         }
         data = self._api_data("/v1/movies/tags", params)
 
@@ -350,35 +339,29 @@ class Spider:
             return [dict(f) for f in self._filters_cache[type_n]]
 
         data = self._api_data("/v2/tags", {"type": type_n})
-        rows = data.get("tags") if isinstance(data, dict) else None
-        groups = []
-        if isinstance(rows, list) and rows:
-            core_rows = [g for cid in CORE_DIMS for g in rows
-                         if isinstance(g, dict) and g.get("category_id") == cid]
-            rest_rows = [g for g in rows
-                         if isinstance(g, dict) and g.get("category_id") not in CORE_DIMS]
-            for g in core_rows + rest_rows:
-                gkey = str(g.get("category_id") or "").strip()
-                if not gkey:
+        tags = data.get("tags") if isinstance(data, dict) else []
+        items = []
+        if isinstance(tags, list):
+            for cat in tags:
+                if not isinstance(cat, dict):
                     continue
-                gname = str(g.get("category") or gkey).strip()
-                first_n = "全部" if gkey == "main" else ("全部" + gname)
-                vals = [{"n": first_n, "v": ""}]
-                for tg in (g.get("tags") or []):
-                    if not isinstance(tg, dict):
-                        continue
-                    nm = str(tg.get("name") or "").strip()
-                    tg_id = str(tg.get("id") or "").strip()
-                    if not nm or not tg_id:
-                        continue
-                    vals.append({"n": nm, "v": tg_id})
-                if len(vals) < 2:
+                cid = str(cat.get("category_id") or "").strip()
+                cname = str(cat.get("category") or cid).strip()
+                if not cid or cid in HIDDEN_DIMS:
                     continue
-                groups.append({"key": gkey, "name": gname,
-                               "init": "", "value": vals})
+                vals = [{"n": "全部", "v": ""}]
+                for t in (cat.get("tags") or []):
+                    if isinstance(t, dict) and t.get("id") is not None:
+                        vals.append({"n": str(t.get("name") or ""),
+                                     "v": str(t.get("id"))})
+                if len(vals) > 1:
+                    items.append({"key": cid, "name": cname,
+                                  "init": "", "value": vals})
 
-        self._filters_cache[type_n] = [dict(f) for f in groups]
-        return groups
+        items.append({"key": "sort_by", "name": "排序", "init": "release",
+                      "value": [dict(x) for x in SORT_FILTER]})
+        self._filters_cache[type_n] = [dict(f) for f in items]
+        return items
 
     def _sign(self):
         ts = str(int(time.time()))
