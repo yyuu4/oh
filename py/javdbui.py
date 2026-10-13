@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.4.15"
-# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；
+VERSION = "1.4.16"
+# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商影片网格加筛选（可用性+标签，filter_by_tags）；
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 import os
 import re
@@ -968,6 +968,28 @@ class Spider:
         cache[num] = groups or None
         return cache[num]
 
+    def _entity_tag_groups(self):
+        """实体网格（演员/系列/片商）可用标签组：走 filter_by_tags 的分类。
+        排除 main/year/month——这些 id 经 filter_by_tags 被服务端拒（返空）。"""
+        groups = self._tags_filter_groups("censored") or []
+        exclude = ("main", "year", "month")
+        return [g for g in groups
+                if isinstance(g, dict)
+                and _to_text(g.get("key") or "") not in exclude]
+
+    @staticmethod
+    def _avail_group():
+        """实体网格「可用性」筛选（网页 EntityMoviesPage 同款）→ filter_by 第4段"""
+        return {"key": "avail", "name": "可用性", "init": "",
+                "value": [{"n": "全部", "v": ""},
+                          {"n": "可播放", "v": "p"},
+                          {"n": "含磁链", "v": "m"},
+                          {"n": "含字幕", "v": "c"}]}
+
+    def _entity_grid_filters(self):
+        """演员/系列/片商点头像后的海报网格筛选：可用性 + 标签组（filter_by_tags 可用）"""
+        return [self._avail_group()] + list(self._entity_tag_groups() or [])
+
     def homeContent(self, filter=None):
         classes = []
         for c in self._classes():
@@ -1053,7 +1075,7 @@ class Spider:
             {"key": "year", "name": "TOP250年份", "init": "all",
              "value": year_vals},
         ]
-        # 演员：网页 3 类
+        # 演员：网页 3 类（mode 供列表用）+ 实体网格筛选（点头像后的海报网格用）
         filters["actors"] = [
             {"key": "mode", "name": "模式", "init": "recommend",
              "value": [
@@ -1061,8 +1083,8 @@ class Spider:
                  {"n": "有码", "v": "censored"},
                  {"n": "无码", "v": "uncensored"},
              ]},
-        ]
-        # 系列 / 片商：网页 4 个类型页签
+        ] + self._entity_grid_filters()
+        # 系列 / 片商：网页 4 个类型页签（type 供列表用）+ 实体网格筛选
         type_opts = [
             {"key": "type", "name": "类型", "init": "censored",
              "value": [
@@ -1072,8 +1094,8 @@ class Spider:
                  {"n": "FC2", "v": "fc2"},
              ]},
         ]
-        filters["series"] = list(type_opts)
-        filters["makers"] = list(type_opts)
+        filters["series"] = list(type_opts) + self._entity_grid_filters()
+        filters["makers"] = list(type_opts) + self._entity_grid_filters()
         return {"class": classes, "filters": filters}
 
     def homeVideoContent(self):
@@ -1241,9 +1263,11 @@ class Spider:
             })
         return self._page_result(out, page)
 
-    def _entity_movies_grid(self, marker, eid, page):
+    def _entity_movies_grid(self, marker, eid, page, fs=None):
         """folder 点击后的下一层：该演员(a)/系列(s)/片商(m)的影片海报网格（categoryContent 用）。
-        网页同款 filter_by 键 = 实体type:marker:实体id，支持翻页。"""
+        网页同款 filter_by 键 = 实体type:marker:实体id[:可用性 p|m|c]，支持翻页。
+        筛选：avail → filter_by 第4段；标签组 → filter_by_tags（逗号连接=AND）。"""
+        fs = fs if isinstance(fs, dict) else {}
         # 先取实体 type（演员/系列/片商详情接口）
         if marker == "a":
             data = self._api_get("/v1/actors/" + quote(eid, safe=""))
@@ -1255,10 +1279,22 @@ class Spider:
             data = self._api_get("/v1/makers/" + quote(eid, safe=""))
             ent = data.get("maker") if isinstance(data, dict) else None
         etype = _to_text(ent.get("type") if isinstance(ent, dict) else "") or "0"
-        movies_data = self._api_get("/v1/movies/tags", {
-            "filter_by": "%s:%s:%s" % (etype, marker, eid),
-            "sort_by": "release", "order_by": "desc", "page": page, "limit": 24,
-        })
+        fb = "%s:%s:%s" % (etype, marker, eid)
+        # 可用性 → filter_by 第4段（网页同款：p可播放/m含磁链/c含字幕）
+        avail = _to_text(fs.get("avail") or "")
+        if avail in ("p", "m", "c"):
+            fb += ":" + avail
+        # 标签组 → filter_by_tags（逗号连接 = AND；main/year/month 不被接受故已排除）
+        tag_ids = []
+        for g in (self._entity_tag_groups() or []):
+            v = _to_text(fs.get(_to_text(g.get("key") or "")) or "")
+            if v:
+                tag_ids.append(v)
+        params = {"filter_by": fb, "sort_by": "release", "order_by": "desc",
+                  "page": page, "limit": 24}
+        if tag_ids:
+            params["filter_by_tags"] = ",".join(tag_ids)
+        movies_data = self._api_get("/v1/movies/tags", params)
         lst = self._movies_to_list(movies_data.get("movies"))
         return self._page_result(lst, page)
 
@@ -1369,11 +1405,11 @@ class Spider:
 
         # ---- folder 下一层：演员/系列/片商 → 该实体的影片海报网格 ----
         if t.startswith("actor_"):
-            return self._entity_movies_grid("a", t[len("actor_"):], page)
+            return self._entity_movies_grid("a", t[len("actor_"):], page, fs)
         if t.startswith("series_"):
-            return self._entity_movies_grid("s", t[len("series_"):], page)
+            return self._entity_movies_grid("s", t[len("series_"):], page, fs)
         if t.startswith("maker_"):
-            return self._entity_movies_grid("m", t[len("maker_"):], page)
+            return self._entity_movies_grid("m", t[len("maker_"):], page, fs)
 
         # ---- 兜底：其它 id 按「全部」处理 ----
         return self._latest_list(fs, page)
