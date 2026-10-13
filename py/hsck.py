@@ -21,6 +21,8 @@ VERSION = "1.0.5"
 #   热播分类筛选加"热门视频/热门磁力"（名称对应网页导航）。
 # v1.0.5，ATVP 适配：无 siteKey 时图片直接返回原图地址（pic.892539.xyz 明文直链，
 #   App 可直接加载，绕开 localProxy 路由）；有 siteKey 仍走 localProxy。
+#   热播筛选同步到 "all" 键（部分 ATVP 版本读 all 而非 hot）；115离线选集保持现状
+#   （TVBox 只在同源 2+ 集时显示选集）。
 import os
 import re
 import json
@@ -934,8 +936,8 @@ class Spider:
             pass
         if not classes:
             classes = [{"type_id": "hot", "type_name": "热播"}]
-        # 首页/热播：同时含在线视频和磁力
-        # 筛选项名称与网页导航对应：热门视频 / 热门磁力
+        # 热播筛选：热门视频 / 热门磁力（名称对应网页导航）
+        # 其余分类：在线 / 磁力
         for c in classes:
             tid = c["type_id"]
             name = _to_text(c.get("type_name") or "")
@@ -960,8 +962,10 @@ class Spider:
                 "key": "kind", "name": "内容", "init": "",
                 "value": opts,
             }]
+        # ATVP 某些版本读 "all" 而非 "hot" → 同步一份，提高兼容性
+        if "hot" in filters and "all" not in filters:
+            filters["all"] = list(filters["hot"])
         return {"class": classes, "filters": filters}
-
     def homeVideoContent(self):
         # 优先首页推荐列表（站点首页已有视频卡片）
         html = self._fetch(self.host + "/")
