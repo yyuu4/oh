@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 # v1.0.0，基础版：首页/分类(base64导航)、列表分页、详情(play.php m3u8 / torrent磁力)、
 #   搜索(视频+磁力)、磁力公共 tracker、可选115离线、封面 localProxy。
 # v1.0.1，修复搜索sid误取导航分类id(改用redirect最终URL)；分页pagecount不再卡在当前页；
@@ -19,6 +19,8 @@ VERSION = "1.0.4"
 #   ⑧磁力保序去重；⑨图片响应补nosniff。
 # v1.0.4，修复首页图片不显示：懒加载 data-original 优先，跳过 loading.gif 占位；
 #   热播分类筛选加"热门视频/热门磁力"（名称对应网页导航）。
+# v1.0.5，ATVP 适配：无 siteKey 时图片直接返回原图地址（pic.892539.xyz 明文直链，
+#   App 可直接加载，绕开 localProxy 路由）；有 siteKey 仍走 localProxy。
 import os
 import re
 import json
@@ -556,6 +558,7 @@ class Spider:
         self.siteKey = _to_text(
             extend.get("siteKey") or extend.get("key")
             or getattr(self, "siteKey", ""))
+        self._ext_site_key = self.siteKey  # 与 _site_key() 保持一致
         if "verify" in extend:
             self.verify = bool(extend["verify"])
         if extend.get("img") or extend.get("imgProxy"):
@@ -790,14 +793,30 @@ class Spider:
         url = _to_text(url)
         if not url:
             return ""
+        if not url.startswith(("http://", "https://")):
+            return url
         p = _to_text(getattr(self, "img_proxy", ""))
         if p:
             if "{url}" in p:
                 return p.replace("{url}", quote(url, safe=""))
             return p + quote(url, safe="")
-        tok = base64.urlsafe_b64encode(url.encode("utf-8")).decode("ascii").rstrip("=")
-        return self._local_proxy_base() + self._local_proxy_qs(
-            kind="image", token=tok)
+        # 关掉代理 → 返回原始地址
+        if getattr(self, "img_proxy_off", False):
+            return url
+        # 无 siteKey（ATVP 场景）：localProxy 的 do=py 路由不中 → 直接返回原图地址，
+        # pic.892539.xyz 是明文直链，App 可直接加载，无需代理。
+        key = _to_text(getattr(self, "siteKey", "")
+                       or getattr(self, "_ext_site_key", ""))
+        if not key:
+            return url
+        # 有 siteKey（pg 场景）：走 localProxy（快、不撑大响应体积）
+        try:
+            tok = base64.urlsafe_b64encode(
+                url.encode("utf-8")).decode("ascii").rstrip("=")
+            return self._local_proxy_base() + self._local_proxy_qs(
+                kind="image", token=tok)
+        except Exception:
+            return url
 
     @staticmethod
     def _parse_proxy_param(param):
