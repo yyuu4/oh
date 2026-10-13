@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 # v1.0.0 初版：MacCMS 采集 API（list/detail/search），封面+详情+分页；hsckm3u8 直链 / hsckyun 分享页解 m3u8；分类筛选/搜索/详情/播放自检通过；
 # v1.0.1 筛选修正：站点 API 实测仅 year 有效（filter_by/sort_by/area 等均被忽略），改为年份筛选——子类直查 year，父类经子类 API 合并；
 # v1.1.0 三域名候选（hsckzy.vip / hsckzy.xyz / hsckzy001.com）自动测速切换——API 探测挑最快可用域名，失败自动跳过，extend.hosts 可覆盖；
 # v1.1.1 多域名健壮性：校验 MacCMS 响应结构（排除 Cloudflare 错误页误判成功），坏域名失败自动切换下一候选；extend.hosts 保留用户指定顺序；
+# v1.2.0 分类重构：只保留顶级分类，子分类（网红主播/国产传媒等）改为父分类下的「子分类」筛选组——选中子类直接 API 直查，选全部走父类聚合；
 # hsckvip.py —— 黄色仓库资源站 (MacCMS) 爬虫
 # 数据走 /api.php/provide/vod/ 标准采集 API；播放源为 m3u8 直链（hsckm3u8）或分享页（hsckyun，播放时解出 m3u8）。
 import os
@@ -408,37 +409,34 @@ class Spider:
 
     # ---------- 首页 ----------
     def homeContent(self, filter=None):
+        # 只保留顶级分类；子分类做成父分类下的「子分类」筛选组
         classes = []
-        # 顶级分类（父类走 HTML 聚合页，子类走 API 直查）
-        seen = set()
         for c in self._classes_raw():
-            if c["type_pid"] != 0:
-                continue
-            tid = c["type_id"]
-            if tid in seen:
-                continue
-            seen.add(tid)
-            classes.append({"type_id": tid, "type_name": c["type_name"]})
-            # 常用子类一并挂出（限量，避免分类过多）
-            for ch in self._children_of(tid)[:6]:
-                if ch["type_id"] in seen:
-                    continue
-                seen.add(ch["type_id"])
-                classes.append({"type_id": ch["type_id"],
-                                "type_name": "·" + ch["type_name"]})
+            if c["type_pid"] == 0:
+                classes.append({"type_id": c["type_id"],
+                                "type_name": c["type_name"]})
 
-        # 年份筛选（采集 API 实测仅 year 有效；filter_by/sort_by/area 等均被忽略）
+        # 年份筛选（采集 API 实测仅 year 有效）
         year_now = time.localtime().tm_year
         year_vals = [{"n": "全部", "v": ""}]
         for y in range(year_now, year_now - 6, -1):
             year_vals.append({"n": str(y), "v": str(y)})
+
         filters = {}
         for c in classes:
-            # 父分类走 HTML 聚合，year 需经子类 API 合并；子类直接传 year
-            filters[c["type_id"]] = [
-                {"key": "year", "name": "年份", "init": "",
-                 "value": list(year_vals)},
-            ]
+            groups = []
+            # 子分类筛选组（仅父分类有子类时才挂）
+            children = self._children_of(c["type_id"])
+            if children:
+                sub_vals = [{"n": "全部", "v": ""}]
+                for ch in children:
+                    sub_vals.append({"n": ch["type_name"],
+                                     "v": ch["type_id"]})
+                groups.append({"key": "sub", "name": "子分类", "init": "",
+                               "value": sub_vals})
+            groups.append({"key": "year", "name": "年份", "init": "",
+                           "value": list(year_vals)})
+            filters[c["type_id"]] = groups
         return {"class": classes, "filters": filters}
 
     def homeVideoContent(self):
@@ -548,6 +546,12 @@ class Spider:
         year = _to_text(fs.get("year") or "")
         if re.match(r"^\d{4}$", year):
             params["year"] = year
+
+        # 子分类筛选：选中具体子类 → 直接走 API t=子类
+        sub = _to_text(fs.get("sub") or "")
+        if re.match(r"^\d+$", sub):
+            params["t"] = sub
+            return self._detail_page(params, page)
 
         # 数字分类 id
         if re.match(r"^\d+$", t):
