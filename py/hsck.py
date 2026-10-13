@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.0.2"
+VERSION = "1.0.4"
 # v1.0.0，基础版：首页/分类(base64导航)、列表分页、详情(play.php m3u8 / torrent磁力)、
 #   搜索(视频+磁力)、磁力公共 tracker、可选115离线、封面 localProxy。
 # v1.0.1，修复搜索sid误取导航分类id(改用redirect最终URL)；分页pagecount不再卡在当前页；
@@ -10,6 +10,15 @@ VERSION = "1.0.2"
 #   磁力/在线分类只展示对应筛选项；_detail_magnet的115离线ID改用干净磁力(不带tracker)；
 #   115提交前强制去tracker；resolve补type/flv；统一走_off_cache_put；
 #   视频详情仅磁力且双关时回退磁力源，避免空播放源。
+# v1.0.3，移植javdbui/javbus-liangzai实测坑修复：
+#   ①type动态挑选防本地代理劫持(硬编码THUNDER会被开代理的宿主转圈)；
+#   ②_play_offline_safe异常一律转msg，绝不静默转圈；
+#   ③编码改强制utf-8(明显提速)；④播放成功后释放115会话内存(防4G盒子OOM重启)；
+#   ⑤冷启动先搜网盘再提交(dn/title三线索，能不提交就不提交)；
+#   ⑥localProxy补siteKey(多站点路由)；⑦ATVP环境cookie优先级反转；
+#   ⑧磁力保序去重；⑨图片响应补nosniff。
+# v1.0.4，修复首页图片不显示：懒加载 data-original 优先，跳过 loading.gif 占位；
+#   热播分类筛选加"热门视频/热门磁力"（名称对应网页导航）。
 import os
 import re
 import json
@@ -67,10 +76,20 @@ OFFLINE_ADD_API = "https://115.com/web/lixian/?ct=lixian&ac=add_task_urls"
 OFFLINE_LIST_API = "https://115.com/web/lixian/?ct=lixian&ac=task_lists"
 OFFLINE_POLL_TIMEOUT = 15
 OFFLINE_POLL_INTERVAL = 1
+OFFLINE_VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".flv", ".ts", ".m4v",
+                      ".wmv", ".rm", ".rmvb", ".iso", ".mpg", ".mpeg", ".3gp",
+                      ".webm", ".m2ts", ".vob", ".mp2")
 
 
 def _to_text(v):
     return str(v or "").strip()
+
+
+def _env(name, default=""):
+    try:
+        return os.environ.get(name, default) or default
+    except Exception:
+        return default
 
 
 def _safe_int(v, default=0):
@@ -152,6 +171,17 @@ def _normalize_magnet(magnet):
 def _magnet_hash(magnet):
     m = re.search(r"btih:([0-9a-fA-F]{40}|[0-9a-zA-Z]{32})", magnet or "")
     return m.group(1).lower() if m else ""
+
+
+def _magnet_dn(magnet):
+    """磁力 dn= 显示名（115 搜网盘的第三线索）。"""
+    m = re.search(r"[?&]dn=([^&]+)", magnet or "")
+    if not m:
+        return ""
+    try:
+        return unquote(m.group(1)).replace("+", " ").strip()
+    except Exception:
+        return ""
 
 
 def _magnet_clean(magnet):
@@ -425,6 +455,8 @@ class Spider:
         self.offline_timeout = 12
         self.offline_proxy = ""
         self.offline_debug = True
+        self.offline_local_proxy_cfg = ""
+        self.siteKey = ""
 
         self._categories_cache = None
         self._off_cache = {}
@@ -441,6 +473,11 @@ class Spider:
 
     def getDependence(self):
         return []
+
+    @staticmethod
+    def _in_atvp():
+        """跑在 alist-tvbox 的 Atvp 包装里？那边不认 ext.cookie115。"""
+        return __name__ == "atvp_inner_spider"
 
     # ---------- extend ----------
     @staticmethod
@@ -489,11 +526,21 @@ class Spider:
             self.enable_magnet = bool(extend["enableMagnet"])
         if "enableOffline115" in extend:
             self.enable_offline_115 = bool(extend["enableOffline115"])
-        if extend.get("cookie115"):
-            self.cookie_115 = str(extend["cookie115"])
-        elif os.environ.get("Y115_COOKIE") or os.environ.get("MY115_COOKIE"):
-            self.cookie_115 = (os.environ.get("Y115_COOKIE")
-                               or os.environ.get("MY115_COOKIE"))
+        # ATVP 包装里 ext.cookie115 不被注入，cookie 优先级要反过来
+        if self._in_atvp():
+            self.cookie_115 = (
+                _env("Y115_COOKIE")
+                or _env("MY115_COOKIE")
+                or DEFAULT_COOKIE_115
+                or _to_text(extend.get("cookie115"))
+            )
+        else:
+            self.cookie_115 = (
+                _to_text(extend.get("cookie115"))
+                or _env("Y115_COOKIE")
+                or _env("MY115_COOKIE")
+                or DEFAULT_COOKIE_115
+            )
         if extend.get("offlineSavePath"):
             self.offline_save_path = str(extend["offlineSavePath"])
         if extend.get("offlineAppVer"):
@@ -503,6 +550,12 @@ class Spider:
         if "offlineDebug" in extend:
             self.offline_debug = str(extend.get("offlineDebug")).lower() not in (
                 "0", "false", "off", "no")
+        # Atvp 会把 local_proxy_config 注入本 ext；115 直链 type 动态挑选靠它
+        self.offline_local_proxy_cfg = extend.get("local_proxy_config") or ""
+        # siteKey：App 在 init 前注入；localProxy URL 带上它才能路由回本爬虫
+        self.siteKey = _to_text(
+            extend.get("siteKey") or extend.get("key")
+            or getattr(self, "siteKey", ""))
         if "verify" in extend:
             self.verify = bool(extend["verify"])
         if extend.get("img") or extend.get("imgProxy"):
@@ -567,7 +620,7 @@ class Spider:
                     continue
                 if r.status_code != 200:
                     return "", ""
-                r.encoding = r.apparent_encoding or "utf-8"
+                r.encoding = "utf-8"
                 return r.text, _to_text(r.url)
             except Exception:
                 if attempt < retries:
@@ -626,11 +679,18 @@ class Spider:
             if not a_match:
                 continue
             href = a_match.group(1).strip()
-            img_match = re.search(
-                r'<img[^>]+(?:data-original|src)="([^"]+)"', card)
+            # 懒加载：优先 data-original（真实图），src 常是 loading.gif 占位
+            img_match = re.search(r'data-original="([^"]+)"', card)
+            if not img_match:
+                img_match = re.search(r'<img[^>]+src="([^"]+)"', card)
             pic = img_match.group(1) if img_match else ""
+            # 跳过占位图 / loading.gif
+            if pic and ("loading" in pic.lower() or "placeholder" in pic.lower()):
+                pic = ""
             if pic.startswith("/"):
                 pic = self.host + pic
+            if pic.startswith("//"):
+                pic = "https:" + pic
 
             title = ""
             title_match = re.search(r'<h3 class="name">(.*?)</h3>', card, re.S)
@@ -695,6 +755,37 @@ class Spider:
         return items, total
 
     # ---------- 图片 ----------
+    def _local_proxy_base(self):
+        """localProxy 基址三层救援（32位 OK影视 不转 proxy://，必须给 http://）。"""
+        try:
+            from com.github.catvod import Proxy
+            port = int(Proxy.getPort() or 0)
+        except Exception:
+            port = 0
+        if port > 0:
+            return "http://127.0.0.1:%d/proxy?" % port
+        try:
+            from com.github.catvod import Proxy
+            getter = getattr(Proxy, "getUrl", None)
+            u = _to_text(getter() if getter else "")
+            if u.startswith(("http://", "https://")):
+                return u + ("&" if "?" in u else "?")
+        except Exception:
+            pass
+        return "proxy://?"
+
+    def _local_proxy_qs(self, **kv):
+        """构造 localProxy query string，自动带 siteKey（多站点路由必需）。"""
+        parts = ["do=py"]
+        key = _to_text(getattr(self, "siteKey", ""))
+        if key:
+            parts.append("siteKey=" + quote(key, safe=""))
+        for k, v in kv.items():
+            if v is None or v == "":
+                continue
+            parts.append("%s=%s" % (k, quote(_to_text(v), safe="")))
+        return "&".join(parts)
+
     def _proxy_pic(self, url):
         url = _to_text(url)
         if not url:
@@ -704,26 +795,9 @@ class Spider:
             if "{url}" in p:
                 return p.replace("{url}", quote(url, safe=""))
             return p + quote(url, safe="")
-        try:
-            from com.github.catvod import Proxy
-        except Exception:
-            return url
-        try:
-            port = int(Proxy.getPort() or 0)
-        except Exception:
-            port = 0
         tok = base64.urlsafe_b64encode(url.encode("utf-8")).decode("ascii").rstrip("=")
-        if port > 0:
-            return "http://127.0.0.1:%d/proxy?do=py&kind=image&token=%s" % (port, quote(tok, safe=""))
-        try:
-            getter = getattr(Proxy, "getUrl", None)
-            u = _to_text(getter() if getter else "")
-            if u.startswith(("http://", "https://")):
-                base = u + ("&" if "?" in u else "?") + "do=py"
-                return base + "&kind=image&token=%s" % quote(tok, safe="")
-        except Exception:
-            pass
-        return "proxy://do=py&kind=image&token=%s" % quote(tok, safe="")
+        return self._local_proxy_base() + self._local_proxy_qs(
+            kind="image", token=tok)
 
     @staticmethod
     def _parse_proxy_param(param):
@@ -781,6 +855,7 @@ class Spider:
                 "Cache-Control": "public, max-age=1800",
                 "Access-Control-Allow-Origin": "*",
                 "Content-Length": str(len(body)),
+                "X-Content-Type-Options": "nosniff",
             }]
         return [404, "text/plain", b"Not Found", {}]
 
@@ -840,11 +915,18 @@ class Spider:
             pass
         if not classes:
             classes = [{"type_id": "hot", "type_name": "热播"}]
-        # 按分类实际内容定制筛选：磁力分类只出磁力，视频分类只出在线，混合给全部
+        # 首页/热播：同时含在线视频和磁力
+        # 筛选项名称与网页导航对应：热门视频 / 热门磁力
         for c in classes:
             tid = c["type_id"]
             name = _to_text(c.get("type_name") or "")
-            if tid == "hot" or "磁力" in name:
+            if tid == "hot":
+                opts = [
+                    {"n": "全部", "v": ""},
+                    {"n": "热门视频", "v": "video"},
+                    {"n": "热门磁力", "v": "magnet"},
+                ]
+            elif "磁力" in name:
                 opts = [
                     {"n": "全部", "v": ""},
                     {"n": "磁力", "v": "magnet"},
@@ -1123,8 +1205,17 @@ class Spider:
             if full not in play_links:
                 play_links.append(full)
 
-        magnets = set(re.findall(
-            r"(magnet:\?xt=urn:btih:[A-Za-z0-9]+[^\s\"'<>]*)", html or ""))
+        # 磁力保序去重（set+sorted 顺序不稳定，站点原始顺序更符合用户预期）
+        magnets = []
+        _mag_seen = set()
+        for mag in re.findall(
+                r"(magnet:\?xt=urn:btih:[A-Za-z0-9]+[^\s\"'<>]*)", html or ""):
+            h = _magnet_hash(mag)
+            if h and h in _mag_seen:
+                continue
+            if h:
+                _mag_seen.add(h)
+            magnets.append(mag)
         media = set(re.findall(
             r"https?://[^\s\"'<>]+\.(?:m3u8|mp4|flv|ts)(?:\?[^\s\"'<>]*)?",
             html or ""))
@@ -1147,7 +1238,7 @@ class Spider:
             play_url.append("#".join(eps))
         if magnets and self.enable_magnet:
             eps = []
-            for i, mag in enumerate(sorted(magnets)):
+            for i, mag in enumerate(magnets):
                 clean = _magnet_clean(mag)
                 play_mag = _magnet_play_url(clean)
                 label = "磁力%d" % (i + 1)
@@ -1156,7 +1247,7 @@ class Spider:
             play_url.append("#".join(eps))
         if magnets and self.enable_offline_115:
             off_eps = []
-            for i, mag in enumerate(sorted(magnets)):
+            for i, mag in enumerate(magnets):
                 clean = _magnet_clean(mag)
                 label = "磁力%d" % (i + 1)
                 b64 = _off_id_encode(clean, title, label)
@@ -1167,7 +1258,7 @@ class Spider:
         if magnets and not play_from:
             # 视频详情里只有磁力、且磁力/离线都关时，回退磁力避免空源
             eps = []
-            for i, mag in enumerate(sorted(magnets)):
+            for i, mag in enumerate(magnets):
                 clean = _magnet_clean(mag)
                 play_mag = _magnet_play_url(clean)
                 label = "磁力%d" % (i + 1)
@@ -1194,9 +1285,16 @@ class Spider:
             magnet, title, label = _off_id_decode(vid[len(OFF_PREFIX_115):])
             if not magnet:
                 return _play_err("磁力解码失败")
-            return self._play_offline(magnet, title, label)
+            res = self._play_offline_safe(magnet, title, label)
+            if res.get("url"):
+                # 播放成功后释放 115 会话内存（防 4G 盒子 OOM）
+                self._release_play_memory()
+            return res
         if vid.startswith("115off:"):
-            return self._play_offline(vid[len("115off:"):].strip())
+            res = self._play_offline_safe(vid[len("115off:"):].strip())
+            if res.get("url"):
+                self._release_play_memory()
+            return res
         if vid.startswith("magnet:"):
             m = _magnet_play_url(vid)
             return {
@@ -1218,6 +1316,97 @@ class Spider:
         return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {}}
 
     # ---------- 115 离线（精简核心链路） ----------
+    @staticmethod
+    def _offline_alt_types():
+        """本地代理可劫持的类型（Atvp local_proxy_config 常见键）。"""
+        return ("THUNDER", "PAN123", "PAN139", "BAIDU",
+                "GUANGYA", "UC", "QUARK", "ALI", "PAN115", "CLOUD189")
+
+    def _offline_no_proxy_type(self):
+        """
+        选一个「未被本地代理启用」的 type 给 115 直链，
+        防止 ATVP/影视自带 local_proxy 把 115 直链劫持到本地代理层。
+        参考 javdbui _offline_no_proxy_type / javbus-liangzai。
+        """
+        cfg = _to_text(self.offline_local_proxy_cfg)
+        if not cfg:
+            return "THUNDER"
+        # local_proxy_config 允许是 JSON / json5 / 简单 key=value 列表
+        enabled = set()
+        try:
+            obj = json.loads(cfg)
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            # 形态1: {"THUNDER": true, ...} 或 {"proxy": {"THUNDER": true}}
+            pool = obj.get("proxy") if isinstance(obj.get("proxy"), dict) else obj
+            for k, v in pool.items():
+                if str(k).upper() in self._offline_alt_types() and v:
+                    enabled.add(str(k).upper())
+        elif isinstance(obj, list):
+            for v in obj:
+                u = _to_text(v).upper()
+                if u in self._offline_alt_types():
+                    enabled.add(u)
+        else:
+            # 兜底：从原始文本里抽启用的类型名
+            for t in self._offline_alt_types():
+                # 形态2: "THUNDER":true / THUNDER=1 / proxy_list: THUNDER
+                if re.search(r"%s[\"']?\s*[:=]\s*(true|1|on|yes)" % t,
+                             cfg, re.I) or re.search(
+                    r"\b%s\b" % t, cfg):
+                    # 明确写了 false 就不算
+                    m = re.search(
+                        r"%s[\"']?\s*[:=]\s*(false|0|off|no)" % t, cfg, re.I)
+                    if not m:
+                        enabled.add(t)
+        for t in self._offline_alt_types():
+            if t not in enabled:
+                return t
+        # 全被启用：退回第一个
+        return self._offline_alt_types()[0]
+
+    def _offline_srt(self, text):
+        """纯文本 → srt 字幕体（部分播放器可直接加载）。"""
+        text = _to_text(text)
+        if not text:
+            return ""
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        out = []
+        for i, l in enumerate(lines, 1):
+            out.append(str(i))
+            out.append("00:00:%02d,000 --> 00:00:%02d,000"
+                       % (min(i - 1, 59), min(i, 59)))
+            out.append(l)
+            out.append("")
+        return "\n".join(out)
+
+    def _offline_hint(self):
+        """离线提示（成功走 desc+subs，绝不能走 msg）。"""
+        return "115离线：%s" % (self.offline_save_path or "/115影视")
+
+    def _release_play_memory(self):
+        """
+        播放成功后释放 115 会话 + 缓存，防 4G 盒子连续快进 OOM。
+        参考 javbus-liangzai _release_play_memory L1853。
+        """
+        try:
+            if self.s115 is not None:
+                self.s115.close()
+        except Exception:
+            pass
+        self.s115 = None
+        try:
+            self._off_cache.clear()
+            self._off_name.clear()
+        except Exception:
+            pass
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+
     def _offline_session(self):
         if self.s115 is not None:
             return self.s115
@@ -1380,8 +1569,8 @@ class Spider:
                 "Cookie": final_cookie,
                 "Referer": "https://115.com/",
             },
-            # 115 直链走云盘专用通道，避免被本地代理劫持
-            "type": "THUNDER",
+            # 115 直链走云盘专用通道；type 动态挑选，防本地代理劫持
+            "type": self._offline_no_proxy_type(),
         }
         if fmt:
             result["format"] = fmt
@@ -1396,9 +1585,81 @@ class Spider:
             self._off_cache.pop(old, None)
             self._off_name.pop(old, None)
 
+    def _guess_keyword_from_name(self, name):
+        """
+        从磁力 dn / 任务名猜搜索关键词（去掉番号分隔符、清晰度、扩展名）。
+        参考 javbus-liangzai _guess_keyword_from_name L2000。
+        """
+        n = _to_text(name)
+        if not n:
+            return ""
+        n = re.sub(
+            r"\.(mp4|mkv|avi|mov|flv|ts|m4v|wmv|rmvb?|iso|mpg|mpeg|3gp|"
+            r"webm|m2ts|vob|mp2|part\d*)$", "", n, flags=re.I)
+        n = re.sub(r"\b(1080p?|720p?|2160p?|4k|8k|bluray|bd|web-?dl|"
+                   r"hdtv|hdrip|x26[45]|hevc|aac|dts|h26[45])\b", "", n,
+                   flags=re.I)
+        n = re.sub(r"[\[\(\{【（].{0,30}?[\]\)\}】）]", " ", n)
+        n = re.sub(r"[_\-\s\.]+", " ", n).strip()
+        n = re.sub(r"\s{2,}", " ", n)
+        return n.strip()[:60]
+
+    def _search_video(self, keyword):
+        """
+        115 网盘内搜文件（webapi v2 文件搜索），命中则直接拿 pickcode。
+        参考 javbus-liangzai _search_video L2976 / _offline_webapi。
+        """
+        sess = self._offline_session()
+        if sess is None or not keyword:
+            return []
+        url = "https://webapi.115.com/files/search"
+        params = {
+            "search_value": keyword,
+            "file_list": "1",
+            "limit": "50",
+            "offset": "0",
+            "type": "0",
+        }
+        try:
+            r = sess.get(url, params=params, headers=self._offline_headers(),
+                         timeout=self.offline_timeout, verify=self.verify)
+            data = r.json()
+        except Exception:
+            return []
+        out = []
+        rows = data.get("data") or []
+        if isinstance(rows, list):
+            out = [x for x in rows if isinstance(x, dict)]
+        return out
+
+    def _offline_search_hit(self, keyword):
+        """
+        搜网盘 → 匹配视频扩展名 → 返回 (pickcode, name)。
+        参考 javbus-liangzai _search_rows。
+        """
+        rows = self._search_video(keyword)
+        if not rows:
+            return "", ""
+        kw = _to_text(keyword).lower()
+        best_pc, best_name, best_score = "", "", 0
+        for row in rows:
+            n = _to_text(row.get("n") or row.get("name") or "")
+            pc = _to_text(row.get("pc") or row.get("pick_code") or "")
+            ico = _to_text(row.get("ico") or row.get("ext") or "")
+            low = n.lower()
+            ext_ok = (low.endswith(OFFLINE_VIDEO_EXTS)
+                      or ico.lower() in [e.lstrip(".") for e in OFFLINE_VIDEO_EXTS])
+            if not pc or not ext_ok:
+                continue
+            score = 2 if kw and kw in low else 1
+            if score > best_score:
+                best_pc, best_name, best_score = pc, n, score
+        return best_pc, best_name
+
     def _play_offline(self, magnet, title="", label=""):
         t0 = time.time()
         # 115 提交用干净磁力（仅 btih，不带 tracker，避免 hash 匹配问题）
+        magnet_raw = _to_text(magnet)
         magnet = _magnet_clean(magnet)
         info_hash = _magnet_hash(magnet)
         if not info_hash:
@@ -1415,6 +1676,22 @@ class Spider:
                 return res
             self._off_cache.pop(info_hash, None)
             self._off_name.pop(info_hash, None)
+
+        # 冷启动先搜网盘（dn/title 三线索），能不提交就不提交
+        # 参考 javbus-liangzai L3036-3074
+        dn = _magnet_dn(magnet_raw)
+        for kw in (dn, title, self._guess_keyword_from_name(dn or title)):
+            if not kw:
+                continue
+            try:
+                pc_hit, name_hit = self._offline_search_hit(kw)
+            except Exception:
+                pc_hit, name_hit = "", ""
+            if pc_hit:
+                self._off_cache_put(info_hash, pc_hit, name_hit)
+                res = self._resolve_pickcode(pc_hit)
+                if res.get("url"):
+                    return res
 
         task = None
         try:
@@ -1468,17 +1745,14 @@ class Spider:
                     time.time() - t0,
                     ("\n" + _to_text(name_or_msg)) if name_or_msg else "")
                 res["desc"] = note
-                # 字幕提示（复用 localProxy offnote），部分播放器可显示
-                try:
-                    from com.github.catvod import Proxy
-                    port = int(Proxy.getPort() or 0)
-                except Exception:
-                    port = 0
-                if port > 0:
-                    q = "do=py&k=offnote&v=%s" % quote(note, safe="")
+                srt = self._offline_srt(note)
+                if srt:
+                    tok = base64.urlsafe_b64encode(
+                        srt.encode("utf-8")).decode("ascii").rstrip("=")
                     res["subs"] = [{
                         "name": "115离线",
-                        "url": "http://127.0.0.1:%d/proxy?%s" % (port, q),
+                        "url": self._local_proxy_base() + self._local_proxy_qs(
+                            k="offnote", v=tok),
                         "lang": "zh",
                         "format": "application/x-subrip",
                         "flag": 0,
@@ -1486,6 +1760,16 @@ class Spider:
             except Exception:
                 pass
         return res
+
+    def _play_offline_safe(self, magnet, title="", label=""):
+        """
+        _play_offline 异常兜底：任何异常一律转 msg，绝不静默转圈。
+        参考 javbus-liangzai _play_offline_safe L2932。
+        """
+        try:
+            return self._play_offline(magnet, title, label)
+        except Exception as e:
+            return _play_err("115离线异常: %s" % e)
 
     # ---------- 基础接口 ----------
     def isVideoFormat(self, url):
@@ -1524,11 +1808,26 @@ if __name__ == "__main__":
     print("VERSION", VERSION)
     print("cookie115", "SET" if sp.cookie_115 else "EMPTY",
           "| offline", sp.enable_offline_115, "| magnet", sp.enable_magnet)
+    print("no_proxy_type", sp._offline_no_proxy_type(),
+          "| siteKey", repr(sp.siteKey))
     hc = sp.homeContent()
     print("classes", [(c["type_id"], c["type_name"]) for c in (hc.get("class") or [])])
+    f_hot = (hc.get("filters") or {}).get("hot") or []
+    vals_hot = [x.get("v") for g in f_hot for x in g.get("value", [])]
+    print("hot filter opts", vals_hot)
     hv = sp.homeVideoContent()
-    print("homeVideo", len(hv.get("list") or []),
-          (hv.get("list") or [{}])[0].get("vod_name", "")[:40])
+    hlist = hv.get("list") or []
+    print("homeVideo", len(hlist), (hlist[0].get("vod_name") if hlist else "")[:40])
+    pic0 = (hlist[0].get("vod_pic") or "") if hlist else ""
+    print("pic0", pic0[:100])
+    print("pic placeholder?", "loading" in pic0.lower() if pic0 else "EMPTY")
+    n_real = sum(1 for it in hlist
+                 if it.get("vod_pic") and "loading" not in it["vod_pic"].lower())
+    print("home pics real", n_real, "/", len(hlist))
+    # hot 筛选：video / magnet
+    for kind in ("video", "magnet"):
+        rf = sp.categoryContent("hot", "1", {"kind": kind}, {})
+        print("hot filter", kind, len(rf.get("list") or []))
     for c in (hc.get("class") or []):
         tid = c["type_id"]
         try:
@@ -1648,5 +1947,31 @@ if __name__ == "__main__":
               "sid cached?", "zzzznotexist999" in sp._search_list_id)
     except Exception as e:
         print("empty search ERR", e)
+    # v1.0.3 新增自检
+    try:
+        sp.offline_local_proxy_cfg = '{"THUNDER": true, "ALI": true}'
+        print("no_proxy_type (THUNDER+ALI on)",
+              sp._offline_no_proxy_type())  # 应避开 THUNDER/ALI
+        sp.offline_local_proxy_cfg = ""
+        print("no_proxy_type (empty cfg)",
+              sp._offline_no_proxy_type())  # THUNDER
+        # 释放内存幂等
+        sp._release_play_memory()
+        sp._release_play_memory()
+        print("release memory ok s115=", sp.s115)
+        # 搜网盘关键词猜测
+        print("guess kw", repr(sp._guess_keyword_from_name(
+            "SSIS-001.1080p.mp4")))
+        print("magnet dn", repr(_magnet_dn(
+            "magnet:?xt=urn:btih:" + "a" * 40 + "&dn=Hello+World")))
+        # 安全包装：异常路径
+        sp2 = Spider()
+        sp2.init("")
+        sp2.enable_offline_115 = True
+        sp2.cookie_115 = ""
+        bad = sp2._play_offline_safe("magnet:?xt=urn:btih:" + "b" * 40)
+        print("safe err has msg?", bool(bad.get("msg")))
+    except Exception as e:
+        print("v103 self-test ERR", e)
     sp.destroy()
     print("DONE")
