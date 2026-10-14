@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.0.4"
+VERSION = "1.0.5"
+# v1.0.5 播放默认走直链（再修 OK影视 转圈）：CDN 实测无 UA/Referer 校验、m3u8 无广告无 DRM，
+#          localProxy 在播放关键路径上只会增加不确定性（部分宿主 do=py 参数路由/多 & 截断）——
+#          默认 stripAds=false 直链播放；要清洗可 ext.stripAds=true（拿不到 127.0.0.1 端口自动回退直链）；
+#          playerContent 兼容旧版/App 缓存的 proxy 播放地址：从 token 还原真实 m3u8 直接播。
 # v1.0.4 修播放转圈圈（OK影视等宿主）：playerContent 不再返回 proxy://do=py——
 #          部分宿主不转换该协议的视频请求（hsckvip v1.3.1 同款问题）；
 #          改为优先 http://127.0.0.1:{port}/proxy?do=py（Proxy.getPort()），
@@ -67,7 +71,7 @@ except Exception:
 #     "proxy": "http://127.0.0.1:7890",
 #     "verify": false,
 #     "cookie": "",
-#     "stripAds": true,
+#     "stripAds": false    # true=播放走 localProxy 清洗（默认直链：本站无广告且部分宿主不认代理地址）,
 #     "probe": false,      # true=先测速选最快入口（默认懒探测）
 #     "noCache": false     # true=关掉磁盘缓存（/tmp/hsckcc_cache.json）
 #   }
@@ -183,7 +187,7 @@ class Spider:
         self.verify = False
         self.proxy = ""
         self.prefer_m3u8 = True
-        self.strip_ads = True
+        self.strip_ads = False  # 本站 m3u8 无广告分片 → 默认直链（localProxy 只作 ext.stripAds=true 可选）
         self._class_cache = []
         self._host_locked = False
         self._probed = False
@@ -1173,6 +1177,27 @@ class Spider:
             return proxy, True
         return _to_text(src), False
 
+    def _src_from_proxy_url(self, url):
+        """从 localProxy 播放地址（…/proxy?…&kind=m3u8&token=b64 或旧版 proxy://…）
+        还原真实 m3u8。用于兼容旧版/App 缓存下来的播放串。"""
+        u = _to_text(url)
+        if u.startswith("proxy://"):
+            qs = u[len("proxy://"):]
+        elif "?" in u:
+            qs = u.split("?", 1)[1]
+        else:
+            return ""
+        p = self._parse_proxy_param(qs)
+        tok = _to_text(p.get("token") or "")
+        if not tok:
+            return ""
+        pad = "=" * (-len(tok) % 4)
+        try:
+            src = base64.urlsafe_b64decode(tok + pad).decode("utf-8")
+        except Exception:
+            return ""
+        return src if src.startswith(("http://", "https://")) else ""
+
     @staticmethod
     def _main_path_from_m3u8(url):
         """由 m3u8 URL 推导正片段路径前缀（不含文件名）"""
@@ -1285,6 +1310,13 @@ class Spider:
         vid = _to_text(vid)
         if not vid:
             return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {}}
+
+        # 旧版/App 缓存下来的 localProxy 播放地址 → 还原真实 m3u8 直接播
+        # （proxy:// 绝不交给播放器：OK影视等宿主不转换该协议）
+        if vid.startswith("proxy://") or "kind=m3u8" in vid or "/proxy?" in vid:
+            real = self._src_from_proxy_url(vid)
+            if real:
+                vid = real
 
         # m3u8 / mp4 等直链
         if vid.startswith(("http://", "https://")):
