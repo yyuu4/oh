@@ -1,53 +1,15 @@
-"""黄果剧场 (huangguo.video) Python 点播爬虫（fongmi / OK影视 适配，Chaquopy）
-
-站点结构：
-- 列表/分类：/videos?category=all|1|2|3|4&page=N，卡片 <article class="video-card">
-- 最新发布：/videos（不带 category，即网页首页「最新发布」区块内容）
-- 搜索：/search?q=xx，结果卡片 <article class="search-content-card">
-- 视频详情：/video/xxx，播放地址在 data-hls（.../master.m3u8），海报在 data-poster
-- 连续剧详情：/series/xxx，剧集列表为 a.series-ep-chip（title="第N集 · 时长"）
-- 播放链路：data-hls 是 master.m3u8（目前仅 480p 一个 variant，绝对地址在 cdn.huangguo.video，
-  整条流 AES-128 加密）。播放器直接吃 master 常因不跟随 variant 而黑屏，故在 playerContent 里
-  解析 master、挑一个具体 variant 播放列表返回。CDN 段与 /api/hls_key 均无需 Referer 即可 200。
-
-网络层：优先使用 fongmi 提供的 OkHttp Java 桥（com.github.catvod.net.OkHttp），
-这是 Chaquopy 环境下唯一稳定可用的出站 HTTP 方式；仅在本地无 OkHttp 时回退 urllib。
-请求超时 20 秒，失败自动重试 2 次（间隔递增）。m3u8 请求使用简化请求头避免 CDN 防护。
-缓存机制：HLS 地址、variant 解析结果、详情页均缓存，重复请求 0 延迟。
-任何一步失败都会把错误放进 msg 返回，而不是静默空白/永久转圈。
-
-配置示例（放进 TVBox 主配置 "sites" 数组，把本文件放到 ./vod/ 目录）：
-[
-  {
-    "key": "huangguo",
-    "name": "黄果剧场",
-    "type": 3,
-    "api": "./vod/huangguo_spider.py",
-    "lang": "zh-CN",
-    "searchable": 1,
-    "quickSearch": 1,
-    "filterable": 0,
-    "changeable": 0,
-    "style": { "type": "rect", "ratio": 0.75 }
-  }
-]
-
-分类由 homeContent() 动态返回（最新发布/全部视频/MV/音乐剧/短片/连续剧/片段），无需写死 classes。
-该站含限制级内容，卡片会把标记透传到 vod_remarks，可自行过滤。
-"""
-
 import re
 import json
 from urllib.parse import quote
 
 try:
     from base.spider import Spider as BaseSpider
-except Exception:  # 独立运行（本机校验）时兜底
+except Exception:
     BaseSpider = object
 
 BASE = "https://huangguo.video"
 PAGE_SIZE = 20
-# 第一个栏目 = 最新发布（映射到 /videos 不带 category）
+VERSION = "1.3.0"
 CATEGORIES = [
     {"type_id": "latest", "type_name": "最新发布"},
     {"type_id": "all", "type_name": "全部视频"},
@@ -55,13 +17,46 @@ CATEGORIES = [
     {"type_id": "2", "type_name": "短片"},
     {"type_id": "3", "type_name": "连续剧"},
     {"type_id": "4", "type_name": "片段"},
+    {"type_id": "photos", "type_name": "图集"},
+    {"type_id": "roles", "type_name": "角色"},
+    {"type_id": "ranking", "type_name": "排行榜"},
 ]
+
+_SORT_OPTS = {"key": "sort", "name": "排序", "init": "newest",
+              "value": [
+                  {"n": "最新发布", "v": "newest"},
+                  {"n": "最多播放", "v": "views"},
+                  {"n": "最多收藏", "v": "favorites"},
+              ]}
+_RATING_OPTS = {"key": "rating", "name": "尺度", "init": "",
+                "value": [
+                    {"n": "全部", "v": ""},
+                    {"n": "安全", "v": "1"},
+                    {"n": "裸露", "v": "2"},
+                    {"n": "限制级", "v": "3"},
+                ]}
+_TAG_OPTS = {"key": "tags", "name": "标签", "init": "",
+             "value": [
+                 {"n": "全部", "v": ""},
+                 {"n": "都市", "v": "1"},
+                 {"n": "人妻", "v": "2"},
+                 {"n": "同人", "v": "4"},
+                 {"n": "校园", "v": "5"},
+                 {"n": "职场", "v": "6"},
+                 {"n": "古风", "v": "7"},
+                 {"n": "乱伦", "v": "8"},
+                 {"n": "NTR", "v": "9"},
+                 {"n": "玄幻", "v": "40"},
+                 {"n": "欧美", "v": "57"},
+             ]}
+_FILTER_KEYS = ["sort", "rating", "tags"]
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-CARD_RE = re.compile(r'<article class="(?:video-card|search-content-card)[\s\S]*?</article>')
+CARD_RE = re.compile(r'<article class="(?:video-card|search-content-card|photo-card)[\s\S]*?</article>')
+ROLE_CARD_RE = re.compile(r'<a[^>]*href="(/role/[a-z0-9-]+)"[^>]*class="[^"]*role-card[^"]*"[^>]*>')
 TITLE_RE = re.compile(r'<p class="[^"]*font-display[^"]*"[^>]*>([^<]*)</p>')
 PIC_RE = re.compile(r'<img[^>]*src="([^"]*)"')
 REMARK_RE = re.compile(r'bg-black/55[^>]*>([^<]*)<')
@@ -71,19 +66,12 @@ DESC_RE = re.compile(r'<meta name="description" content="([^"]*)"')
 OGIMG_RE = re.compile(r'<meta property="og:image" content="([^"]*)"')
 POSTER_RE = re.compile(r'data-poster="([^"]*)"')
 HLS_RE = re.compile(r'data-hls="([^"]*)"')
-TOTAL_RE = re.compile(r'(\d+)\s*集')
+TOTAL_RE = re.compile(r'全(\d+)\s*集')
 PAGER_RE = re.compile(r'href="[^"]*page=(\d+)"')
-EP_CHIP_RE = re.compile(r'<a[^>]*href="/video/([a-z0-9]+)"[^>]*class="[^"]*series-ep-chip[^"]*"[^>]*title="第(\d+)集[^"]*"')
+EP_CHIP_RE = re.compile(r'<a[^>]*href="/video/([a-z0-9-]+)"[^>]*class="[^"]*series-ep-chip[^"]*"[^>]*title="第(\d+)集[^"]*"')
 
 
 def _okhttp_get(url, referer=None, retries=2):
-    """优先 fongmi OkHttp 桥；否则回退 urllib（仅本地测试）。返回 HTML 文本。
-    
-    Args:
-        url: 请求地址
-        referer: 来源页
-        retries: 失败重试次数
-    """
     is_m3u8 = ".m3u8" in url.lower()
     if is_m3u8:
         headers = {
@@ -150,17 +138,12 @@ def _okhttp_get(url, referer=None, retries=2):
 
 
 def _http_get(url, referer=None):
-    """模块内统一同步入口（list / detail 调用）。实际走 _okhttp_get。
-
-    这样即便运行环境没有注入全局 _http_get，也能正常工作，不依赖外部全局符号。
-    """
     return _okhttp_get(url, referer=referer)
 
 
 _variant_cache = {}
 
 def _pick_variant(master_url):
-    """解析 master.m3u8，挑一个具体 variant 播放列表（绝对地址）返回；失败回退 master。"""
     if master_url in _variant_cache:
         return _variant_cache[master_url]
     try:
@@ -217,8 +200,8 @@ class Spider(BaseSpider):
                 self.options = {}
         else:
             self.options = {}
-        self._hls_cache = {}
-        self._detail_cache = {}
+        self._hls_cache = self._hls_cache or {}
+        self._detail_cache = self._detail_cache or {}
 
     def getName(self):
         return "黄果剧场"
@@ -226,7 +209,17 @@ class Spider(BaseSpider):
     def homeContent(self, filter):
         result = {"class": CATEGORIES}
         if filter:
-            result["filters"] = {}
+            result["filters"] = {
+                "latest": [_SORT_OPTS],
+                "all": [_SORT_OPTS, _RATING_OPTS, _TAG_OPTS],
+                "1": [_SORT_OPTS],
+                "2": [_SORT_OPTS],
+                "3": [_SORT_OPTS],
+                "4": [_SORT_OPTS],
+                "photos": [_SORT_OPTS],
+                "roles": [_SORT_OPTS],
+                "ranking": [_SORT_OPTS],
+            }
         return result
 
     def homeVideoContent(self):
@@ -239,9 +232,17 @@ class Spider(BaseSpider):
             }
 
     def categoryContent(self, tid, pg, filter, extend):
-        del filter, extend
+        del filter
         try:
-            return self._list(str(tid), pg, "")
+            ext = {}
+            if isinstance(extend, dict):
+                ext = extend
+            elif extend:
+                try:
+                    ext = json.loads(extend)
+                except Exception:
+                    ext = {}
+            return self._list(str(tid), pg, "", ext)
         except Exception as e:
             return {
                 "list": [], "page": 1, "pagecount": 1, "limit": PAGE_SIZE,
@@ -258,14 +259,26 @@ class Spider(BaseSpider):
                 "total": 0, "msg": "搜索失败：" + type(e).__name__,
             }
 
-    def _build_url(self, cat, pg, keyword):
+    def _build_url(self, cat, pg, keyword, ext=None):
         if cat == "latest":
             url = "%s/videos" % BASE
+        elif cat == "photos":
+            url = "%s/photos" % BASE
+        elif cat == "roles":
+            url = "%s/roles" % BASE
+        elif cat == "ranking":
+            url = "%s/ranking" % BASE
         else:
             url = "%s/videos?category=%s" % (BASE, quote(cat))
         if keyword:
             sep = "&" if "?" in url else "?"
             url += sep + "q=" + quote(keyword)
+        if ext:
+            for k in _FILTER_KEYS:
+                v = ext.get(k)
+                if v:
+                    sep = "&" if "?" in url else "?"
+                    url += sep + "%s=%s" % (k, quote(str(v)))
         page = max(1, int(pg) if str(pg).isdigit() else 1)
         if page > 1:
             sep = "&" if "?" in url else "?"
@@ -279,11 +292,38 @@ class Spider(BaseSpider):
             url += "&page=%d" % page
         return url
 
-    def _list(self, cat, pg, keyword):
-        url = self._build_url(cat, pg, keyword)
+    def _list(self, cat, pg, keyword, ext=None):
+        url = self._build_url(cat, pg, keyword, ext)
         html_text = _http_get(url, referer=BASE + "/")
-        cards = [self._parse_card(b) for b in CARD_RE.findall(html_text)]
-        cards = [c for c in cards if c]
+        if cat == "roles":
+            cards = []
+            for m in ROLE_CARD_RE.finditer(html_text):
+                code = m.group(1).rstrip("/").split("/")[-1]
+                start = m.start()
+                end = html_text.find("</a>", start)
+                if end < 0:
+                    continue
+                inner = html_text[start:end]
+                title_m = re.search(r'<p class="mt-2\.5 font-display[^"]*"[^>]*>([^<]*)</p>', inner)
+                title = title_m.group(1).strip() if title_m else ""
+                pic_m = re.search(r'background-image:url\(([^)]+)\)', inner)
+                pic = ""
+                if pic_m:
+                    pic_url = pic_m.group(1).split(",")[0].strip()
+                    pic = self._absolute(pic_url)
+                remark_m = re.search(r'bg-black/55[^>]*>([^<]*)<', inner)
+                remark = remark_m.group(1).strip() if remark_m else ""
+                cards.append({
+                    "vod_id": "role/%s" % code,
+                    "vod_name": title,
+                    "vod_pic": pic,
+                    "vod_remarks": remark,
+                    "vod_type": "角色",
+                    "style": {"type": "rect", "ratio": 1.0},
+                })
+        else:
+            cards = [self._parse_card(b) for b in CARD_RE.findall(html_text)]
+            cards = [c for c in cards if c]
         pagecount = self._pagecount(html_text)
         return {
             "list": cards,
@@ -311,7 +351,14 @@ class Spider(BaseSpider):
         if not href_m:
             return None
         href = href_m.group(1)
-        kind = "series" if href.startswith("/series/") else "video"
+        if href.startswith("/series/"):
+            kind = "series"
+        elif href.startswith("/photo/"):
+            kind = "photo"
+        elif href.startswith("/role/"):
+            kind = "role"
+        else:
+            kind = "video"
         code = href.rstrip("/").split("/")[-1]
         title_m = TITLE_RE.search(block)
         title = title_m.group(1).strip() if title_m else ""
@@ -319,18 +366,18 @@ class Spider(BaseSpider):
         pic = self._absolute(pic_m.group(1)) if pic_m else ""
         remark_m = REMARK_RE.search(block)
         remark = remark_m.group(1).strip() if remark_m else ""
+        type_map = {"series": "连续剧", "photo": "图集", "role": "角色", "video": "视频"}
         return {
             "vod_id": "%s/%s" % (kind, code),
             "vod_name": title,
             "vod_pic": pic,
             "vod_remarks": remark,
-            "vod_type": "连续剧" if kind == "series" else "视频",
+            "vod_type": type_map.get(kind, "视频"),
             "style": {"type": "rect", "ratio": 0.75},
         }
 
     def _pagecount(self, html_text):
-        pages = [int(n) for n in PAGER_RE.findall(html_text)]
-        return max(1, max(pages)) if pages else 1
+        return 9999
 
     def detailContent(self, ids):
         ident = ids[0] if ids else ""
@@ -394,7 +441,6 @@ class Spider(BaseSpider):
         return item
 
     def _resolve_hls(self, code):
-        """取视频页的 data-hls（master.m3u8）绝对地址；不在此处解析 variant，留给播放时解析。"""
         if code in self._hls_cache:
             return self._hls_cache[code]
         text = _http_get("%s/video/%s" % (BASE, code), referer=BASE + "/")
@@ -413,7 +459,6 @@ class Spider(BaseSpider):
             url = self._absolute(hls)
             if not url:
                 return {"parse": 0, "jx": 0, "url": "", "msg": "空播放地址"}
-            # master -> 具体 variant，避免播放器不跟随 variant 导致黑屏
             playable = _pick_variant(url)
             return {
                 "parse": 0,
