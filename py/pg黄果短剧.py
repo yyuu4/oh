@@ -9,7 +9,7 @@ except Exception:
 
 BASE = "https://huangguo.video"
 PAGE_SIZE = 20
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 CATEGORIES = [
     {"type_id": "latest", "type_name": "最新发布"},
     {"type_id": "all", "type_name": "全部视频"},
@@ -65,45 +65,33 @@ _ROLE_GENDER_OPTS = {"key": "gender", "name": "性别", "init": "",
                          {"n": "男", "v": "1"},
                          {"n": "女", "v": "2"},
                      ]}
-_TAG_OPTS = {"key": "tags#", "name": "情节标签（可多选，需同时满足）", "init": "",
-             "value": [
-                 {"n": "全部", "v": ""},
-                 {"n": "都市", "v": "1"},
-                 {"n": "人妻", "v": "2"},
-                 {"n": "同人", "v": "4"},
-                 {"n": "校园", "v": "5"},
-                 {"n": "职场", "v": "6"},
-                 {"n": "古风", "v": "7"},
-                 {"n": "乱伦", "v": "8"},
-                 {"n": "NTR", "v": "9"},
-                 {"n": "玄幻", "v": "40"},
-                 {"n": "欧美", "v": "57"},
-                 {"n": "露出", "v": "42"},
-                 {"n": "二次元", "v": "59"},
-                 {"n": "女同", "v": "55"},
-                 {"n": "男同", "v": "56"},
-                 {"n": "穿越", "v": "39"},
-                 {"n": "衍生", "v": "3"},
-             ]}
-_ROLE_TAG_OPTS = {"key": "tags#", "name": "人设标签（可多选，需同时满足）", "init": "",
-                  "value": [
-                      {"n": "全部", "v": ""},
-                      {"n": "知性", "v": "53"},
-                      {"n": "御姐", "v": "43"},
-                      {"n": "人妻", "v": "2"},
-                      {"n": "冷艳", "v": "51"},
-                      {"n": "清纯", "v": "49"},
-                      {"n": "甜美", "v": "50"},
-                      {"n": "活力", "v": "44"},
-                      {"n": "傲娇", "v": "52"},
-                      {"n": "大小姐", "v": "54"},
-                      {"n": "学生", "v": "46"},
-                      {"n": "年轻", "v": "48"},
-                      {"n": "OL", "v": "47"},
-                      {"n": "熟女", "v": "45"},
-                      {"n": "网红", "v": "41"},
-                  ]}
-_FILTER_KEYS = ["sort", "rating", "tags#", "type", "gender", "p"]
+_VIDEO_TAG_VALUES = [
+    ("1", "都市"), ("2", "人妻"), ("4", "同人"), ("5", "校园"), ("6", "职场"),
+    ("7", "古风"), ("8", "乱伦"), ("9", "NTR"), ("40", "玄幻"), ("57", "欧美"),
+    ("42", "露出"), ("59", "二次元"), ("55", "女同"), ("56", "男同"),
+    ("39", "穿越"), ("3", "衍生"),
+]
+_ROLE_TAG_VALUES = [
+    ("53", "知性"), ("43", "御姐"), ("2", "人妻"), ("51", "冷艳"), ("49", "清纯"),
+    ("50", "甜美"), ("44", "活力"), ("52", "傲娇"), ("54", "大小姐"), ("46", "学生"),
+    ("48", "年轻"), ("47", "OL"), ("45", "熟女"), ("41", "网红"),
+]
+
+
+def _tag_filters(values):
+    groups = []
+    for vid, name in values:
+        groups.append({
+            "key": "tag_" + vid, "name": name, "init": "",
+            "value": [
+                {"n": "不选", "v": ""},
+                {"n": "选中", "v": vid},
+            ],
+        })
+    return groups
+
+
+_FILTER_KEYS = ["sort", "rating", "type", "gender", "p"]
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -265,13 +253,13 @@ class Spider(BaseSpider):
         if filter:
             result["filters"] = {
                 "latest": [_VIDEO_SORT_OPTS],
-                "all": [_VIDEO_SORT_OPTS, _RATING_OPTS, _TAG_OPTS],
-                "1": [_VIDEO_SORT_OPTS, _RATING_OPTS, _TAG_OPTS],
-                "2": [_VIDEO_SORT_OPTS, _RATING_OPTS, _TAG_OPTS],
-                "3": [_VIDEO_SORT_OPTS, _RATING_OPTS, _TAG_OPTS],
-                "4": [_VIDEO_SORT_OPTS, _RATING_OPTS, _TAG_OPTS],
-                "photos": [_PHOTO_SORT_OPTS, _RATING_OPTS, _TAG_OPTS],
-                "roles": [_ROLE_SORT_OPTS, _ROLE_TYPE_OPTS, _ROLE_GENDER_OPTS, _ROLE_TAG_OPTS],
+                "all": [_VIDEO_SORT_OPTS, _RATING_OPTS] + _tag_filters(_VIDEO_TAG_VALUES),
+                "1": [_VIDEO_SORT_OPTS, _RATING_OPTS] + _tag_filters(_VIDEO_TAG_VALUES),
+                "2": [_VIDEO_SORT_OPTS, _RATING_OPTS] + _tag_filters(_VIDEO_TAG_VALUES),
+                "3": [_VIDEO_SORT_OPTS, _RATING_OPTS] + _tag_filters(_VIDEO_TAG_VALUES),
+                "4": [_VIDEO_SORT_OPTS, _RATING_OPTS] + _tag_filters(_VIDEO_TAG_VALUES),
+                "photos": [_PHOTO_SORT_OPTS, _RATING_OPTS] + _tag_filters(_VIDEO_TAG_VALUES),
+                "roles": [_ROLE_SORT_OPTS, _ROLE_TYPE_OPTS, _ROLE_GENDER_OPTS] + _tag_filters(_ROLE_TAG_VALUES),
                 "ranking": [_RANKING_TIME_OPTS],
             }
         return result
@@ -329,11 +317,19 @@ class Spider(BaseSpider):
             url += sep + "q=" + quote(keyword)
         if ext:
             for k in _FILTER_KEYS:
-                v = ext.get(k)
+                v = ext.get(k) or ext.get(k + "#")
+                if isinstance(v, list):
+                    v = ",".join(str(x) for x in v if x)
                 if v:
-                    url_key = k.rstrip("#")
                     sep = "&" if "?" in url else "?"
-                    url += sep + "%s=%s" % (url_key, quote(str(v), safe=","))
+                    url += sep + "%s=%s" % (k, quote(str(v), safe=","))
+            tag_vals = []
+            for k, v in ext.items():
+                if k.startswith("tag_") and v:
+                    tag_vals.append(str(v))
+            if tag_vals:
+                sep = "&" if "?" in url else "?"
+                url += sep + "tags=%s" % quote(",".join(tag_vals), safe=",")
         page = max(1, int(pg) if str(pg).isdigit() else 1)
         if page > 1:
             sep = "&" if "?" in url else "?"
