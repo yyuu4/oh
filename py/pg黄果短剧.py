@@ -71,7 +71,7 @@ _ROLE_GENDER_OPTS = {"key": "gender", "name": "性别", "init": "",
                          {"n": "男", "v": "1"},
                          {"n": "女", "v": "2"},
                      ]}
-_TAG_OPTS = {"key": "tags", "name": "情节标签", "init": "",
+_TAG_OPTS = {"key": "tags", "name": "情节标签（可多选，需同时满足）", "init": "", "multi": True,
              "value": [
                  {"n": "全部", "v": ""},
                  {"n": "都市", "v": "1"},
@@ -91,7 +91,7 @@ _TAG_OPTS = {"key": "tags", "name": "情节标签", "init": "",
                  {"n": "穿越", "v": "39"},
                  {"n": "衍生", "v": "3"},
              ]}
-_ROLE_TAG_OPTS = {"key": "tags", "name": "人设标签", "init": "",
+_ROLE_TAG_OPTS = {"key": "tags", "name": "人设标签（可多选，需同时满足）", "init": "", "multi": True,
                   "value": [
                       {"n": "全部", "v": ""},
                       {"n": "知性", "v": "53"},
