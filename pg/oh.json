@@ -418,7 +418,7 @@
                 }
             }
         },
-		{
+		//{
             "key": "javdbui.py",
             "name": "javdbui.py",
             "type": 3,
