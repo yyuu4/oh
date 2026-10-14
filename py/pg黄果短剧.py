@@ -9,7 +9,7 @@ except Exception:
 
 BASE = "https://huangguo.video"
 PAGE_SIZE = 20
-VERSION = "1.3.0"
+VERSION = "1.4.1"
 CATEGORIES = [
     {"type_id": "latest", "type_name": "最新发布"},
     {"type_id": "all", "type_name": "全部视频"},
@@ -29,12 +29,6 @@ _RATING_OPTS = {"key": "rating", "name": "尺度分级", "init": "",
                     {"n": "裸露", "v": "2"},
                     {"n": "限制级", "v": "3"},
                 ]}
-_LATEST_SORT_OPTS = {"key": "sort", "name": "排序", "init": "newest",
-                     "value": [
-                         {"n": "最新发布", "v": "newest"},
-                         {"n": "最多播放", "v": "views"},
-                         {"n": "最多收藏", "v": "favorites"},
-                     ]}
 _VIDEO_SORT_OPTS = {"key": "sort", "name": "排序", "init": "newest",
                     "value": [
                         {"n": "最新发布", "v": "newest"},
@@ -71,7 +65,7 @@ _ROLE_GENDER_OPTS = {"key": "gender", "name": "性别", "init": "",
                          {"n": "男", "v": "1"},
                          {"n": "女", "v": "2"},
                      ]}
-_TAG_OPTS = {"key": "tags", "name": "情节标签（可多选，需同时满足）", "init": "", "multi": True,
+_TAG_OPTS = {"key": "tags#", "name": "情节标签（可多选，需同时满足）", "init": "",
              "value": [
                  {"n": "全部", "v": ""},
                  {"n": "都市", "v": "1"},
@@ -91,7 +85,7 @@ _TAG_OPTS = {"key": "tags", "name": "情节标签（可多选，需同时满足�
                  {"n": "穿越", "v": "39"},
                  {"n": "衍生", "v": "3"},
              ]}
-_ROLE_TAG_OPTS = {"key": "tags", "name": "人设标签（可多选，需同时满足）", "init": "", "multi": True,
+_ROLE_TAG_OPTS = {"key": "tags#", "name": "人设标签（可多选，需同时满足）", "init": "",
                   "value": [
                       {"n": "全部", "v": ""},
                       {"n": "知性", "v": "53"},
@@ -109,7 +103,7 @@ _ROLE_TAG_OPTS = {"key": "tags", "name": "人设标签（可多选，需同时�
                       {"n": "熟女", "v": "45"},
                       {"n": "网红", "v": "41"},
                   ]}
-_FILTER_KEYS = ["sort", "rating", "tags", "type", "gender", "p"]
+_FILTER_KEYS = ["sort", "rating", "tags#", "type", "gender", "p"]
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -270,7 +264,7 @@ class Spider(BaseSpider):
         result = {"class": CATEGORIES}
         if filter:
             result["filters"] = {
-                "latest": [_LATEST_SORT_OPTS],
+                "latest": [_VIDEO_SORT_OPTS],
                 "all": [_VIDEO_SORT_OPTS, _RATING_OPTS, _TAG_OPTS],
                 "1": [_VIDEO_SORT_OPTS, _RATING_OPTS, _TAG_OPTS],
                 "2": [_VIDEO_SORT_OPTS, _RATING_OPTS, _TAG_OPTS],
@@ -337,13 +331,9 @@ class Spider(BaseSpider):
             for k in _FILTER_KEYS:
                 v = ext.get(k)
                 if v:
+                    url_key = k.rstrip("#")
                     sep = "&" if "?" in url else "?"
-                    url += sep + "%s=%s" % (k, quote(str(v)))
-            if cat == "ranking":
-                p_val = ext.get("p")
-                if p_val:
-                    sep = "&" if "?" in url else "?"
-                    url += sep + "p=%s" % quote(str(p_val))
+                    url += sep + "%s=%s" % (url_key, quote(str(v), safe=","))
         page = max(1, int(pg) if str(pg).isdigit() else 1)
         if page > 1:
             sep = "&" if "?" in url else "?"
@@ -389,7 +379,7 @@ class Spider(BaseSpider):
         else:
             cards = [self._parse_card(b) for b in CARD_RE.findall(html_text)]
             cards = [c for c in cards if c]
-        pagecount = self._pagecount(html_text)
+        pagecount = self._pagecount()
         return {
             "list": cards,
             "page": max(1, int(pg) if str(pg).isdigit() else 1),
@@ -406,7 +396,7 @@ class Spider(BaseSpider):
         return {
             "list": cards,
             "page": max(1, int(pg) if str(pg).isdigit() else 1),
-            "pagecount": self._pagecount(html_text),
+            "pagecount": self._pagecount(),
             "limit": PAGE_SIZE,
             "total": len(cards),
         }
@@ -441,7 +431,7 @@ class Spider(BaseSpider):
             "style": {"type": "rect", "ratio": 0.75},
         }
 
-    def _pagecount(self, html_text):
+    def _pagecount(self):
         return 9999
 
     def detailContent(self, ids):
