@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 # v1.0.0 初版：MacCMS 采集 API（list/detail/search），封面+详情+分页；hsckm3u8 直链 / hsckyun 分享页解 m3u8；分类筛选/搜索/详情/播放自检通过；
 # v1.0.1 筛选修正：站点 API 实测仅 year 有效（filter_by/sort_by/area 等均被忽略），改为年份筛选——子类直查 year，父类经子类 API 合并；
 # v1.1.0 三域名候选（hsckzy.vip / hsckzy.xyz / hsckzy001.com）自动测速切换——API 探测挑最快可用域名，失败自动跳过，extend.hosts 可覆盖；
 # v1.1.1 多域名健壮性：校验 MacCMS 响应结构（排除 Cloudflare 错误页误判成功），坏域名失败自动切换下一候选；extend.hosts 保留用户指定顺序；
 # v1.2.0 分类重构：只保留顶级分类，子分类（网红主播/国产传媒等）改为父分类下的「子分类」筛选组——选中子类直接 API 直查，选全部走父类聚合；
 # v1.3.0 去广告：CDN 在正片 m3u8 头/尾拼接广告分片（独立 path+AES key，片头~22s/片尾固定~19s）——playerContent 走 localProxy 重写播放列表，
-#          按主路径过滤只保留正片段；ext.stripAds=false 可关回直链；
-# v1.3.1 修播放失败：部分宿主不转换 proxy:// 视频请求——优先 http://127.0.0.1:port/proxy 形式，拿不到端口则回退直链（有广告但能播）；
+#          按主路径过滤只保留正片段；
+# v1.3.1 修播放失败：部分宿主不转换 proxy:// 视频请求——优先 http://127.0.0.1:port/proxy 形式；
+# v1.3.2 默认关去广告（stripAds=false 直链能播）；仅 ext.stripAds=true 且 Proxy 端口可用才走代理清洗，拿不到端口自动回退直链；
 # hsckvip.py —— 黄色仓库资源站 (MacCMS) 爬虫
 # 数据走 /api.php/provide/vod/ 标准采集 API；播放源为 m3u8 直链（hsckm3u8）或分享页（hsckyun，播放时解出 m3u8）。
 import os
@@ -138,7 +139,9 @@ class Spider:
         self.verify = False
         self.proxy = ""
         self.prefer_m3u8 = True
-        self.strip_ads = True
+        # 去广告默认关闭：部分宿主 localProxy 不支持视频请求，开启会导致黑屏；
+        # 需 ext.stripAds=true 显式开启（且宿主 Proxy 端口可用时才生效）
+        self.strip_ads = False
         self._class_cache = []
         self._host_locked = False
         self._probed = False
