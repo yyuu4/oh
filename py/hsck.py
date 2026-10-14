@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 # v1.0.0，基础版：首页/分类(base64导航)、列表分页、详情(play.php m3u8 / torrent磁力)、
 #   搜索(视频+磁力)、磁力公共 tracker、可选115离线、封面 localProxy。
 # v1.0.1，修复搜索sid误取导航分类id(改用redirect最终URL)；分页pagecount不再卡在当前页；
@@ -23,6 +23,9 @@ VERSION = "1.0.5"
 #   App 可直接加载，绕开 localProxy 路由）；有 siteKey 仍走 localProxy。
 #   热播筛选同步到 "all" 键（部分 ATVP 版本读 all 而非 hot）；115离线选集保持现状
 #   （TVBox 只在同源 2+ 集时显示选集）；分类硬编码兜底（_fetch 失败时不再只剩热播）。
+# v1.0.6，代码清理：删未使用的 _safe_json/_offline_hint；提取 _safe_find_task 消除
+#   5 处重复 try/except；提取 _dedup_magnets 消除磁力去重重复；_resolve_pickcode
+#   复用 _offline_headers；移除 _ext_site_key 冗余。
 import os
 import re
 import json
@@ -120,13 +123,6 @@ def _safe_int(v, default=0):
             return default
 
 
-def _safe_json(text, fallback=None):
-    try:
-        return json.loads(str(text or ""))
-    except Exception:
-        return fallback if fallback is not None else {}
-
-
 def _norm_proxy(v):
     p = _to_text(v)
     if not p:
@@ -214,6 +210,21 @@ def _magnet_play_url(magnet):
     if h:
         return _magnet_with_trackers(h)
     return _normalize_magnet(magnet)
+
+
+def _dedup_magnets(html):
+    """从 HTML 提取磁力并保序去重（_detail_torrent / _detail_video 共用）。"""
+    magnets = []
+    seen = set()
+    for mag in re.findall(
+            r"(magnet:\?xt=urn:btih:[A-Za-z0-9]+[^\s\"'<>]*)", html or ""):
+        h = _magnet_hash(mag)
+        if h and h in seen:
+            continue
+        if h:
+            seen.add(h)
+        magnets.append(mag)
+    return magnets
 
 
 def _off_id_encode(magnet, title="", label=""):
@@ -574,7 +585,6 @@ class Spider:
         self.siteKey = _to_text(
             extend.get("siteKey") or extend.get("key")
             or getattr(self, "siteKey", ""))
-        self._ext_site_key = self.siteKey  # 与 _site_key() 保持一致
         if "verify" in extend:
             self.verify = bool(extend["verify"])
         if extend.get("img") or extend.get("imgProxy"):
@@ -824,9 +834,7 @@ class Spider:
             return url
         # 无 siteKey（ATVP 场景）：localProxy 的 do=py 路由不中 → 直接返回原图地址，
         # pic.892539.xyz 是明文直链，App 可直接加载，无需代理。
-        key = _to_text(getattr(self, "siteKey", "")
-                       or getattr(self, "_ext_site_key", ""))
-        if not key:
+        if not self.siteKey:
             return url
         # 有 siteKey（pg 场景）：走 localProxy（快、不撑大响应体积）
         try:
@@ -1165,26 +1173,15 @@ class Spider:
                 if t and "document.write" not in t:
                     title = t
                     break
-        magnets = re.findall(
-            r'(magnet:\?xt=urn:btih:[A-Za-z0-9]+[^\s"\'<>]*)', html or "")
-        # 去重保序
-        seen = set()
-        uniq = []
-        for mag in magnets:
-            h = _magnet_hash(mag)
-            if h and h in seen:
-                continue
-            if h:
-                seen.add(h)
-            uniq.append(_normalize_magnet(mag))
+        magnets = _dedup_magnets(html)
         play_from = []
         play_url = []
         eps = []
         off_eps = []
-        for i, mag in enumerate(uniq):
+        for i, mag in enumerate(magnets):
             clean = _magnet_clean(mag)
             play_mag = _magnet_play_url(clean)
-            label = "磁力%d" % (i + 1) if len(uniq) > 1 else "磁力"
+            label = "磁力%d" % (i + 1) if len(magnets) > 1 else "磁力"
             eps.append("%s$%s" % (_sanitize_play(label), _sanitize_play(play_mag)))
             if self.enable_offline_115:
                 b64 = _off_id_encode(clean, title, label)
@@ -1206,7 +1203,7 @@ class Spider:
             "vod_name": title or ("磁力 " + tid),
             "vod_pic": "",
             "vod_content": title or "",
-            "vod_remarks": "磁力%d" % len(uniq) if uniq else "磁力",
+            "vod_remarks": "磁力%d" % len(magnets) if magnets else "磁力",
             "vod_play_from": "$$$".join(play_from),
             "vod_play_url": "$$$".join(play_url),
         }
@@ -1249,17 +1246,8 @@ class Spider:
             if full not in play_links:
                 play_links.append(full)
 
-        # 磁力保序去重（set+sorted 顺序不稳定，站点原始顺序更符合用户预期）
-        magnets = []
-        _mag_seen = set()
-        for mag in re.findall(
-                r"(magnet:\?xt=urn:btih:[A-Za-z0-9]+[^\s\"'<>]*)", html or ""):
-            h = _magnet_hash(mag)
-            if h and h in _mag_seen:
-                continue
-            if h:
-                _mag_seen.add(h)
-            magnets.append(mag)
+        # 磁力保序去重（公共函数）
+        magnets = _dedup_magnets(html)
         media = set(re.findall(
             r"https?://[^\s\"'<>]+\.(?:m3u8|mp4|flv|ts)(?:\?[^\s\"'<>]*)?",
             html or ""))
@@ -1425,10 +1413,6 @@ class Spider:
             out.append("")
         return "\n".join(out)
 
-    def _offline_hint(self):
-        """离线提示（成功走 desc+subs，绝不能走 msg）。"""
-        return "115离线：%s" % (self.offline_save_path or "/115影视")
-
     def _release_play_memory(self):
         """
         播放成功后释放 115 会话 + 缓存，防 4G 盒子连续快进 OOM。
@@ -1516,6 +1500,13 @@ class Spider:
                     return t
         return None
 
+    def _safe_find_task(self, info_hash, max_page=2):
+        """_offline_find_task 异常安全版（消除 5 处重复 try/except）。"""
+        try:
+            return self._offline_find_task(info_hash, max_page=max_page)
+        except Exception:
+            return None
+
     @staticmethod
     def _task_pickcode(task):
         if not task:
@@ -1552,10 +1543,7 @@ class Spider:
         deadline = time.time() + timeout
         last_name = ""
         while time.time() < deadline:
-            try:
-                task = self._offline_find_task(info_hash, max_page=1)
-            except Exception:
-                task = None
+            task = self._safe_find_task(info_hash, max_page=1)
             done, failed, msg = self._offline_task_state(task)
             if done:
                 return True, msg or last_name
@@ -1574,14 +1562,8 @@ class Spider:
             return _play_err("requests 模块不可用")
         body = _build_downurl_body({"pickcode": pickcode})
         url = "https://proapi.115.com/app/chrome/downurl?t=%d" % int(time.time())
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Content-Length": str(len(body)),
-            "Cookie": self.cookie_115,
-            "User-Agent": OFFLINE_UA,
-            "Referer": "https://115.com/",
-            "Origin": "https://115.com",
-        }
+        headers = self._offline_headers()
+        headers["Content-Length"] = str(len(body))
         try:
             r = sess.post(url, data=body, headers=headers, timeout=12,
                           verify=self.verify)
@@ -1737,11 +1719,7 @@ class Spider:
                 if res.get("url"):
                     return res
 
-        task = None
-        try:
-            task = self._offline_find_task(info_hash)
-        except Exception:
-            task = None
+        task = self._safe_find_task(info_hash)
         done0, failed0, _ = self._offline_task_state(task)
         if task and done0:
             pc0 = self._task_pickcode(task)
@@ -1759,25 +1737,16 @@ class Spider:
                                or add.get("error"))
             if not add.get("state") and not any(
                     k in add_msg for k in ("已存在", "重复")):
-                try:
-                    task = self._offline_find_task(info_hash)
-                except Exception:
-                    task = None
+                task = self._safe_find_task(info_hash)
                 if not task:
                     return _play_err("115离线提交失败：%s" % (add_msg or "提交失败"))
-            try:
-                task = self._offline_find_task(info_hash)
-            except Exception:
-                task = None
+            task = self._safe_find_task(info_hash)
 
         done, name_or_msg = self._offline_wait_done(info_hash)
         if not done:
             return _play_err("已提交115离线，下载中（%s），请稍后重试"
                              % (name_or_msg or "等待完成"))
-        try:
-            task = self._offline_find_task(info_hash)
-        except Exception:
-            task = None
+        task = self._safe_find_task(info_hash)
         pickcode = self._task_pickcode(task)
         if not pickcode:
             return _play_err("离线已完成，但未取到 pickcode，请稍后重试")

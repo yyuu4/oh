@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.0.5"
+VERSION = "1.0.6"
+# v1.0.6 清理冗余 + 越界页一致性：删掉从未使用的 _safe_json/_api、从未生效的 ext.cookie，
+#          收敛 ext 别名（hostList/hostCandidates/eagerProbe 并入 hosts/probe）；
+#          父分类越界页码夹到末页（站点对越界 vodtype 本就返回末页内容）；
+#          网页搜索回退越界时夹到末页重取（站点对越界搜索页返回近空页）；
+#          修配置区注释与实际行为的漂移（懒探测/直链默认、noProbe 补文档）。
 # v1.0.5 播放默认走直链（再修 OK影视 转圈）：CDN 实测无 UA/Referer 校验、m3u8 无广告无 DRM，
 #          localProxy 在播放关键路径上只会增加不确定性（部分宿主 do=py 参数路由/多 & 截断）——
 #          默认 stripAds=false 直链播放；要清洗可 ext.stripAds=true（拿不到 127.0.0.1 端口自动回退直链）；
@@ -70,16 +75,15 @@ except Exception:
 #     "hosts": ["https://444.ablck.cc", "https://222.1eck.cc", "https://444.ahlck.cc"],
 #     "proxy": "http://127.0.0.1:7890",
 #     "verify": false,
-#     "cookie": "",
-#     "stripAds": false    # true=播放走 localProxy 清洗（默认直链：本站无广告且部分宿主不认代理地址）,
+#     "noProbe": false,    # true=锁定 host，不做候选切换
+#     "stripAds": false,   # true=播放走 localProxy 清洗（默认直链：本站无广告且部分宿主不认代理地址）
 #     "probe": false,      # true=先测速选最快入口（默认懒探测）
 #     "noCache": false     # true=关掉磁盘缓存（/tmp/hsckcc_cache.json）
 #   }
 
-# 入口域名（301 网关，探测成功后自动切到最快可用入口，并记住其背后的真实域名）
+# 入口域名（301 网关且跳转丢路径；默认懒探测：先用它，失败自动切候选并记住真实域名）
 HOST = "https://444.ablck.cc"
-# 三入口候选：逐个「解析 301 → 请求采集 API」，能连上 + 能出 JSON 的最快者胜；
-# 全失败才回退 HOST。extend.host / extend.hosts 可覆盖。
+# 三入口候选（ext.probe=true 时才并发测速选最快）；extend.host / extend.hosts 可覆盖。
 HOST_CANDIDATES = [
     "https://444.ablck.cc",
     "https://222.1eck.cc",
@@ -116,13 +120,6 @@ LIST_HEADERS = {
 
 def _to_text(v):
     return str(v or "").strip()
-
-
-def _safe_json(text, fallback=None):
-    try:
-        return json.loads(str(text or ""))
-    except Exception:
-        return fallback if fallback is not None else {}
 
 
 def _safe_int(v, default=0):
@@ -183,7 +180,6 @@ class Spider:
         self.timeout = 15
         self.page_size = PAGE_SIZE
         self.search_limit = SEARCH_LIMIT
-        self.cookie = ""
         self.verify = False
         self.proxy = ""
         self.prefer_m3u8 = True
@@ -248,7 +244,7 @@ class Spider:
             self.gateway = self.host
             self._host_locked = True
         # 多域名候选（list 或 逗号分隔字符串）：host 层自动切换用
-        hv = extend.get("hosts") or extend.get("hostList") or extend.get("hostCandidates")
+        hv = extend.get("hosts")
         if hv:
             if isinstance(hv, (list, tuple)):
                 cand = [_to_text(x).rstrip("/") for x in hv]
@@ -265,9 +261,7 @@ class Spider:
         if extend.get("noProbe"):
             self._host_locked = True
         # 默认懒探测（首请求失败才切候选）；ext.probe=true 恢复先测速选最快
-        self.eager_probe = bool(extend.get("probe") or extend.get("eagerProbe"))
-        if extend.get("cookie"):
-            self.cookie = str(extend["cookie"])
+        self.eager_probe = bool(extend.get("probe"))
         if "verify" in extend:
             self.verify = bool(extend["verify"])
         if "preferM3u8" in extend:
@@ -341,10 +335,6 @@ class Spider:
         return None  # 跟随环境变量
 
     # ---------- 入口解析 / API ----------
-    @property
-    def _api(self):
-        return self.host + API_PATH
-
     def _host_pool(self):
         """候选入口池：当前入口 + 内置/extend 候选 + 已解析出的真实站，去重保序；
         锁定（extend.host / noProbe）时只用当前 host。"""
@@ -908,6 +898,8 @@ class Spider:
             for n in re.findall(r"/vodtype/\d+-(\d+)\.html", html):
                 pagecount = max(pagecount, _safe_int(n, 0))
         lst = self._enrich_details(ids)
+        if pagecount and page > pagecount:
+            page = pagecount  # 越界：站点对越界 vodtype 直接返回末页内容，页码夹到末页即可
         return self._page_result(lst, page, pagecount=pagecount)
 
     def _merged_children_page(self, tid, page):
@@ -1087,18 +1079,19 @@ class Spider:
             return {"list": lst, "page": real_page,
                     "pagecount": pc or (real_page + 1),
                     "limit": len(lst), "total": len(lst)}
-        # API 搜不到/失败 → 网页搜索回退（自带尾页页数）
+        # API 搜不到/失败 → 网页搜索回退（自带尾页页数，越界自动夹到末页）
         res = self._search_html(keyword, page)
         lst = res.get("list") or []
         pc = _safe_int(res.get("pagecount"), 0)
-        return {"list": lst, "page": page,
-                "pagecount": pc or (page + 1 if lst else page),
+        real_page = _safe_int(res.get("page"), 0) or page
+        return {"list": lst, "page": real_page,
+                "pagecount": pc or (real_page + 1 if lst else real_page),
                 "limit": len(lst), "total": len(lst)}
 
     def _search_html(self, keyword, page):
         """网页搜索回退：站点自身分页格式 /vodsearch/{关键词}----------{页}---1.html。
         注意 /vodsearch/-------------{页}.html 站点不认（pg1/2/3 返回同一批，等于不翻页）。
-        返回 {"list": [...], "pagecount": 总页数}。"""
+        返回 {"list": [...], "pagecount": 总页数, "page": 实际页码}。"""
         if not requests or not self.s:
             return {"list": [], "pagecount": 0}
         path = "/vodsearch/%s----------%d---1.html" % (quote(keyword, safe=""), page)
@@ -1132,8 +1125,11 @@ class Spider:
         m = re.search(r'----------(\d+)---1\.html"[^>]*>\s*尾页', html)
         if m:
             pagecount = _safe_int(m.group(1), 0)
+        if pagecount and page > pagecount:
+            # 越界页站点返回近空页（不像 vodtype 直接给末页）→ 夹到末页重取
+            return self._search_html(keyword, pagecount)
         return {"list": self._enrich_details(ids)[: self.page_size],
-                "pagecount": pagecount}
+                "pagecount": pagecount, "page": page}
 
     # ---------- 播放 ----------
     def _proxy_base(self):
