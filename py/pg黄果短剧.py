@@ -22,20 +22,56 @@ CATEGORIES = [
     {"type_id": "ranking", "type_name": "排行榜"},
 ]
 
-_SORT_OPTS = {"key": "sort", "name": "排序", "init": "newest",
-              "value": [
-                  {"n": "最新发布", "v": "newest"},
-                  {"n": "最多播放", "v": "views"},
-                  {"n": "最多收藏", "v": "favorites"},
-              ]}
-_RATING_OPTS = {"key": "rating", "name": "尺度", "init": "",
+_RATING_OPTS = {"key": "rating", "name": "尺度分级", "init": "",
                 "value": [
                     {"n": "全部", "v": ""},
                     {"n": "安全", "v": "1"},
                     {"n": "裸露", "v": "2"},
                     {"n": "限制级", "v": "3"},
                 ]}
-_TAG_OPTS = {"key": "tags", "name": "标签", "init": "",
+_LATEST_SORT_OPTS = {"key": "sort", "name": "排序", "init": "newest",
+                     "value": [
+                         {"n": "最新发布", "v": "newest"},
+                         {"n": "最多播放", "v": "views"},
+                         {"n": "最多收藏", "v": "favorites"},
+                     ]}
+_VIDEO_SORT_OPTS = {"key": "sort", "name": "排序", "init": "newest",
+                    "value": [
+                        {"n": "最新发布", "v": "newest"},
+                        {"n": "最多播放", "v": "views"},
+                        {"n": "最多收藏", "v": "favorites"},
+                    ]}
+_PHOTO_SORT_OPTS = {"key": "sort", "name": "排序", "init": "newest",
+                    "value": [
+                        {"n": "最新发布", "v": "newest"},
+                        {"n": "最多播放/浏览", "v": "views"},
+                        {"n": "最多收藏", "v": "favorites"},
+                    ]}
+_ROLE_SORT_OPTS = {"key": "sort", "name": "排序", "init": "newest",
+                   "value": [
+                       {"n": "最新创建", "v": "newest"},
+                       {"n": "最多作品", "v": "works"},
+                       {"n": "最多播放", "v": "views"},
+                   ]}
+_RANKING_TIME_OPTS = {"key": "p", "name": "时间范围", "init": "24h",
+                      "value": [
+                          {"n": "6小时", "v": "6h"},
+                          {"n": "24小时", "v": "24h"},
+                          {"n": "7天", "v": "7d"},
+                      ]}
+_ROLE_TYPE_OPTS = {"key": "type", "name": "类型", "init": "",
+                   "value": [
+                       {"n": "全部", "v": ""},
+                       {"n": "真人", "v": "1"},
+                       {"n": "二次元", "v": "2"},
+                   ]}
+_ROLE_GENDER_OPTS = {"key": "gender", "name": "性别", "init": "",
+                     "value": [
+                         {"n": "全部", "v": ""},
+                         {"n": "男", "v": "1"},
+                         {"n": "女", "v": "2"},
+                     ]}
+_TAG_OPTS = {"key": "tags", "name": "情节标签", "init": "",
              "value": [
                  {"n": "全部", "v": ""},
                  {"n": "都市", "v": "1"},
@@ -48,8 +84,32 @@ _TAG_OPTS = {"key": "tags", "name": "标签", "init": "",
                  {"n": "NTR", "v": "9"},
                  {"n": "玄幻", "v": "40"},
                  {"n": "欧美", "v": "57"},
+                 {"n": "露出", "v": "42"},
+                 {"n": "二次元", "v": "59"},
+                 {"n": "女同", "v": "55"},
+                 {"n": "男同", "v": "56"},
+                 {"n": "穿越", "v": "39"},
+                 {"n": "衍生", "v": "3"},
              ]}
-_FILTER_KEYS = ["sort", "rating", "tags"]
+_ROLE_TAG_OPTS = {"key": "tags", "name": "人设标签", "init": "",
+                  "value": [
+                      {"n": "全部", "v": ""},
+                      {"n": "知性", "v": "53"},
+                      {"n": "御姐", "v": "43"},
+                      {"n": "人妻", "v": "2"},
+                      {"n": "冷艳", "v": "51"},
+                      {"n": "清纯", "v": "49"},
+                      {"n": "甜美", "v": "50"},
+                      {"n": "活力", "v": "44"},
+                      {"n": "傲娇", "v": "52"},
+                      {"n": "大小姐", "v": "54"},
+                      {"n": "学生", "v": "46"},
+                      {"n": "年轻", "v": "48"},
+                      {"n": "OL", "v": "47"},
+                      {"n": "熟女", "v": "45"},
+                      {"n": "网红", "v": "41"},
+                  ]}
+_FILTER_KEYS = ["sort", "rating", "tags", "type", "gender", "p"]
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -210,15 +270,15 @@ class Spider(BaseSpider):
         result = {"class": CATEGORIES}
         if filter:
             result["filters"] = {
-                "latest": [_SORT_OPTS],
-                "all": [_SORT_OPTS, _RATING_OPTS, _TAG_OPTS],
-                "1": [_SORT_OPTS],
-                "2": [_SORT_OPTS],
-                "3": [_SORT_OPTS],
-                "4": [_SORT_OPTS],
-                "photos": [_SORT_OPTS],
-                "roles": [_SORT_OPTS],
-                "ranking": [_SORT_OPTS],
+                "latest": [_LATEST_SORT_OPTS],
+                "all": [_VIDEO_SORT_OPTS, _RATING_OPTS, _TAG_OPTS],
+                "1": [_VIDEO_SORT_OPTS, _RATING_OPTS, _TAG_OPTS],
+                "2": [_VIDEO_SORT_OPTS, _RATING_OPTS, _TAG_OPTS],
+                "3": [_VIDEO_SORT_OPTS, _RATING_OPTS, _TAG_OPTS],
+                "4": [_VIDEO_SORT_OPTS, _RATING_OPTS, _TAG_OPTS],
+                "photos": [_PHOTO_SORT_OPTS, _RATING_OPTS, _TAG_OPTS],
+                "roles": [_ROLE_SORT_OPTS, _ROLE_TYPE_OPTS, _ROLE_GENDER_OPTS, _ROLE_TAG_OPTS],
+                "ranking": [_RANKING_TIME_OPTS],
             }
         return result
 
@@ -279,6 +339,11 @@ class Spider(BaseSpider):
                 if v:
                     sep = "&" if "?" in url else "?"
                     url += sep + "%s=%s" % (k, quote(str(v)))
+            if cat == "ranking":
+                p_val = ext.get("p")
+                if p_val:
+                    sep = "&" if "?" in url else "?"
+                    url += sep + "p=%s" % quote(str(p_val))
         page = max(1, int(pg) if str(pg).isdigit() else 1)
         if page > 1:
             sep = "&" if "?" in url else "?"
