@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 # v1.0.0 初版：MacCMS 采集 API（list/detail/search），封面+详情+分页；hsckm3u8 直链 / hsckyun 分享页解 m3u8；分类筛选/搜索/详情/播放自检通过；
 # v1.0.1 筛选修正：站点 API 实测仅 year 有效（filter_by/sort_by/area 等均被忽略），改为年份筛选——子类直查 year，父类经子类 API 合并；
 # v1.1.0 三域名候选（hsckzy.vip / hsckzy.xyz / hsckzy001.com）自动测速切换——API 探测挑最快可用域名，失败自动跳过，extend.hosts 可覆盖；
@@ -7,6 +7,7 @@ VERSION = "1.3.0"
 # v1.2.0 分类重构：只保留顶级分类，子分类（网红主播/国产传媒等）改为父分类下的「子分类」筛选组——选中子类直接 API 直查，选全部走父类聚合；
 # v1.3.0 去广告：CDN 在正片 m3u8 头/尾拼接广告分片（独立 path+AES key，片头~22s/片尾固定~19s）——playerContent 走 localProxy 重写播放列表，
 #          按主路径过滤只保留正片段；ext.stripAds=false 可关回直链；
+# v1.3.1 修播放失败：部分宿主不转换 proxy:// 视频请求——优先 http://127.0.0.1:port/proxy 形式，拿不到端口则回退直链（有广告但能播）；
 # hsckvip.py —— 黄色仓库资源站 (MacCMS) 爬虫
 # 数据走 /api.php/provide/vod/ 标准采集 API；播放源为 m3u8 直链（hsckm3u8）或分享页（hsckyun，播放时解出 m3u8）。
 import os
@@ -137,7 +138,7 @@ class Spider:
         self.verify = False
         self.proxy = ""
         self.prefer_m3u8 = True
-        self.strip_ads = False
+        self.strip_ads = True
         self._class_cache = []
         self._host_locked = False
         self._probed = False
@@ -705,7 +706,9 @@ class Spider:
 
     # ---------- 播放 ----------
     def _proxy_base(self):
-        """localProxy 基址：优先 Proxy.getPort()，退回 proxy://do=py"""
+        """localProxy 基址：优先 http://127.0.0.1:port/proxy（播放器可直接播），
+        退回 Proxy.getUrl() 的 http(s) 形式；拿不到则返回 None（调用方回退直链）。
+        部分宿主不转换 proxy:// 视频请求，故不再兜底 proxy://。"""
         try:
             from com.github.catvod import Proxy
             p = Proxy.getPort()
@@ -716,17 +719,22 @@ class Spider:
             return "http://127.0.0.1:%s/proxy?do=py" % port
         try:
             from com.github.catvod import Proxy
-            q = Proxy.getUrl()
-            if q and ("do=py" in str(q) or str(q).startswith("proxy://")):
-                return str(q)
+            q = str(Proxy.getUrl() or "").strip()
+            if q.startswith("http://") or q.startswith("https://"):
+                if "do=py" not in q:
+                    q += ("&" if "?" in q else "?") + "do=py"
+                return q
         except Exception:
             pass
-        return "proxy://do=py"
+        return None
 
     def _m3u8_proxy_url(self, src):
-        """包装 m3u8 为 localProxy URL（token=urlsafe-b64）"""
+        """包装 m3u8 为 localProxy URL；拿不到可用基址则返回 None（调用方回退直链）"""
+        base = self._proxy_base()
+        if not base:
+            return None
         tok = base64.urlsafe_b64encode(_to_text(src).encode("utf-8")).decode("ascii")
-        return "%s&kind=m3u8&token=%s" % (self._proxy_base(), quote(tok, safe=""))
+        return "%s&kind=m3u8&token=%s" % (base, quote(tok, safe=""))
 
     @staticmethod
     def _main_path_from_m3u8(url):
@@ -860,6 +868,16 @@ class Spider:
         m = re.search(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', text, re.I)
         return m.group(0) if m else ""
 
+    def _m3u8_play_url(self, src):
+        """去广告包装：拿得到 localProxy 则返回代理 URL，否则回退直链（有广告但能播）。
+        返回 (url, used_proxy)"""
+        if not self.strip_ads:
+            return src, False
+        proxy = self._m3u8_proxy_url(src)
+        if proxy:
+            return proxy, True
+        return src, False
+
     def playerContent(self, flag, ids, vipFlags=None):
         vid = str(ids[0]) if isinstance(ids, (list, tuple)) and ids else str(ids or "")
         vid = _to_text(vid)
@@ -872,10 +890,15 @@ class Spider:
             if low.endswith((".m3u8", ".mp4", ".flv", ".mkv", ".ts", ".avi", ".m4v")):
                 header = {"User-Agent": self.ua, "Referer": self.host + "/",
                           "Accept": "*/*"}
-                # m3u8 默认走 localProxy 去广告（ext.stripAds=false 关回直链）
+                # m3u8 默认走 localProxy 去广告（ext.stripAds=false 关回直链；
+                # 代理不可用时回退直链，保证能播）
                 if self.strip_ads and low.endswith(".m3u8"):
-                    return {"parse": 0, "jx": 0, "playUrl": "",
-                            "url": self._m3u8_proxy_url(vid), "header": header}
+                    play_url, used_proxy = self._m3u8_play_url(vid)
+                    # 代理 URL 时不要带站 Referer，避免本地代理二次请求异常
+                    if used_proxy:
+                        header = {"User-Agent": self.ua, "Accept": "*/*"}
+                    return {"parse": 0, "jx": 0, "playUrl": "", "url": play_url,
+                            "header": header}
                 return {"parse": 0, "jx": 0, "playUrl": "", "url": vid,
                         "header": header}
             # 分享页/其它网页：尝试解出 m3u8；成功则直链，失败交给 App 解析
@@ -886,9 +909,11 @@ class Spider:
                               "Referer": self.host + "/",
                               "Accept": "*/*"}
                     if self.strip_ads:
+                        play_url, used_proxy = self._m3u8_play_url(m3u8)
+                        if used_proxy:
+                            header = {"User-Agent": self.ua, "Accept": "*/*"}
                         return {"parse": 0, "jx": 0, "playUrl": "",
-                                "url": self._m3u8_proxy_url(m3u8),
-                                "header": header}
+                                "url": play_url, "header": header}
                     return {"parse": 0, "jx": 0, "playUrl": "", "url": m3u8,
                             "header": header}
             return {"parse": 1, "jx": 0, "playUrl": "", "url": vid,
