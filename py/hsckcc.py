@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.0.3"
+VERSION = "1.0.4"
+# v1.0.4 修播放转圈圈（OK影视等宿主）：playerContent 不再返回 proxy://do=py——
+#          部分宿主不转换该协议的视频请求（hsckvip v1.3.1 同款问题）；
+#          改为优先 http://127.0.0.1:{port}/proxy?do=py（Proxy.getPort()），
+#          拿不到端口/基址则回退 m3u8 直链——本站无广告分片，直链即可播（能播优先）。
 # v1.0.3 磁盘缓存（warm 提速）：TVBox 每次调用都是新进程，内存缓存活不过一次调用——
 #          把「入口→真实站」映射（TTL 24h）和「type_id→父分类」pid 表（TTL 7d）写进
 #          /tmp/hsckcc_cache.json（原子写 tmp+replace；不可写/损坏 → 静默降级为纯内存）。
@@ -1129,7 +1133,9 @@ class Spider:
 
     # ---------- 播放 ----------
     def _proxy_base(self):
-        """localProxy 基址：优先 Proxy.getPort()，退回 proxy://do=py"""
+        """localProxy 基址：优先 http://127.0.0.1:port/proxy?do=py（播放器可直接播），
+        退回 Proxy.getUrl() 的 http(s) 形式；拿不到返回 None（调用方回退直链）。
+        部分宿主（OK影视等）不转换 proxy:// 视频请求，故绝不发 proxy://。"""
         try:
             from com.github.catvod import Proxy
             p = Proxy.getPort()
@@ -1140,17 +1146,32 @@ class Spider:
             return "http://127.0.0.1:%s/proxy?do=py" % port
         try:
             from com.github.catvod import Proxy
-            q = Proxy.getUrl()
-            if q and ("do=py" in str(q) or str(q).startswith("proxy://")):
-                return str(q)
+            q = str(Proxy.getUrl() or "").strip()
+            if q.startswith("http://") or q.startswith("https://"):
+                if "do=py" not in q:
+                    q += ("&" if "?" in q else "?") + "do=py"
+                return q
         except Exception:
             pass
-        return "proxy://do=py"
+        return None
 
     def _m3u8_proxy_url(self, src):
-        """包装 m3u8 为 localProxy URL（token=urlsafe-b64）"""
+        """包装 m3u8 为 localProxy URL（token=urlsafe-b64）；拿不到基址返回 None"""
+        base = self._proxy_base()
+        if not base:
+            return None
         tok = base64.urlsafe_b64encode(_to_text(src).encode("utf-8")).decode("ascii")
-        return "%s&kind=m3u8&token=%s" % (self._proxy_base(), quote(tok, safe=""))
+        return "%s&kind=m3u8&token=%s" % (base, quote(tok, safe=""))
+
+    def _m3u8_play_url(self, src):
+        """去广告包装：拿得到 localProxy 则代理 URL，否则回退直链（能播优先）。
+        返回 (url, used_proxy)"""
+        if not self.strip_ads:
+            return _to_text(src), False
+        proxy = self._m3u8_proxy_url(src)
+        if proxy:
+            return proxy, True
+        return _to_text(src), False
 
     @staticmethod
     def _main_path_from_m3u8(url):
@@ -1271,25 +1292,32 @@ class Spider:
             if low.endswith((".m3u8", ".mp4", ".flv", ".mkv", ".ts", ".avi", ".m4v")):
                 header = {"User-Agent": self.ua, "Referer": self.host + "/",
                           "Accept": "*/*"}
-                # m3u8 默认走 localProxy 过滤广告分片（ext.stripAds=false 关回直链）
+                # m3u8 优先走 localProxy（ext.stripAds=false 关回直链）；
+                # 拿不到可用基址时回退直链——能播优先，绝不发 proxy://（OK影视等不认）
                 if self.strip_ads and low.endswith(".m3u8"):
-                    return {"parse": 0, "jx": 0, "playUrl": "",
-                            "url": self._m3u8_proxy_url(vid), "header": header}
+                    play_url, used_proxy = self._m3u8_play_url(vid)
+                    if used_proxy:
+                        header = {"User-Agent": self.ua, "Accept": "*/*"}
+                    return {"parse": 0, "jx": 0, "playUrl": "", "url": play_url,
+                            "header": header}
                 return {"parse": 0, "jx": 0, "playUrl": "", "url": vid,
                         "header": header}
             # 分享页/其它网页：尝试解出 m3u8；成功则直链，失败交给 App 解析
             if "share" in vid or low.endswith((".html", ".htm", "/")):
                 m3u8 = self._fetch_m3u8_from_share(vid)
                 if m3u8:
-                    header = {"User-Agent": self.ua,
-                              "Referer": self.host + "/",
-                              "Accept": "*/*"}
                     if self.strip_ads:
+                        play_url, used_proxy = self._m3u8_play_url(m3u8)
+                        header = ({"User-Agent": self.ua, "Accept": "*/*"}
+                                  if used_proxy else
+                                  {"User-Agent": self.ua,
+                                   "Referer": self.host + "/", "Accept": "*/*"})
                         return {"parse": 0, "jx": 0, "playUrl": "",
-                                "url": self._m3u8_proxy_url(m3u8),
-                                "header": header}
+                                "url": play_url, "header": header}
                     return {"parse": 0, "jx": 0, "playUrl": "", "url": m3u8,
-                            "header": header}
+                            "header": {"User-Agent": self.ua,
+                                       "Referer": self.host + "/",
+                                       "Accept": "*/*"}}
             return {"parse": 1, "jx": 0, "playUrl": "", "url": vid,
                     "header": {"User-Agent": self.ua, "Referer": self.host + "/"}}
         return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {}}
