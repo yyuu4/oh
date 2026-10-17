@@ -7,7 +7,7 @@ try:
 except Exception:
     BaseSpider = object
 
-BASE = "https://huangguo.video"
+BASE = "https://huangguoai.fit"
 PAGE_SIZE = 20
 VERSION = "1.4.1"
 CATEGORIES = [
