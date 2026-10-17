@@ -7,9 +7,9 @@ try:
 except Exception:
     BaseSpider = object
 
-BASE_CANDIDATES = ["https://huangguoai.fit", "https://huangguo.video"]
+BASE = "https://huangguoai.fit"
 PAGE_SIZE = 20
-VERSION = "1.5.0"
+VERSION = "1.4.1"
 CATEGORIES = [
     {"type_id": "latest", "type_name": "最新发布"},
     {"type_id": "all", "type_name": "全部视频"},
@@ -111,9 +111,9 @@ USER_AGENT = (
 
 CARD_RE = re.compile(r'<article class="(?:video-card|search-content-card|photo-card)[\s\S]*?</article>')
 ROLE_CARD_RE = re.compile(r'<a[^>]*href="(/role/[a-z0-9-]+)"[^>]*class="[^"]*role-card[^"]*"[^>]*>')
-TITLE_RE = re.compile(r'<p class="[^"]*font-(?:card-title|display)[^"]*"[^>]*>([^<]*)</p>')
+TITLE_RE = re.compile(r'<p class="[^"]*font-display[^"]*"[^>]*>([^<]*)</p>')
 PIC_RE = re.compile(r'<img[^>]*src="([^"]*)"')
-REMARK_RE = re.compile(r'bg-black/\d+[^>]*>([^<]*)<')
+REMARK_RE = re.compile(r'bg-black/55[^>]*>([^<]*)<')
 HREF_RE = re.compile(r'<a[^>]+href="([^"]*)"')
 H1_RE = re.compile(r'<h1[^>]*>([^<]*)</h1>')
 DESC_RE = re.compile(r'<meta name="description" content="([^"]*)"')
@@ -125,106 +125,12 @@ PAGER_RE = re.compile(r'href="[^"]*page=(\d+)"')
 EP_CHIP_RE = re.compile(r'<a[^>]*href="/video/([a-z0-9-]+)"[^>]*class="[^"]*series-ep-chip[^"]*"[^>]*title="第(\d+)集[^"]*"')
 
 
-_base_cache = {"base": ""}
-
-
-def _probe_once(url):
-    """探测域名连通性，可达返回耗时秒数，不可达返回 None。"""
-    import time
-    t0 = time.time()
-    try:
-        try:
-            from com.github.catvod.net import OkHttp
-            from java.util import HashMap
-            from java.util.concurrent import TimeUnit
-
-            hm = HashMap()
-            hm.put("User-Agent", USER_AGENT)
-            call = OkHttp.newCall(url, hm)
-            try:
-                call.timeout().timeout(4, TimeUnit.SECONDS)
-            except Exception:
-                pass
-            resp = call.execute()
-            try:
-                code = 0
-                try:
-                    code = resp.code()
-                except Exception:
-                    pass
-                body = resp.body()
-                if body is not None:
-                    body.string()
-                if code >= 500:
-                    return None
-            finally:
-                try:
-                    resp.close()
-                except Exception:
-                    pass
-        except ImportError:
-            import urllib.request
-
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-            # 绕过系统代理直连探测，与电视盒子的实际网络环境保持一致
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            try:
-                with opener.open(req, timeout=4) as r:
-                    r.read(64)
-            except urllib.error.HTTPError as e:
-                if e.code >= 500:
-                    return None
-                # 收到 4xx 响应（如 Cloudflare 403）也说明域名可达
-                try:
-                    e.read(64)
-                except Exception:
-                    pass
-        return time.time() - t0
-    except Exception:
-        return None
-
-
-def _pick_base():
-    """并行探测候选域名，可达且最快的胜出；全部失败则用第一个作兜底。"""
-    base = _base_cache.get("base")
-    if base:
-        return base
-    import threading
-
-    results = []
-    lock = threading.Lock()
-
-    def worker(cand):
-        elapsed = _probe_once(cand + "/")
-        if elapsed is not None:
-            with lock:
-                results.append((elapsed, cand))
-
-    threads = [threading.Thread(target=worker, args=(c,)) for c in BASE_CANDIDATES]
-    for t in threads:
-        t.daemon = True
-        t.start()
-    for t in threads:
-        t.join()
-    if results:
-        results.sort(key=lambda x: x[0])
-        base = results[0][1]
-    else:
-        base = BASE_CANDIDATES[0]
-    _base_cache["base"] = base
-    return base
-
-
-def _get_base():
-    return _pick_base()
-
-
 def _okhttp_get(url, referer=None, retries=2):
     is_m3u8 = ".m3u8" in url.lower()
     if is_m3u8:
         headers = {
             "User-Agent": USER_AGENT,
-            "Referer": referer or _get_base() + "/",
+            "Referer": referer or BASE + "/",
         }
     else:
         headers = {
@@ -286,14 +192,7 @@ def _okhttp_get(url, referer=None, retries=2):
 
 
 def _http_get(url, referer=None):
-    try:
-        return _okhttp_get(url, referer=referer)
-    except Exception:
-        # 当前主域名持续失败时清除缓存，下次调用自动重新探测切换域名
-        base = _base_cache.get("base")
-        if base and str(url).startswith(base):
-            _base_cache["base"] = ""
-        raise
+    return _okhttp_get(url, referer=referer)
 
 
 _variant_cache = {}
@@ -302,7 +201,7 @@ def _pick_variant(master_url):
     if master_url in _variant_cache:
         return _variant_cache[master_url]
     try:
-        txt = _okhttp_get(master_url, referer=_get_base() + "/")
+        txt = _okhttp_get(master_url, referer=BASE + "/")
     except Exception:
         _variant_cache[master_url] = master_url
         return master_url
@@ -334,7 +233,7 @@ def _pick_variant(master_url):
     if uri.startswith("http://") or uri.startswith("https://"):
         result = uri
     elif uri.startswith("/"):
-        result = _get_base() + uri
+        result = BASE + uri
     else:
         result = base_dir + uri
     _variant_cache[master_url] = result
@@ -357,10 +256,6 @@ class Spider(BaseSpider):
             self.options = {}
         self._hls_cache = self._hls_cache or {}
         self._detail_cache = self._detail_cache or {}
-        try:
-            _pick_base()
-        except Exception:
-            pass
 
     def getName(self):
         return "黄果剧场"
@@ -420,15 +315,15 @@ class Spider(BaseSpider):
 
     def _build_url(self, cat, pg, keyword, ext=None):
         if cat == "latest":
-            url = "%s/videos" % _get_base()
+            url = "%s/videos" % BASE
         elif cat == "photos":
-            url = "%s/photos" % _get_base()
+            url = "%s/photos" % BASE
         elif cat == "roles":
-            url = "%s/roles" % _get_base()
+            url = "%s/roles" % BASE
         elif cat == "ranking":
-            url = "%s/ranking" % _get_base()
+            url = "%s/ranking" % BASE
         else:
-            url = "%s/videos?category=%s" % (_get_base(), quote(cat))
+            url = "%s/videos?category=%s" % (BASE, quote(cat))
         if keyword:
             sep = "&" if "?" in url else "?"
             url += sep + "q=" + quote(keyword)
@@ -447,7 +342,7 @@ class Spider(BaseSpider):
         return url
 
     def _search_url(self, keyword, pg):
-        url = "%s/search?q=%s" % (_get_base(), quote(keyword))
+        url = "%s/search?q=%s" % (BASE, quote(keyword))
         page = max(1, int(pg) if str(pg).isdigit() else 1)
         if page > 1:
             url += "&page=%d" % page
@@ -455,7 +350,7 @@ class Spider(BaseSpider):
 
     def _list(self, cat, pg, keyword, ext=None):
         url = self._build_url(cat, pg, keyword, ext)
-        html_text = _http_get(url, referer=_get_base() + "/")
+        html_text = _http_get(url, referer=BASE + "/")
         if cat == "roles":
             cards = []
             for m in ROLE_CARD_RE.finditer(html_text):
@@ -465,14 +360,14 @@ class Spider(BaseSpider):
                 if end < 0:
                     continue
                 inner = html_text[start:end]
-                title_m = re.search(r'<p class="mt-2\.5 font-(?:card-title|display)[^"]*"[^>]*>([^<]*)</p>', inner)
+                title_m = re.search(r'<p class="mt-2\.5 font-display[^"]*"[^>]*>([^<]*)</p>', inner)
                 title = title_m.group(1).strip() if title_m else ""
                 pic_m = re.search(r'background-image:url\(([^)]+)\)', inner)
                 pic = ""
                 if pic_m:
                     pic_url = pic_m.group(1).split(",")[0].strip()
                     pic = self._absolute(pic_url)
-                remark_m = re.search(r'bg-black/\d+[^>]*>([^<]*)<', inner)
+                remark_m = re.search(r'bg-black/55[^>]*>([^<]*)<', inner)
                 remark = remark_m.group(1).strip() if remark_m else ""
                 cards.append({
                     "vod_id": "role/%s" % code,
@@ -496,7 +391,7 @@ class Spider(BaseSpider):
 
     def _search(self, keyword, pg):
         url = self._search_url(keyword, pg)
-        html_text = _http_get(url, referer=_get_base() + "/")
+        html_text = _http_get(url, referer=BASE + "/")
         cards = [self._parse_card(b) for b in CARD_RE.findall(html_text)]
         cards = [c for c in cards if c]
         return {
@@ -567,7 +462,7 @@ class Spider(BaseSpider):
             "vod_play_url": "",
         }
         if kind == "series":
-            text = _http_get("%s/series/%s" % (_get_base(), code), referer=_get_base() + "/")
+            text = _http_get("%s/series/%s" % (BASE, code), referer=BASE + "/")
             item["vod_name"] = self._first(H1_RE, text) or ""
             item["vod_pic"] = self._absolute(
                 self._first(OGIMG_RE, text) or self._first(POSTER_RE, text)
@@ -591,7 +486,7 @@ class Spider(BaseSpider):
                 item["vod_remark"] = "全%s集" % total_m.group(1)
             item["vod_play_url"] = "#".join(urls)
         else:
-            text = _http_get("%s/video/%s" % (_get_base(), code), referer=_get_base() + "/")
+            text = _http_get("%s/video/%s" % (BASE, code), referer=BASE + "/")
             item["vod_name"] = self._first(H1_RE, text) or "正片"
             item["vod_pic"] = self._absolute(
                 self._first(POSTER_RE, text) or self._first(OGIMG_RE, text)
@@ -604,7 +499,7 @@ class Spider(BaseSpider):
     def _resolve_hls(self, code):
         if code in self._hls_cache:
             return self._hls_cache[code]
-        text = _http_get("%s/video/%s" % (_get_base(), code), referer=_get_base() + "/")
+        text = _http_get("%s/video/%s" % (BASE, code), referer=BASE + "/")
         m = HLS_RE.search(text)
         result = self._absolute(m.group(1)) if m else ""
         if result:
@@ -625,7 +520,7 @@ class Spider(BaseSpider):
                 "parse": 0,
                 "jx": 0,
                 "url": playable,
-                "header": {"Referer": _get_base() + "/"},
+                "header": {"Referer": BASE + "/"},
             }
         except Exception as e:
             return {"parse": 0, "jx": 0, "url": "", "msg": "播放失败：" + type(e).__name__}
@@ -651,7 +546,7 @@ class Spider(BaseSpider):
         if v.startswith("http://") or v.startswith("https://"):
             return v
         if v.startswith("/"):
-            return _get_base() + v
+            return BASE + v
         return v
 
     @staticmethod
