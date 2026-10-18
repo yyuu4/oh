@@ -385,16 +385,17 @@
       }
     },
 	  {
-      "key": "玩偶‖表哥",
-      "name": "玩偶‖表哥",
+      "key": "玩偶‖花卷",
+      "name": "玩偶‖花卷",
       "type": 3,
-      "api": "csp_kongbai",
+      "api": "csp_HuaJuan",
       "searchable": 1,
       "changeable": 0,
       "ext": {
         "commonConfig": "./json/peizhi.json",
-        "siteUrl": "http://xn--4yqy17f.xn--yi7aa.vip:3155",
-        "filter": "./json/wogg.json"
+        "siteUrl": [
+          "https://www.hjzhencai.top/"
+        ]
       }
     },
     {
