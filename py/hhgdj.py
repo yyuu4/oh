@@ -10,7 +10,7 @@ except Exception:
 
 BASE = "https://huangguoai.fit"
 PAGE_SIZE = 20
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 CATEGORIES = [
     {"type_id": "latest", "type_name": "最新发布"},
     {"type_id": "all", "type_name": "全部视频"},
