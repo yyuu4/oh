@@ -265,19 +265,7 @@ class Spider(BaseSpider):
             return {"list": [self._error_card("详情载入失败", exc, subject_id)]}
 
     def searchContent(self, key, quick=False, pg="1"):
-        page = self._positive_int(pg, 1)
-        limit = 20
-        params = {"q": key, "start": (page - 1) * limit, "count": limit}
-        try:
-            data = self._get_json(self.MOVIE + "/j/search_subjects", params=params, ttl=self.list_cache_ttl)
-            items = [self._subject_card(raw, {}) for raw in data.get("subjects") or []]
-            if not items and page == 1:
-                suggest = self._get_json(self.MOVIE + "/j/subject_suggest", params={"q": key}, ttl=self.list_cache_ttl)
-                items = [self._subject_card(raw, {}) for raw in suggest or []]
-            pagecount = page + (1 if len(items) >= limit else 0)
-            return self._page_result(items, page, pagecount, pagecount * limit, limit)
-        except Exception as exc:
-            return self._page_result([self._error_card("搜索失败", exc)], page, page, 1, limit)
+        return {"list": []}
 
     def playerContent(self, flag, id, vipFlags=None):
         return {
