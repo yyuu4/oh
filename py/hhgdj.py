@@ -9,7 +9,7 @@ except Exception:
 
 BASE = "https://huangguoai.fit"
 PAGE_SIZE = 20
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 CATEGORIES = [
     {"type_id": "latest", "type_name": "最新发布"},
     {"type_id": "all", "type_name": "全部视频"},
@@ -111,9 +111,12 @@ USER_AGENT = (
 
 CARD_RE = re.compile(r'<article class="(?:video-card|search-content-card|photo-card)[\s\S]*?</article>')
 ROLE_CARD_RE = re.compile(r'<a[^>]*href="(/role/[a-z0-9-]+)"[^>]*class="[^"]*role-card[^"]*"[^>]*>')
-TITLE_RE = re.compile(r'<p class="[^"]*font-display[^"]*"[^>]*>([^<]*)</p>')
+TITLE_RE = re.compile(r'<p class="[^"]*font-(?:card-title|display)[^"]*"[^>]*>([^<]*)</p>')
 PIC_RE = re.compile(r'<img[^>]*src="([^"]*)"')
-REMARK_RE = re.compile(r'bg-black/55[^>]*>([^<]*)<')
+ALT_RE = re.compile(r'<img[^>]*alt="([^"]+)"')
+PILL_RE = re.compile(r'cover-pill-text[^>]*>([^<]*)<')
+REMARK_RE = re.compile(r'bg-black/(?:50|55)[^>]*>([^<]*)<')
+META_P_RE = re.compile(r'<p class="[^"]*font-mono-meta[^"]*"[^>]*>([^<]*)</p>')
 HREF_RE = re.compile(r'<a[^>]+href="([^"]*)"')
 H1_RE = re.compile(r'<h1[^>]*>([^<]*)</h1>')
 DESC_RE = re.compile(r'<meta name="description" content="([^"]*)"')
@@ -123,6 +126,12 @@ HLS_RE = re.compile(r'data-hls="([^"]*)"')
 TOTAL_RE = re.compile(r'全(\d+)\s*集')
 PAGER_RE = re.compile(r'href="[^"]*page=(\d+)"')
 EP_CHIP_RE = re.compile(r'<a[^>]*href="/video/([a-z0-9-]+)"[^>]*class="[^"]*series-ep-chip[^"]*"[^>]*title="第(\d+)集[^"]*"')
+PHOTO_VIDEO_RE = re.compile(r'data-video="([^"]+)"')
+BADGE_RE = re.compile(r'<span class="badge">([^<]*)</span>')
+COUNTER_RE = re.compile(r'viewer-counter[^>]*>\s*\d+\s*/\s*(\d+)')
+VCARD_START_RE = re.compile(r'<a[^>]*class="vcard"')
+VWORK_HREF_RE = re.compile(r'href="(/(?:video|photo|series)/[a-z0-9-]+)"')
+VWORK_TITLE_RE = re.compile(r'<div class="vcard-title">([^<]*)</div>')
 
 
 def _okhttp_get(url, referer=None, retries=2):
@@ -166,6 +175,13 @@ def _okhttp_get(url, referer=None, retries=2):
                     pass
                 resp = call.execute()
                 try:
+                    try:
+                        status = int(resp.code())
+                    except Exception:
+                        status = 0
+                    if status >= 400:
+                        from urllib.error import HTTPError as _HTTPError
+                        raise _HTTPError(url, status, "Error", {}, None)
                     body = resp.body()
                     return str(body.string()) if body is not None else ""
                 finally:
@@ -185,6 +201,9 @@ def _okhttp_get(url, referer=None, retries=2):
                     return data.decode("utf-8", "ignore")
         except Exception as e:
             last_err = e
+            code = getattr(e, "code", None)
+            if isinstance(code, int) and 400 <= code < 500 and code not in (408, 429):
+                break
             if attempt < retries:
                 import time
                 time.sleep(0.5 * (attempt + 1))
@@ -198,6 +217,8 @@ def _http_get(url, referer=None):
 _variant_cache = {}
 
 def _pick_variant(master_url):
+    if not str(master_url or "").split("?")[0].lower().endswith(".m3u8"):
+        return master_url
     if master_url in _variant_cache:
         return _variant_cache[master_url]
     try:
@@ -360,15 +381,15 @@ class Spider(BaseSpider):
                 if end < 0:
                     continue
                 inner = html_text[start:end]
-                title_m = re.search(r'<p class="mt-2\.5 font-display[^"]*"[^>]*>([^<]*)</p>', inner)
-                title = title_m.group(1).strip() if title_m else ""
+                title = " ".join(self._clean(inner, TITLE_RE).split())
+                if not title:
+                    title = self._clean(inner, ALT_RE)
                 pic_m = re.search(r'background-image:url\(([^)]+)\)', inner)
                 pic = ""
                 if pic_m:
                     pic_url = pic_m.group(1).split(",")[0].strip()
                     pic = self._absolute(pic_url)
-                remark_m = re.search(r'bg-black/55[^>]*>([^<]*)<', inner)
-                remark = remark_m.group(1).strip() if remark_m else ""
+                remark = self._remark(inner)
                 cards.append({
                     "vod_id": "role/%s" % code,
                     "vod_name": title,
@@ -416,12 +437,12 @@ class Spider(BaseSpider):
         else:
             kind = "video"
         code = href.rstrip("/").split("/")[-1]
-        title_m = TITLE_RE.search(block)
-        title = title_m.group(1).strip() if title_m else ""
+        title = " ".join(self._clean(block, TITLE_RE).split())
+        if not title:
+            title = self._clean(block, ALT_RE)
         pic_m = PIC_RE.search(block)
         pic = self._absolute(pic_m.group(1)) if pic_m else ""
-        remark_m = REMARK_RE.search(block)
-        remark = remark_m.group(1).strip() if remark_m else ""
+        remark = self._remark(block)
         type_map = {"series": "连续剧", "photo": "图集", "role": "角色", "video": "视频"}
         return {
             "vod_id": "%s/%s" % (kind, code),
@@ -442,13 +463,30 @@ class Spider(BaseSpider):
         try:
             item = self._parse_detail(ident)
             if not item.get("vod_play_url"):
-                result = {"list": [item], "msg": "未能解析到播放地址"}
+                result = {"list": [item], "msg": self._empty_msg(ident)}
             else:
                 result = {"list": [item]}
             self._detail_cache[ident] = result
             return result
         except Exception as e:
-            return {"list": [], "msg": "详情加载失败：" + type(e).__name__}
+            return {"list": [], "msg": "详情加载失败：" + self._err(e)}
+
+    @staticmethod
+    def _err(e):
+        name = type(e).__name__
+        code = getattr(e, "code", None)
+        if isinstance(code, int):
+            return "%s(%d)" % (name, code)
+        text = str(e).strip()
+        if text and text != name:
+            return "%s：%s" % (name, text[:80])
+        return name
+
+    @staticmethod
+    def _empty_msg(ident):
+        if str(ident).startswith("photo/"):
+            return "静态图集暂无可播放视频"
+        return "未能解析到播放地址"
 
     def _parse_detail(self, ident):
         parts = str(ident).split("/")
@@ -473,18 +511,18 @@ class Spider(BaseSpider):
             for m in EP_CHIP_RE.finditer(text):
                 eps.append((int(m.group(2)), m.group(1)))
             eps.sort()
-            urls = []
-            for ep_num, ep_code in eps:
-                master = self._resolve_hls(ep_code)
-                if master:
-                    urls.append("第%d集$%s" % (ep_num, master))
+            urls = ["第%d集$work:video/%s" % (ep_num, ep_code) for ep_num, ep_code in eps]
             if not urls:
-                master = self._resolve_hls(code)
-                if master:
-                    urls.append("正片$%s" % master)
+                urls = ["正片$work:series/%s" % code]
             if total_m:
                 item["vod_remark"] = "全%s集" % total_m.group(1)
+            if not item.get("vod_remark"):
+                item["vod_remark"] = self._series_remark(text)
             item["vod_play_url"] = "#".join(urls)
+        elif kind == "photo":
+            self._fill_photo(item, code)
+        elif kind == "role":
+            self._fill_role(item, code)
         else:
             text = _http_get("%s/video/%s" % (BASE, code), referer=BASE + "/")
             item["vod_name"] = self._first(H1_RE, text) or "正片"
@@ -492,9 +530,69 @@ class Spider(BaseSpider):
                 self._first(POSTER_RE, text) or self._first(OGIMG_RE, text)
             )
             item["vod_content"] = self._first(DESC_RE, text) or ""
-            master = self._resolve_hls(code)
+            master = self._absolute(self._first(HLS_RE, text))
+            if not master:
+                master = self._resolve_hls(code)
+            elif master not in self._hls_cache:
+                self._hls_cache[code] = master
             item["vod_play_url"] = "正片$%s" % (master or "")
         return item
+
+    @staticmethod
+    def _series_remark(text):
+        m = H1_RE.search(text)
+        tail = text[m.end():m.end() + 500] if m else ""
+        meta = META_P_RE.search(tail)
+        if meta:
+            return " ".join(meta.group(1).split())
+        return ""
+
+    def _fill_photo(self, item, code):
+        text = _http_get("%s/photo/%s" % (BASE, code), referer=BASE + "/")
+        item["vod_name"] = self._first(H1_RE, text) or code
+        item["vod_pic"] = self._absolute(
+            self._first(OGIMG_RE, text) or self._first(POSTER_RE, text)
+        )
+        item["vod_content"] = self._first(DESC_RE, text) or ""
+        urls = []
+        for i, v in enumerate(PHOTO_VIDEO_RE.findall(text), 1):
+            u = self._absolute(v)
+            if u:
+                urls.append("第%d张$%s" % (i, u))
+        badges = BADGE_RE.findall(text)
+        remark = " ".join(badges[-1].split()) if badges else ""
+        if not remark:
+            counter = COUNTER_RE.search(text)
+            if counter:
+                remark = "%s 张" % counter.group(1)
+        if remark:
+            item["vod_remark"] = remark
+        elif urls:
+            item["vod_remark"] = "共%d段" % len(urls)
+        item["vod_play_url"] = "#".join(urls)
+
+    def _fill_role(self, item, code):
+        text = _http_get("%s/role/%s" % (BASE, code), referer=BASE + "/")
+        item["vod_name"] = self._first(H1_RE, text) or code
+        item["vod_pic"] = self._absolute(
+            self._first(OGIMG_RE, text) or self._first(POSTER_RE, text)
+        )
+        item["vod_content"] = self._first(DESC_RE, text) or ""
+        starts = [m.start() for m in VCARD_START_RE.finditer(text)]
+        urls = []
+        for i, start in enumerate(starts):
+            end = starts[i + 1] if i + 1 < len(starts) else len(text)
+            block = text[start:end]
+            href_m = VWORK_HREF_RE.search(block)
+            if not href_m:
+                continue
+            rel = href_m.group(1).lstrip("/")
+            title = " ".join(self._clean(block, VWORK_TITLE_RE).split())
+            title = title.replace("$", " ").replace("#", " ").strip()
+            urls.append("%s$work:%s" % (title or "作品%d" % (i + 1), rel))
+        if urls:
+            item["vod_remark"] = "共%d部作品" % len(urls)
+        item["vod_play_url"] = "#".join(urls)
 
     def _resolve_hls(self, code):
         if code in self._hls_cache:
@@ -506,14 +604,45 @@ class Spider(BaseSpider):
             self._hls_cache[code] = result
         return result
 
+    def _resolve_photo_video(self, code):
+        key = "photo:%s" % code
+        if key in self._hls_cache:
+            return self._hls_cache[key]
+        text = _http_get("%s/photo/%s" % (BASE, code), referer=BASE + "/")
+        m = PHOTO_VIDEO_RE.search(text)
+        result = self._absolute(m.group(1)) if m else ""
+        self._hls_cache[key] = result
+        return result
+
+    def _resolve_series(self, code):
+        text = _http_get("%s/series/%s" % (BASE, code), referer=BASE + "/")
+        m = EP_CHIP_RE.search(text)
+        return self._resolve_hls(m.group(1)) if m else self._resolve_hls(code)
+
+    def _resolve_work(self, ident):
+        parts = str(ident).split("/")
+        kind = parts[0] if parts else ""
+        code = parts[1] if len(parts) >= 2 else ""
+        if not code:
+            return ""
+        if kind == "photo":
+            return self._resolve_photo_video(code)
+        if kind == "series":
+            return self._resolve_series(code)
+        return self._resolve_hls(code)
+
     def playerContent(self, flag, id, vipFlags):
         del flag, vipFlags
         try:
             cur = str(id or "").split("#")[0]
             sep = cur.rfind("$")
             hls = cur[sep + 1:] if sep >= 0 else cur
+            if hls.startswith("work:"):
+                hls = self._resolve_work(hls[5:])
+                if not hls:
+                    return {"parse": 0, "jx": 0, "url": "", "msg": "该作品暂无可播放地址"}
             url = self._absolute(hls)
-            if not url:
+            if not url or not url.startswith(("http://", "https://")):
                 return {"parse": 0, "jx": 0, "url": "", "msg": "空播放地址"}
             playable = _pick_variant(url)
             return {
@@ -523,7 +652,7 @@ class Spider(BaseSpider):
                 "header": {"Referer": BASE + "/"},
             }
         except Exception as e:
-            return {"parse": 0, "jx": 0, "url": "", "msg": "播放失败：" + type(e).__name__}
+            return {"parse": 0, "jx": 0, "url": "", "msg": "播放失败：" + self._err(e)}
 
     def manualVideoCheck(self):
         return False
@@ -553,3 +682,15 @@ class Spider(BaseSpider):
     def _first(regex, text):
         m = regex.search(text)
         return m.group(1) if m else ""
+
+    @classmethod
+    def _clean(cls, text, regex):
+        return (cls._first(regex, text) or "").strip()
+
+    @classmethod
+    def _remark(cls, text):
+        for rx in (PILL_RE, REMARK_RE, META_P_RE):
+            value = cls._clean(text, rx)
+            if value:
+                return " ".join(value.split())
+        return ""
