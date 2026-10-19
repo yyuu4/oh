@@ -1,5 +1,6 @@
 import re
 import json
+from html import unescape
 from urllib.parse import quote
 
 try:
@@ -132,6 +133,7 @@ COUNTER_RE = re.compile(r'viewer-counter[^>]*>\s*\d+\s*/\s*(\d+)')
 VCARD_START_RE = re.compile(r'<a[^>]*class="vcard"')
 VWORK_HREF_RE = re.compile(r'href="(/(?:video|photo|series)/[a-z0-9-]+)"')
 VWORK_TITLE_RE = re.compile(r'<div class="vcard-title">([^<]*)</div>')
+BGIMG_RE = re.compile(r'background-image:url\(([^)]+)\)')
 
 
 def _okhttp_get(url, referer=None, retries=2):
@@ -303,7 +305,7 @@ class Spider(BaseSpider):
         except Exception as e:
             return {
                 "list": [], "page": 1, "pagecount": 1, "limit": PAGE_SIZE,
-                "total": 0, "msg": "首页推荐加载失败：" + type(e).__name__,
+                "total": 0, "msg": "首页推荐加载失败：" + self._err(e),
             }
 
     def categoryContent(self, tid, pg, filter, extend):
@@ -321,7 +323,7 @@ class Spider(BaseSpider):
         except Exception as e:
             return {
                 "list": [], "page": 1, "pagecount": 1, "limit": PAGE_SIZE,
-                "total": 0, "msg": "分类加载失败：" + type(e).__name__,
+                "total": 0, "msg": "分类加载失败：" + self._err(e),
             }
 
     def searchContent(self, key, quick, pg="1"):
@@ -331,7 +333,7 @@ class Spider(BaseSpider):
         except Exception as e:
             return {
                 "list": [], "page": 1, "pagecount": 1, "limit": PAGE_SIZE,
-                "total": 0, "msg": "搜索失败：" + type(e).__name__,
+                "total": 0, "msg": "搜索失败：" + self._err(e),
             }
 
     def _build_url(self, cat, pg, keyword, ext=None):
@@ -384,11 +386,8 @@ class Spider(BaseSpider):
                 title = " ".join(self._clean(inner, TITLE_RE).split())
                 if not title:
                     title = self._clean(inner, ALT_RE)
-                pic_m = re.search(r'background-image:url\(([^)]+)\)', inner)
-                pic = ""
-                if pic_m:
-                    pic_url = pic_m.group(1).split(",")[0].strip()
-                    pic = self._absolute(pic_url)
+                pic_url = self._first(BGIMG_RE, inner)
+                pic = self._absolute(pic_url.split(",")[0].strip()) if pic_url else ""
                 remark = self._remark(inner)
                 cards.append({
                     "vod_id": "role/%s" % code,
@@ -440,8 +439,7 @@ class Spider(BaseSpider):
         title = " ".join(self._clean(block, TITLE_RE).split())
         if not title:
             title = self._clean(block, ALT_RE)
-        pic_m = PIC_RE.search(block)
-        pic = self._absolute(pic_m.group(1)) if pic_m else ""
+        pic = self._absolute(self._clean(block, PIC_RE))
         remark = self._remark(block)
         type_map = {"series": "连续剧", "photo": "图集", "role": "角色", "video": "视频"}
         return {
@@ -485,7 +483,7 @@ class Spider(BaseSpider):
     @staticmethod
     def _empty_msg(ident):
         if str(ident).startswith("photo/"):
-            return "静态图集暂无可播放视频"
+            return "静态图集暂无可播放视频（OK影视不支持图片浏览）"
         return "未能解析到播放地址"
 
     def _parse_detail(self, ident):
@@ -538,14 +536,12 @@ class Spider(BaseSpider):
             item["vod_play_url"] = "正片$%s" % (master or "")
         return item
 
-    @staticmethod
-    def _series_remark(text):
+    @classmethod
+    def _series_remark(cls, text):
         m = H1_RE.search(text)
         tail = text[m.end():m.end() + 500] if m else ""
-        meta = META_P_RE.search(tail)
-        if meta:
-            return " ".join(meta.group(1).split())
-        return ""
+        meta = cls._first(META_P_RE, tail)
+        return " ".join(meta.split()) if meta else ""
 
     def _fill_photo(self, item, code):
         text = _http_get("%s/photo/%s" % (BASE, code), referer=BASE + "/")
@@ -556,11 +552,11 @@ class Spider(BaseSpider):
         item["vod_content"] = self._first(DESC_RE, text) or ""
         urls = []
         for i, v in enumerate(PHOTO_VIDEO_RE.findall(text), 1):
-            u = self._absolute(v)
+            u = self._absolute(unescape(v).strip())
             if u:
                 urls.append("第%d张$%s" % (i, u))
         badges = BADGE_RE.findall(text)
-        remark = " ".join(badges[-1].split()) if badges else ""
+        remark = " ".join(unescape(badges[-1]).split()) if badges else ""
         if not remark:
             counter = COUNTER_RE.search(text)
             if counter:
@@ -598,8 +594,7 @@ class Spider(BaseSpider):
         if code in self._hls_cache:
             return self._hls_cache[code]
         text = _http_get("%s/video/%s" % (BASE, code), referer=BASE + "/")
-        m = HLS_RE.search(text)
-        result = self._absolute(m.group(1)) if m else ""
+        result = self._absolute(self._first(HLS_RE, text))
         if result:
             self._hls_cache[code] = result
         return result
@@ -609,15 +604,14 @@ class Spider(BaseSpider):
         if key in self._hls_cache:
             return self._hls_cache[key]
         text = _http_get("%s/photo/%s" % (BASE, code), referer=BASE + "/")
-        m = PHOTO_VIDEO_RE.search(text)
-        result = self._absolute(m.group(1)) if m else ""
+        result = self._absolute(self._first(PHOTO_VIDEO_RE, text))
         self._hls_cache[key] = result
         return result
 
     def _resolve_series(self, code):
         text = _http_get("%s/series/%s" % (BASE, code), referer=BASE + "/")
-        m = EP_CHIP_RE.search(text)
-        return self._resolve_hls(m.group(1)) if m else self._resolve_hls(code)
+        ep = self._first(EP_CHIP_RE, text)
+        return self._resolve_hls(ep) if ep else self._resolve_hls(code)
 
     def _resolve_work(self, ident):
         parts = str(ident).split("/")
@@ -638,8 +632,11 @@ class Spider(BaseSpider):
             sep = cur.rfind("$")
             hls = cur[sep + 1:] if sep >= 0 else cur
             if hls.startswith("work:"):
-                hls = self._resolve_work(hls[5:])
+                ident = hls[5:]
+                hls = self._resolve_work(ident)
                 if not hls:
+                    if ident.startswith("photo/"):
+                        return {"parse": 0, "jx": 0, "url": "", "msg": "静态图集无可播放视频"}
                     return {"parse": 0, "jx": 0, "url": "", "msg": "该作品暂无可播放地址"}
             url = self._absolute(hls)
             if not url or not url.startswith(("http://", "https://")):
@@ -681,7 +678,9 @@ class Spider(BaseSpider):
     @staticmethod
     def _first(regex, text):
         m = regex.search(text)
-        return m.group(1) if m else ""
+        if not m:
+            return ""
+        return unescape(m.group(1)).strip()
 
     @classmethod
     def _clean(cls, text, regex):
