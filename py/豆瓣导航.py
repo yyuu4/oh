@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 # //@name:豆瓣导航
 # //@id:douban_meta_wish
-# //@version:1.1.3
+# //@version:1.1.4
 #
 # 更新日志:
+# 1.1.4  筛选器重构：tvfilter 改为 形式/题材 两级（与热门分类一致）；moviefilter 补齐平台筛选；
+#        统一排序 key=sort；动态筛选同步更新键名
 # 1.1.3  统一数据源：电影/剧集「实时热门」改走 /movie|tv/recommend 推荐接口，与首页一致，支持筛选分页
 # 1.1.2  修复榜单接口失效：电影/剧集「实时热门」改用 /j/search_subjects 兜底；Top250 恢复 250 条
 # 1.1.1  核心修复：实现搜索、Cookie 自动解析 user_id/ck、缓存键加前缀、详情页补充播放占位、
@@ -346,7 +348,7 @@ class Spider(BaseSpider):
             endpoint = "movie"
             selected = {"类型": genre, "地区": area}
             expected_type = "movie"
-            tags = [genre, area, year, tag]
+            tags = [genre, area, year, platform, tag]
         else:
             endpoint = "tv"
             form = "电视剧" if media == "tv" else "综艺"
@@ -427,20 +429,24 @@ class Spider(BaseSpider):
     def _category_recommend(self, kind, page, ext):
         limit = 20
         if kind == "movie":
-            type_value = self._value(ext, "1", "")
-            area = self._value(ext, "2", "")
-            tags = [type_value, area, self._value(ext, "3", ""), self._value(ext, "4", "")]
+            type_value = self._value(ext, "type", "")
+            area = self._value(ext, "area", "")
+            year = self._value(ext, "year", "")
+            platform = self._value(ext, "platform", "")
+            tag = self._value(ext, "tag", "")
+            tags = [type_value, area, year, platform, tag]
             selected = {"类型": type_value, "地区": area}
-            sort = self._value(ext, "5", "U")
+            sort = self._value(ext, "sort", "U")
         else:
-            form = self._value(ext, "1", "")
-            series = self._value(ext, "2", "")
-            show = self._value(ext, "3", "")
-            area = self._value(ext, "4", "")
-            subtype = series if form == "电视剧" else show if form == "综艺" else ""
-            tags = [subtype or form, area, self._value(ext, "5", ""), self._value(ext, "6", ""), self._value(ext, "7", "")]
-            selected = {"类型": subtype, "形式": form, "地区": area}
-            sort = self._value(ext, "8", "U")
+            form = self._value(ext, "form", "")
+            genre = self._value(ext, "genre", "")
+            area = self._value(ext, "area", "")
+            year = self._value(ext, "year", "")
+            platform = self._value(ext, "platform", "")
+            tag = self._value(ext, "tag", "")
+            tags = [form, genre, area, year, platform, tag]
+            selected = {"类型": genre, "形式": form, "地区": area}
+            sort = self._value(ext, "sort", "U")
         params = {
             "refresh": 0,
             "start": (page - 1) * limit,
@@ -636,21 +642,21 @@ class Spider(BaseSpider):
             "movielist": [self._filter("1", "榜单", self.MOVIE_LISTS)],
             "tvlist": [self._filter("1", "榜单", self.TV_LISTS)],
             "moviefilter": [
-                self._filter("5", "排序", self.SORTS),
-                self._filter("1", "类型", [("全部类型", "")] + [(v, v) for v in self.MOVIE_TYPES]),
-                self._filter("2", "地区", [("全部地区", "")] + [(v, v) for v in self.AREAS]),
-                self._filter("3", "年代", [("全部年代", "")] + [(v, v) for v in years]),
-                self._filter("4", "标签", [("全部标签", "")] + [(v, v) for v in self.TAGS]),
+                self._filter("sort", "排序", self.SORTS),
+                self._filter("type", "类型", [("全部类型", "")] + [(v, v) for v in self.MOVIE_TYPES]),
+                self._filter("area", "地区", [("全部地区", "")] + [(v, v) for v in self.AREAS]),
+                self._filter("year", "年代", [("全部年代", "")] + [(v, v) for v in years]),
+                self._filter("platform", "平台", [("全部平台", "")] + [(v, v) for v in self.PLATFORMS]),
+                self._filter("tag", "标签", [("全部标签", "")] + [(v, v) for v in self.TAGS]),
             ],
             "tvfilter": [
-                self._filter("8", "排序", self.SORTS),
-                self._filter("1", "类型", [("全部类型", "")] + [(v, v) for v in self.TV_TYPES]),
-                self._filter("2", "电视剧", [("全部剧集", "")] + [(v, v) for v in self.SERIES_TYPES]),
-                self._filter("3", "综艺", [("全部综艺", "")] + [(v, v) for v in self.SHOW_TYPES]),
-                self._filter("4", "地区", [("全部地区", "")] + [(v, v) for v in self.AREAS]),
-                self._filter("5", "年代", [("全部年代", "")] + [(v, v) for v in years]),
-                self._filter("6", "平台", [("全部平台", "")] + [(v, v) for v in self.PLATFORMS]),
-                self._filter("7", "标签", [("全部标签", "")] + [(v, v) for v in self.TAGS]),
+                self._filter("sort", "排序", self.SORTS),
+                self._filter("form", "形式", [("全部形式", ""), ("电视剧", "电视剧"), ("综艺", "综艺")]),
+                self._filter("genre", "题材", [("全部题材", "")] + [(v, v) for v in self.TV_GENRES]),
+                self._filter("area", "地区", [("全部地区", "")] + [(v, v) for v in self.AREAS]),
+                self._filter("year", "年代", [("全部年代", "")] + [(v, v) for v in years]),
+                self._filter("platform", "平台", [("全部平台", "")] + [(v, v) for v in self.PLATFORMS]),
+                self._filter("tag", "标签", [("全部标签", "")] + [(v, v) for v in self.TAGS]),
             ],
             "anime": self._anime_filters(years),
             "wishlist": [],
@@ -698,12 +704,18 @@ class Spider(BaseSpider):
                         name = str(item).replace("全部剧集", "电视剧").replace("全部综艺", "综艺")
                         values.append((name, name))
                     if values:
-                        self._set_filter_values(target, "1", [("全部类型", "")] + values)
-                if len(categories) > 1:
-                    areas = categories[1].get("data") or []
+                        self._set_filter_values(target, "form", [("全部形式", "")] + values)
+                genre_data = categories[1].get("data") if len(categories) > 1 else []
+                if genre_data:
+                    genre_tags = genre_data[0].get("tags") or []
+                    genre_values = [(str(t), str(t)) for t in genre_tags[1:] if t]
+                    if genre_values:
+                        self._set_filter_values(target, "genre", [("全部题材", "")] + genre_values)
+                if len(categories) > 2:
+                    areas = categories[2].get("data") or []
                     values = [(str(v.get("text")), str(v.get("text"))) for v in areas[1:] if v.get("text")]
                     if values:
-                        self._set_filter_values(target, "4", [("全部地区", "")] + values)
+                        self._set_filter_values(target, "area", [("全部地区", "")] + values)
             else:
                 for index in (0, 1):
                     values = []
@@ -711,10 +723,10 @@ class Spider(BaseSpider):
                         if item.get("text"):
                             values.append((str(item["text"]), str(item["text"])))
                     if values:
-                        self._set_filter_values(target, "1" if index == 0 else "2", [("全部" + ("类型" if index == 0 else "地区"), "")] + values)
+                        self._set_filter_values(target, "type" if index == 0 else "area", [("全部" + ("类型" if index == 0 else "地区"), "")] + values)
             sorts = [(str(v.get("text")), str(v.get("name"))) for v in data.get("sorts") or [] if v.get("text") and v.get("name")]
             if sorts:
-                self._set_filter_values(target, "8" if is_tv else "5", sorts)
+                self._set_filter_values(target, "sort", sorts)
         except Exception:
             return
 
