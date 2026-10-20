@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 # //@name:豆瓣导航
 # //@id:douban_meta_wish
-# //@version:1.1.4
+# //@version:1.1.5
 #
 # 更新日志:
+# 1.1.5  质量修复：持久化筛选校验 expiresAt（过期回退动态重建）；destroy 后重新 init 恢复线程池；
+#        inflight 去重锁不再跨等待持锁（解除跨 URL 串行阻塞）；清理死代码
 # 1.1.4  筛选器重构：tvfilter 改为 形式/题材 两级（与热门分类一致）；moviefilter 补齐平台筛选；
 #        统一排序 key=sort；动态筛选同步更新键名
 # 1.1.3  统一数据源：电影/剧集「实时热门」改走 /movie|tv/recommend 推荐接口，与首页一致，支持筛选分页
@@ -71,8 +73,6 @@ class Spider(BaseSpider):
     )
     AREAS = ("中国大陆", "中国香港", "中国台湾", "美国", "英国", "日本", "韩国", "法国", "德国", "印度", "泰国")
     MOVIE_TYPES = ("剧情", "喜剧", "动作", "爱情", "科幻", "动画", "悬疑", "犯罪", "惊悚", "恐怖", "纪录片", "短片")
-    TV_TYPES = ("电视剧", "综艺")
-    SERIES_TYPES = ("国产剧", "港剧", "台剧", "日剧", "韩剧", "美剧", "英剧")
     SHOW_TYPES = ("真人秀", "脱口秀", "音乐", "喜剧", "旅行", "竞技")
     TV_GENRES = ("剧情", "喜剧", "爱情", "悬疑", "动画", "武侠", "古装", "家庭", "犯罪", "科幻", "恐怖", "历史", "战争")
     TAGS = ("经典", "热门", "高分", "青春", "家庭", "治愈", "女性", "成长", "推理", "真实事件改编")
@@ -168,6 +168,8 @@ class Spider(BaseSpider):
         self._failures.clear()
         self._filters = None
         self._filters_at = 0
+        if getattr(self, "_executor", None) is None:
+            self._executor = ThreadPoolExecutor(max_workers=4)
         self._reset_session()
         if not self.user_id and self.cookie:
             self._resolve_user_id()
@@ -182,6 +184,7 @@ class Spider(BaseSpider):
             self._executor.shutdown(wait=False)
         except Exception:
             pass
+        self._executor = None
 
     def homeContent(self, filter=False):
         result = {"class": [{"type_id": key, "type_name": name} for key, name in self.CATEGORIES]}
@@ -240,8 +243,6 @@ class Spider(BaseSpider):
 
     def detailContent(self, ids):
         subject_id = self._first_id(ids)
-        if subject_id.startswith("atvp_detail:"):
-            subject_id = subject_id[len("atvp_detail:"):]
         if subject_id.startswith(self.ERROR_PREFIX):
             text = subject_id[len(self.ERROR_PREFIX):]
             return {"list": [{"vod_id": subject_id, "vod_name": "豆瓣错误", "vod_content": text}]}
@@ -324,16 +325,6 @@ class Spider(BaseSpider):
             log.exception("Add to wishlist error for %s", subject_id)
             return json.dumps({"msg": "加入想看失败：%s" % self._short_error(exc)}, ensure_ascii=False)
 
-    def _category_search_subjects(self, kind, page, tag, ext):
-        limit = 50
-        params = {"type": kind, "tag": tag or "热门", "page_limit": limit, "page_start": (page - 1) * limit}
-        data = self._get_json(self.MOVIE + "/j/search_subjects", params=params, ttl=self.list_cache_ttl)
-        items = []
-        for raw in data.get("subjects") or []:
-            items.append(self._subject_card(raw, ext))
-        pagecount = page + 1 if len(items) >= limit else page
-        return self._page_result(items, page, pagecount, pagecount * limit, limit)
-
     def _category_media(self, media, page, ext):
         limit = 20
         sort = self._value(ext, "sort", "U")
@@ -374,21 +365,6 @@ class Spider(BaseSpider):
         total = self._positive_int(data.get("total"), 0)
         pagecount = int(math.ceil(float(total) / limit)) if total else page + (1 if len(items) >= limit else 0)
         return self._page_result(items, page, max(page, pagecount), total or pagecount * limit, limit)
-
-    def _category_hot_show(self, page, scope, ext):
-        if page > 1:
-            return self._page_result([], page, 1, 0, 50)
-        params = {"start": 0, "count": 50, "updated_at": "", "items_only": 1, "for_mobile": 1}
-        data = self._get_json(self.API + "/subject_collection/show_hot/items", params=params, ttl=self.list_cache_ttl)
-        items = []
-        for raw in data.get("subject_collection_items") or []:
-            subtitle = str(raw.get("card_subtitle") or "")
-            if scope == "zy_cn" and "中国" not in subtitle:
-                continue
-            if scope == "zy_other" and "中国" in subtitle:
-                continue
-            items.append(self._collection_card(raw, ext))
-        return self._page_result(items, 1, 1, len(items), 50)
 
     def _category_movie_list(self, page, collection, ext):
         if collection == "top250":
@@ -534,16 +510,6 @@ class Spider(BaseSpider):
     def _parse_collection_items(self, data):
         return [self._collection_card(raw, {}) for raw in data.get("subject_collection_items") or []]
 
-    def _subject_card(self, raw, ext):
-        score = str(raw.get("rate") or "").strip()
-        card = {
-            "vod_id": str(raw.get("id") or ""),
-            "vod_name": str(raw.get("title") or ""),
-            "vod_pic": self._image(str(raw.get("cover") or "")),
-            "vod_remarks": (score + "分") if score and score != "0" else "暂无评分",
-        }
-        return card
-
     def _collection_card(self, raw, ext):
         rating = self._rating(raw)
         honor = self._names(raw.get("honor_infos"), "title", 1)
@@ -584,6 +550,9 @@ class Spider(BaseSpider):
         try:
             value = getter(self.FILTER_CACHE_KEY)
             if not isinstance(value, dict):
+                return None
+            expires = value.get("expiresAt")
+            if not isinstance(expires, (int, float)) or time.time() >= expires:
                 return None
             filters = value.get("filters")
             if not isinstance(filters, dict):
@@ -750,20 +719,20 @@ class Spider(BaseSpider):
         self._raise_cached_failure(key)
         with self._inflight_lock:
             fut = self._inflight.get(key)
-            if fut is not None:
+            if fut is None:
+                fut = self._executor.submit(self._do_get_json, url, params, key)
+                self._inflight[key] = fut
+                mine = True
+            else:
+                mine = False
                 log.debug("Inflight request hit: %s", key[:80])
-                try:
-                    return fut.result()
-                except Exception:
-                    pass
-            fut = self._executor.submit(self._do_get_json, url, params, key)
-            self._inflight[key] = fut
         try:
-            result = fut.result()
-            return result
+            return fut.result()
         finally:
-            with self._inflight_lock:
-                self._inflight.pop(key, None)
+            if mine:
+                with self._inflight_lock:
+                    if self._inflight.get(key) is fut:
+                        self._inflight.pop(key, None)
 
     def _do_get_json(self, url, params, key):
         try:
@@ -795,20 +764,20 @@ class Spider(BaseSpider):
         self._raise_cached_failure(key)
         with self._inflight_lock:
             fut = self._inflight.get(key)
-            if fut is not None:
+            if fut is None:
+                fut = self._executor.submit(self._do_get_text, url, params, key)
+                self._inflight[key] = fut
+                mine = True
+            else:
+                mine = False
                 log.debug("Inflight request hit: %s", key[:80])
-                try:
-                    return fut.result()
-                except Exception:
-                    pass
-            fut = self._executor.submit(self._do_get_text, url, params, key)
-            self._inflight[key] = fut
         try:
-            result = fut.result()
-            return result
+            return fut.result()
         finally:
-            with self._inflight_lock:
-                self._inflight.pop(key, None)
+            if mine:
+                with self._inflight_lock:
+                    if self._inflight.get(key) is fut:
+                        self._inflight.pop(key, None)
 
     def _do_get_text(self, url, params, key):
         try:
