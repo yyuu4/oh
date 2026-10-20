@@ -1,7 +1,14 @@
 # -*- coding: utf-8 -*-
 # //@name:豆瓣导航
 # //@id:douban_meta_wish
-# //@version:1.1.2
+# //@version:1.1.3
+#
+# 更新日志:
+# 1.1.3  统一数据源：电影/剧集「实时热门」改走 /movie|tv/recommend 推荐接口，与首页一致，支持筛选分页
+# 1.1.2  修复榜单接口失效：电影/剧集「实时热门」改用 /j/search_subjects 兜底；Top250 恢复 250 条
+# 1.1.1  核心修复：实现搜索、Cookie 自动解析 user_id/ck、缓存键加前缀、详情页补充播放占位、
+#        POST 重试、连接池按域名隔离、请求去重、筛选项精简、关键日志
+# 1.1.0  初始版本（原 v2 重命名）
 
 import json
 import logging
@@ -212,7 +219,7 @@ class Spider(BaseSpider):
             if tid == "tvlist":
                 collection = self._value(ext, "1", "tv_real_time_hotest")
                 if collection == "tv_real_time_hotest":
-                    return self._category_search_subjects("tv", page, "热门", ext)
+                    return self._category_media("tv", page, {"sort": "U"})
                 return self._category_collection(page, collection, ext)
             if tid == "moviefilter":
                 return self._category_recommend("movie", page, ext)
@@ -385,7 +392,7 @@ class Spider(BaseSpider):
         if collection == "top250":
             return self._category_top250(page, ext)
         if collection == "movie_real_time_hotest":
-            return self._category_search_subjects("movie", page, "热门", ext)
+            return self._category_media("movie", page, {"sort": "U"})
         return self._category_collection(page, collection, ext)
 
     def _category_collection(self, page, collection, ext):
