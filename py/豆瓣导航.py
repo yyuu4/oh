@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # //@name:豆瓣导航
 # //@id:douban_meta_wish
-# //@version:1.1.1
+# //@version:1.1.2
 
 import json
 import logging
@@ -210,7 +210,10 @@ class Spider(BaseSpider):
             if tid == "movielist":
                 return self._category_movie_list(page, self._value(ext, "1", "movie_real_time_hotest"), ext)
             if tid == "tvlist":
-                return self._category_collection(page, self._value(ext, "1", "tv_real_time_hotest"), ext)
+                collection = self._value(ext, "1", "tv_real_time_hotest")
+                if collection == "tv_real_time_hotest":
+                    return self._category_search_subjects("tv", page, "热门", ext)
+                return self._category_collection(page, collection, ext)
             if tid == "moviefilter":
                 return self._category_recommend("movie", page, ext)
             if tid == "tvfilter":
@@ -381,6 +384,8 @@ class Spider(BaseSpider):
     def _category_movie_list(self, page, collection, ext):
         if collection == "top250":
             return self._category_top250(page, ext)
+        if collection == "movie_real_time_hotest":
+            return self._category_search_subjects("movie", page, "热门", ext)
         return self._category_collection(page, collection, ext)
 
     def _category_collection(self, page, collection, ext):
