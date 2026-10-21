@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 # //@name:豆瓣导航
 # //@id:douban_meta_wish
-# //@version:1.1.5
+# //@version:1.1.6
 #
 # 更新日志:
+# 1.1.6  工程加固：动态筛选合并改用独立线程池（消除嵌套池死锁隐患）；user_id 懒解析+节流（init 不再阻塞网络）；
+#        推荐元数据合并逐项容错（分类缺失不再连带丢排序）；筛选类 sort 白名单校验；补充类型注解
 # 1.1.5  质量修复：持久化筛选校验 expiresAt（过期回退动态重建）；destroy 后重新 init 恢复线程池；
 #        inflight 去重锁不再跨等待持锁（解除跨 URL 串行阻塞）；清理死代码
 # 1.1.4  筛选器重构：tvfilter 改为 形式/题材 两级（与热门分类一致）；moviefilter 补齐平台筛选；
@@ -133,12 +135,14 @@ class Spider(BaseSpider):
         self._inflight = {}
         self._inflight_lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=4)
+        self._merge_executor = ThreadPoolExecutor(max_workers=2)
+        self._user_id_attempt_at = 0.0
         self._reset_session()
 
-    def getName(self):
+    def getName(self) -> str:
         return self.name
 
-    def init(self, extend=""):
+    def init(self, extend: str = "") -> None:
         config = self._parse_config(extend)
         self.timeout = self._bounded_int(config.get("timeout"), 15, 5, 45)
         self.cache_ttl = self._bounded_int(config.get("cache_ttl"), 180, 0, 3600)
@@ -170,29 +174,34 @@ class Spider(BaseSpider):
         self._filters_at = 0
         if getattr(self, "_executor", None) is None:
             self._executor = ThreadPoolExecutor(max_workers=4)
+        if getattr(self, "_merge_executor", None) is None:
+            self._merge_executor = ThreadPoolExecutor(max_workers=2)
+        self._user_id_attempt_at = 0.0
         self._reset_session()
-        if not self.user_id and self.cookie:
-            self._resolve_user_id()
 
-    def destroy(self):
+    def destroy(self) -> None:
         if self._session is not None:
             try:
                 self._session.close()
             except Exception:
                 pass
-        try:
-            self._executor.shutdown(wait=False)
-        except Exception:
-            pass
-        self._executor = None
+        for name in ("_executor", "_merge_executor"):
+            pool = getattr(self, name, None)
+            if pool is None:
+                continue
+            try:
+                pool.shutdown(wait=False)
+            except Exception:
+                pass
+            setattr(self, name, None)
 
-    def homeContent(self, filter=False):
+    def homeContent(self, filter: bool = False) -> dict:
         result = {"class": [{"type_id": key, "type_name": name} for key, name in self.CATEGORIES]}
         if filter:
             result["filters"] = self._get_filters()
         return result
 
-    def homeVideoContent(self):
+    def homeVideoContent(self) -> dict:
         try:
             params = {"start": 0, "count": 30, "updated_at": "", "items_only": 1, "for_mobile": 1}
             data = self._get_json(self.API + "/subject_collection/subject_real_time_hotest/items", params=params, ttl=self.list_cache_ttl)
@@ -209,7 +218,7 @@ class Spider(BaseSpider):
                 pass
             return {"list": [self._error_card("首页载入失败", primary)]}
 
-    def categoryContent(self, tid, pg, filter=False, extend=None):
+    def categoryContent(self, tid: str, pg, filter: bool = False, extend=None) -> dict:
         page = self._positive_int(pg, 1)
         ext = self._parse_extend(extend)
         try:
@@ -241,7 +250,7 @@ class Spider(BaseSpider):
         except Exception as exc:
             return self._page_result([self._error_card("分类载入失败", exc)], page, page, 1, 20)
 
-    def detailContent(self, ids):
+    def detailContent(self, ids) -> dict:
         subject_id = self._first_id(ids)
         if subject_id.startswith(self.ERROR_PREFIX):
             text = subject_id[len(self.ERROR_PREFIX):]
@@ -277,10 +286,10 @@ class Spider(BaseSpider):
         except Exception as exc:
             return {"list": [self._error_card("详情载入失败", exc, subject_id)]}
 
-    def searchContent(self, key, quick=False, pg="1"):
+    def searchContent(self, key: str, quick: bool = False, pg="1") -> dict:
         return {"list": []}
 
-    def playerContent(self, flag, id, vipFlags=None):
+    def playerContent(self, flag, id, vipFlags=None) -> dict:
         return {
             "parse": 0,
             "jx": 0,
@@ -290,10 +299,10 @@ class Spider(BaseSpider):
             "msg": "豆瓣仅提供影视资料，请使用详情页的全局搜索查找播放源",
         }
 
-    def localProxy(self, param):
+    def localProxy(self, param) -> list:
         return [404, "text/plain; charset=utf-8", "not found"]
 
-    def action(self, action):
+    def action(self, action) -> str:
         value = str(action or "")
         if not value.startswith(self.ACTION_PREFIX):
             return json.dumps({"msg": "不支持的豆瓣操作"}, ensure_ascii=False)
@@ -423,6 +432,8 @@ class Spider(BaseSpider):
             tags = [form, genre, area, year, platform, tag]
             selected = {"类型": genre, "形式": form, "地区": area}
             sort = self._value(ext, "sort", "U")
+        if sort not in {item[1] for item in self.SORTS}:
+            sort = "U"
         params = {
             "refresh": 0,
             "start": (page - 1) * limit,
@@ -445,7 +456,8 @@ class Spider(BaseSpider):
     def _category_wishlist(self, page):
         user_id = self.user_id or self._resolve_user_id()
         if not user_id:
-            message = "请在 ext 中配置 user_id；写回想看还需 cookie，ck 可从 Cookie 自动读取"
+            message = ("Cookie 已配置但未能解析出 user_id，可稍后重试或在 ext 手动配置 user_id"
+                       if self.cookie else "请在 ext 中配置 user_id；写回想看还需 cookie，ck 可从 Cookie 自动读取")
             return self._page_result([self._error_card("豆瓣想看未配置", message)], page, page, 1, 15)
         start = (page - 1) * 15
         url = self.MOVIE + "/people/%s/wish" % quote(user_id, safe="")
@@ -524,7 +536,7 @@ class Spider(BaseSpider):
         }
         return card
 
-    def _get_filters(self):
+    def _get_filters(self) -> dict:
         now = time.time()
         if self._filters is not None and now - self._filters_at < self.filter_cache_ttl:
             return self._filters
@@ -541,7 +553,7 @@ class Spider(BaseSpider):
         self._save_persistent_filters(filters)
         return filters
 
-    def _load_persistent_filters(self):
+    def _load_persistent_filters(self) -> dict:
         if not self.persistent_filter_cache:
             return None
         getter = getattr(self, "getCache", None)
@@ -564,7 +576,7 @@ class Spider(BaseSpider):
         except Exception:
             return None
 
-    def _save_persistent_filters(self, filters):
+    def _save_persistent_filters(self, filters) -> None:
         if not self.persistent_filter_cache:
             return
         setter = getattr(self, "setCache", None)
@@ -578,7 +590,7 @@ class Spider(BaseSpider):
         except Exception:
             pass
 
-    def _base_filters(self):
+    def _base_filters(self) -> dict:
         years = [str(year) for year in range(time.localtime().tm_year, 1979, -1)]
         hot_movie = [
             self._filter("sort", "排序", self.SORTS),
@@ -641,14 +653,14 @@ class Spider(BaseSpider):
             self._filter("format", "形式", [("全部形式", "")] + [(v, v) for v in self.ANIME_FORMATS]),
         ]
 
-    def _merge_dynamic_filters(self, filters):
+    def _merge_dynamic_filters(self, filters) -> None:
         jobs = {
             "movie_meta": (self.API + "/movie/recommend", {}),
             "tv_meta": (self.API + "/tv/recommend", {}),
         }
         results = {}
         try:
-            futures = {self._executor.submit(self._get_json, url, params, self.filter_cache_ttl): key for key, (url, params) in jobs.items()}
+            futures = {self._merge_executor.submit(self._get_json, url, params, self.filter_cache_ttl): key for key, (url, params) in jobs.items()}
             for future in as_completed(futures):
                 try:
                     results[futures[future]] = future.result()
@@ -659,14 +671,20 @@ class Spider(BaseSpider):
         self._merge_recommend_meta(filters.get("moviefilter"), results.get("movie_meta"), False)
         self._merge_recommend_meta(filters.get("tvfilter"), results.get("tv_meta"), True)
 
-    def _merge_recommend_meta(self, target, data, is_tv):
+    def _merge_recommend_meta(self, target, data, is_tv) -> None:
         if not target or not isinstance(data, dict):
             return
         categories = data.get("recommend_categories") or []
+
+        def category(index):
+            node = categories[index] if index < len(categories) else None
+            return node if isinstance(node, dict) else None
+
         try:
             if is_tv:
-                type_data = categories[0].get("data") or []
-                if type_data:
+                first = category(0)
+                type_data = (first.get("data") or []) if first else []
+                if type_data and isinstance(type_data[0], dict):
                     tags = type_data[0].get("tags") or []
                     values = []
                     for item in tags[1:]:
@@ -674,30 +692,34 @@ class Spider(BaseSpider):
                         values.append((name, name))
                     if values:
                         self._set_filter_values(target, "form", [("全部形式", "")] + values)
-                genre_data = categories[1].get("data") if len(categories) > 1 else []
-                if genre_data:
+                second = category(1)
+                genre_data = (second.get("data") or []) if second else []
+                if genre_data and isinstance(genre_data[0], dict):
                     genre_tags = genre_data[0].get("tags") or []
                     genre_values = [(str(t), str(t)) for t in genre_tags[1:] if t]
                     if genre_values:
                         self._set_filter_values(target, "genre", [("全部题材", "")] + genre_values)
-                if len(categories) > 2:
-                    areas = categories[2].get("data") or []
-                    values = [(str(v.get("text")), str(v.get("text"))) for v in areas[1:] if v.get("text")]
-                    if values:
-                        self._set_filter_values(target, "area", [("全部地区", "")] + values)
+                third = category(2)
+                areas = (third.get("data") or []) if third else []
+                values = [(str(v.get("text")), str(v.get("text"))) for v in areas[1:] if isinstance(v, dict) and v.get("text")]
+                if values:
+                    self._set_filter_values(target, "area", [("全部地区", "")] + values)
             else:
                 for index in (0, 1):
-                    values = []
-                    for item in (categories[index].get("data") or [])[1:]:
-                        if item.get("text"):
-                            values.append((str(item["text"]), str(item["text"])))
+                    node = category(index)
+                    if not node:
+                        continue
+                    values = [(str(item.get("text")), str(item.get("text"))) for item in (node.get("data") or [])[1:] if isinstance(item, dict) and item.get("text")]
                     if values:
                         self._set_filter_values(target, "type" if index == 0 else "area", [("全部" + ("类型" if index == 0 else "地区"), "")] + values)
-            sorts = [(str(v.get("text")), str(v.get("name"))) for v in data.get("sorts") or [] if v.get("text") and v.get("name")]
+        except Exception:
+            pass
+        try:
+            sorts = [(str(v.get("text")), str(v.get("name"))) for v in data.get("sorts") or [] if isinstance(v, dict) and v.get("text") and v.get("name")]
             if sorts:
                 self._set_filter_values(target, "sort", sorts)
         except Exception:
-            return
+            pass
 
     def _set_filter_values(self, filters, key, pairs):
         for item in filters or []:
@@ -705,7 +727,7 @@ class Spider(BaseSpider):
                 item["value"] = self._values(pairs)
                 return
 
-    def _get_json(self, url, params=None, ttl=None):
+    def _get_json(self, url: str, params=None, ttl=None) -> dict:
         key = self.CACHE_PREFIX + "json:" + url + "?" + urlencode(sorted((params or {}).items()), doseq=True)
         ttl = self.cache_ttl if ttl is None else ttl
         cached = self._cache_get(key, ttl)
@@ -750,7 +772,7 @@ class Spider(BaseSpider):
                 return stale
             raise
 
-    def _get_text(self, url, params=None, custom_key="", ttl=None):
+    def _get_text(self, url: str, params=None, custom_key: str = "", ttl=None) -> str:
         key = custom_key or (self.CACHE_PREFIX + "text:" + url + "?" + urlencode(sorted((params or {}).items()), doseq=True))
         ttl = self.cache_ttl if ttl is None else ttl
         cached = self._cache_get(key, ttl)
@@ -835,11 +857,16 @@ class Spider(BaseSpider):
         session.mount("https://", adapter)
         self._session = session
 
-    def _resolve_user_id(self):
+    def _resolve_user_id(self) -> str:
         if self.user_id:
             return self.user_id
         if not self.cookie:
             return ""
+        now = time.time()
+        if now - self._user_id_attempt_at < self.failure_ttl:
+            log.debug("Skip user_id resolve (throttled)")
+            return self.user_id
+        self._user_id_attempt_at = now
         try:
             response = self._session.get("https://www.douban.com/mine/", timeout=self.timeout, verify=self.verify_tls, allow_redirects=True)
             match = re.search(r"/people/([^/?#]+)/?", response.url)
@@ -852,7 +879,7 @@ class Spider(BaseSpider):
             log.warning("Failed to resolve user_id: %s", exc)
         return self.user_id
 
-    def _parse_config(self, extend):
+    def _parse_config(self, extend) -> dict:
         value = extend
         if isinstance(value, str):
             text = value.strip()
@@ -872,7 +899,7 @@ class Spider(BaseSpider):
             return merged
         return dict(value)
 
-    def _parse_extend(self, extend):
+    def _parse_extend(self, extend) -> dict:
         if isinstance(extend, dict):
             return extend
         if isinstance(extend, str):
@@ -886,7 +913,7 @@ class Spider(BaseSpider):
                 return {}
         return {}
 
-    def _cache_get(self, key, ttl, allow_expired=False):
+    def _cache_get(self, key: str, ttl, allow_expired: bool = False):
         with self._cache_lock:
             item = self._cache.get(key)
             if not item:
@@ -900,7 +927,7 @@ class Spider(BaseSpider):
             self._cache.move_to_end(key)
             return value
 
-    def _cache_set(self, key, value):
+    def _cache_set(self, key: str, value) -> None:
         if self.cache_ttl <= 0:
             return
         with self._cache_lock:
@@ -909,16 +936,16 @@ class Spider(BaseSpider):
             while len(self._cache) > self.cache_max_entries:
                 self._cache.popitem(last=False)
 
-    def _drop_cache_prefix(self, prefix):
+    def _drop_cache_prefix(self, prefix: str) -> None:
         with self._cache_lock:
             for key in list(self._cache):
                 if key.startswith(prefix):
                     self._cache.pop(key, None)
 
-    def _remember_failure(self, key, exc):
+    def _remember_failure(self, key: str, exc) -> None:
         self._failures[key] = (time.time(), self._short_error(exc))
 
-    def _raise_cached_failure(self, key):
+    def _raise_cached_failure(self, key: str) -> None:
         item = self._failures.get(key)
         if not item:
             return
@@ -927,7 +954,7 @@ class Spider(BaseSpider):
             raise RuntimeError(message)
         self._failures.pop(key, None)
 
-    def _has_cached_failure(self, key):
+    def _has_cached_failure(self, key: str) -> bool:
         item = self._failures.get(key)
         if not item:
             return False
@@ -936,10 +963,10 @@ class Spider(BaseSpider):
         self._failures.pop(key, None)
         return False
 
-    def _page_result(self, items, page, pagecount, total, limit):
+    def _page_result(self, items, page, pagecount, total, limit) -> dict:
         return {"list": items, "page": page, "pagecount": max(page, pagecount), "limit": limit, "total": total}
 
-    def _error_card(self, title, exc, subject_id=""):
+    def _error_card(self, title, exc, subject_id: str = "") -> dict:
         message = self._short_error(exc)
         identity = self.ERROR_PREFIX + quote(message[:180], safe="")
         return {"vod_id": subject_id or identity, "vod_name": title, "vod_pic": "", "vod_remarks": message, "vod_content": message}
