@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 # //@name:豆瓣导航
 # //@id:douban_meta_wish
-# //@version:1.1.9
+# //@version:1.1.10
 #
 # 更新日志:
+# 1.1.10  新增「高分剧集」分类(高分电影之后): 固定 高分优先+电视剧+中国大陆 三项,不带筛选组、
+#         忽略 ext,无限翻页(实测 500 条/25 页连续满页);与剧集筛选手选三项同函数同参数逐条一致。
 # 1.1.9   新增「高分电影」分类(排首位): 固定 高分优先+动作+欧美 三项,不带筛选组、忽略 ext,
 #        无限翻页(实测组合 500 条/25 页连续满页);复用推荐列表路径,与电影筛选手选三项逐条一致;
 #        翻页到池底时不触发标签降级(防尾页漂出非欧美内容)。
@@ -64,6 +66,7 @@ class Spider(BaseSpider):
 
     CATEGORIES = (
         ("hdaction", "高分电影"),
+        ("hdseries", "高分剧集"),
         ("hottv", "热门剧集"),
         ("hotmovie", "热门电影"),
         ("hotzy", "热门综艺"),
@@ -239,8 +242,12 @@ class Spider(BaseSpider):
         try:
             if tid == "hdaction":
                 # 固定 高分优先+动作+欧美 三项,不带筛选组(不入 filters),忽略 ext 保证内容恒定;
-                # 与 moviefilter 手选三项同函数同参数,结果逐条一致,实测 500 条/25 页连续可翻
+                # 与 moviefilter 手选三项同函数同参数,结果逐条一致,实测 500 条/25 页连续满页
                 return self._category_media("movie", page, {"sort": "S", "type": "动作", "area": "欧美"})
+            if tid == "hdseries":
+                # 固定 高分优先+电视剧+中国大陆 三项,同上不带筛选组、忽略 ext;
+                # 与 tvfilter 手选三项同函数同参数,实测 500 条/25 页连续满页
+                return self._category_media("tv", page, {"sort": "S", "form": "电视剧", "area": "中国大陆"})
             if tid == "hotmovie":
                 return self._category_media("movie", page, ext)
             if tid == "hottv":
