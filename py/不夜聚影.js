@@ -5,10 +5,15 @@
 // 不支持: 弹幕、播放记录、刮削引擎(这三项为 OmniBox SDK 专有能力)
 // 依赖: axios;运行时由不夜容器注入 server.redis / server.log / server.drives
 
-const VERSION = "1.1.15";
+const VERSION = "1.1.16";
 
 // ==================== 版本更新说明(重点) ====================
 
+// 1.1.16  2026-10-25
+//   - 修复"选集排序错乱"(报障: 百度分享 share/list 按 order=time&desc=1 返回,逐集上传的分享直出就是
+//     N→1 倒序): loadShareEpisodes 统一出口处按集数升序(orderEpisodes 三件套照 omnibox觅盘移植)——
+//     有明确集数标记按集数,部分有按可识别集数,全无按文件名自然序;百直连/123直连/容器三条枚举路径
+//     与全部网盘(夸克/UC/115/天翼/123/百度)一并生效,第一条永远是第一集。
 // 1.1.15  2026-10-25
 //   - 全量验收修复: ①死分享判定补认"好友已取消(了)?分享"与"分享者用户封禁"(此前这两类永远当瞬时
 //     错误重试/出可重试占位,点一次错一次); ②百度直连播放两处死/精确错误门补认"需要提取码"
@@ -2412,7 +2417,83 @@ function safeEpisodeName(value) {
   return truncateText(text || "资源", 120);
 }
 
+// ==================== 选集排序(默认第一集在最前) ====================
+// 自然序比较:让 EP2 排在 EP10 前面
+function naturalCompare(a, b) {
+  const ax = String(a || "").split(/(\d+)/);
+  const bx = String(b || "").split(/(\d+)/);
+  const len = Math.max(ax.length, bx.length);
+  for (let i = 0; i < len; i++) {
+    const x = ax[i] || "";
+    const y = bx[i] || "";
+    if (x === y) continue;
+    const nx = /^\d+$/.test(x);
+    const ny = /^\d+$/.test(y);
+    if (nx && ny) return Number(x) - Number(y);
+    if (nx) return -1;
+    if (ny) return 1;
+    return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
+// 从文件名里认集数,只认明确标记(SxxEyy / EPxx / 第x集 / [x]),不猜年份和分辨率
+function parseEpisodeNumber(name) {
+  const value = String(name || "");
+  if (!value) return null;
+  const patterns = [
+    /S\d{1,2}[-_. ]?E(\d{1,4})/i,
+    /EPISODE[-_. ]?(\d{1,4})/i,
+    /\bEP[-_. ]?(\d{1,4})\b/i,
+    /第\s*(\d{1,4})\s*[集话話期]/,
+    /\[(\d{1,3})\]/,
+    /【(\d{1,3})】/,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(value);
+    if (!match) continue;
+    const parsed = parseInt(match[1], 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return null;
+}
+
+// 选集统一升序:有完整集数用集数;只有部分有就用认得出的集数;都没有就按文件名自然序
+// 目的:任何网盘/任何返回顺序下,第一条都是第一集(百度 share/list 按 time 倒序返回,不再直出)
+function orderEpisodes(episodes) {
+  const list = Array.isArray(episodes) ? [...episodes] : [];
+  if (list.length <= 1) return list;
+
+  const allNumbered = list.every((ep) => ep && Number.isFinite(ep && ep._episodeNumber));
+  if (allNumbered) {
+    return list.sort((a, b) => a._episodeNumber - b._episodeNumber);
+  }
+
+  const parsed = list.map((ep) => ({ ep, n: parseEpisodeNumber(ep && ep.name) }));
+  const counted = parsed.filter((item) => item.n !== null).length;
+  if (counted >= Math.max(2, Math.ceil(list.length / 2))) {
+    return parsed
+      .sort((a, b) => {
+        const an = a.n === null ? Number.MAX_SAFE_INTEGER : a.n;
+        const bn = b.n === null ? Number.MAX_SAFE_INTEGER : b.n;
+        if (an !== bn) return an - bn;
+        return naturalCompare(a.ep.name, b.ep.name);
+      })
+      .map((item) => item.ep);
+  }
+
+  return list.sort((a, b) => naturalCompare(a && a.name, b && b.name));
+}
+
 async function loadShareEpisodes(shareURL) {
+  const loaded = await loadShareEpisodesRaw(shareURL);
+  if (loaded && Array.isArray(loaded.episodes)) {
+    return { ...loaded, episodes: orderEpisodes(loaded.episodes) };
+  }
+  return loaded;
+}
+
+async function loadShareEpisodesRaw(shareURL) {
   // 123镜像域名兜底改写(缓存键也用改写后的链接,避免同分享两套缓存)
   shareURL = normalizePanShareURL(shareURL);
   const key = `jy:share:${md5(shareURL)}`;
