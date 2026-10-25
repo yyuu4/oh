@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 # //@name:豆瓣导航
 # //@id:douban_meta_wish
-# //@version:1.1.8
+# //@version:1.1.9
 #
 # 更新日志:
+# 1.1.9   新增「高分电影」分类(排首位): 固定 高分优先+动作+欧美 三项,不带筛选组、忽略 ext,
+#        无限翻页(实测组合 500 条/25 页连续满页);复用推荐列表路径,与电影筛选手选三项逐条一致;
+#        翻页到池底时不触发标签降级(防尾页漂出非欧美内容)。
 # 1.1.8  复查修复「形式(电视剧/综艺)」筛选整体失效: 推荐接口实测忽略 selected_categories,
 #        过滤只认 tags 参数,而形式从未进 tags —— 热门综艺/剧集筛选选 形式=综艺 一直返回电视剧;
 #        现把 form 并入 tags(热门综艺=综艺、热门剧集=电视剧、剧集筛选 全部形式=不限);
@@ -60,6 +63,7 @@ class Spider(BaseSpider):
     FILTER_CACHE_KEY = CACHE_PREFIX + "filters_v6"
 
     CATEGORIES = (
+        ("hdaction", "高分电影"),
         ("hottv", "热门剧集"),
         ("hotmovie", "热门电影"),
         ("hotzy", "热门综艺"),
@@ -233,6 +237,10 @@ class Spider(BaseSpider):
         page = self._positive_int(pg, 1)
         ext = self._parse_extend(extend)
         try:
+            if tid == "hdaction":
+                # 固定 高分优先+动作+欧美 三项,不带筛选组(不入 filters),忽略 ext 保证内容恒定;
+                # 与 moviefilter 手选三项同函数同参数,结果逐条一致,实测 500 条/25 页连续可翻
+                return self._category_media("movie", page, {"sort": "S", "type": "动作", "area": "欧美"})
             if tid == "hotmovie":
                 return self._category_media("movie", page, ext)
             if tid == "hottv":
@@ -427,6 +435,12 @@ class Spider(BaseSpider):
         data = self._get_json(url, params=params, ttl=self.list_cache_ttl)
         items = self._parse_recommend_items(data, expected_type, ext)
         if not items and params.get("tags"):
+            # 翻页已到池底(total>0 且 start>=total)是组合有效而非组合为空: 不走降级,
+            # 否则尾页会剥标签漂成别的内容(高分电影 p26 曾漏出非欧美片),直接返回空让 pagecount 收口
+            total_seen = self._positive_int(data.get("total"), 0)
+            start = self._positive_int(params.get("start"), 0)
+            if total_seen and start >= total_seen:
+                return items, data
             # 整包标签组合为空时从尾部逐级剥离可选标签重试,始终保住首标签锚点(形式/动画)——
             # 全丢会把别的内容端上来(实测: 动漫 剧场版+地区组合为空后曾退成电视剧列表);
             # 标签顺序: 分类身份在前、可选项在后(形式/动画 → 题材 → 地区 → 年份/平台 → 形式标签),
