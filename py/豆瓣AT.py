@@ -1,9 +1,16 @@
 # -*- coding: utf-8 -*-
 # //@name:豆瓣导航
 # //@id:douban_meta_wish
-# //@version:1.1.7
+# //@version:1.1.8
 #
 # 更新日志:
+# 1.1.8  复查修复「形式(电视剧/综艺)」筛选整体失效: 推荐接口实测忽略 selected_categories,
+#        过滤只认 tags 参数,而形式从未进 tags —— 热门综艺/剧集筛选选 形式=综艺 一直返回电视剧;
+#        现把 form 并入 tags(热门综艺=综艺、热门剧集=电视剧、剧集筛选 全部形式=不限);
+#        修正剧集动态筛选合并的节点错位(题材误读成地区节点、地区节点取错位),题材改取类型节点
+#        各行(电视剧/综艺)tags 并集、地区改取地区节点;过滤缓存键 v5->v6 立即重建;
+#        空结果兜底从"丢全部标签"改为"从尾部逐级剥离、保住首标签锚点"(否则动漫筛选 空组合会退成电视剧列表);
+#        动漫形式移除恒空的"TV动画"(非豆瓣标签,点了必出兜底错内容)。
 # 1.1.7  修复筛选「标签」热门/高分点击后无海报：这两类不是推荐接口题材标签，改映射为「近期热度/高分优先」排序；
 #        「最新」映射首播时间；推荐列表为空时自动去掉标签重试，避免个别标签导致整页空；
 #        合并 电影/剧集筛选 与 热门分类 的推荐请求逻辑，统一排序校验与标签拼接
@@ -50,7 +57,7 @@ class Spider(BaseSpider):
     ACTION_PREFIX = "douban-wish:add:"
     ERROR_PREFIX = "douban-error:"
     CACHE_PREFIX = "douban_meta_wish:"
-    FILTER_CACHE_KEY = CACHE_PREFIX + "filters_v5"
+    FILTER_CACHE_KEY = CACHE_PREFIX + "filters_v6"
 
     CATEGORIES = (
         ("hottv", "热门剧集"),
@@ -98,7 +105,7 @@ class Spider(BaseSpider):
         "anime_us": "美国",
     }
     ANIME_GENRES = ("热血", "冒险", "奇幻", "科幻", "校园", "治愈", "搞笑", "恋爱", "悬疑", "运动", "音乐", "历史", "机战", "推理")
-    ANIME_FORMATS = ("TV动画", "剧场版", "OVA", "网络动画", "动画短片")
+    ANIME_FORMATS = ("剧场版", "OVA", "网络动画", "动画短片")  # "TV动画"非豆瓣标签(接口恒空)已移除,剧集由「内容」筛选表达
 
     def __init__(self):
         try:
@@ -229,7 +236,7 @@ class Spider(BaseSpider):
             if tid == "hotmovie":
                 return self._category_media("movie", page, ext)
             if tid == "hottv":
-                return self._category_media("tv", page, ext)
+                return self._category_media("tv", page, ext, form_default="电视剧")
             if tid == "hotzy":
                 return self._category_media("show", page, ext)
             if tid == "movielist":
@@ -237,7 +244,7 @@ class Spider(BaseSpider):
             if tid == "tvlist":
                 collection = self._value(ext, "1", "tv_real_time_hotest")
                 if collection == "tv_real_time_hotest":
-                    return self._category_media("tv", page, {"sort": "U"})
+                    return self._category_media("tv", page, {"sort": "U"}, form_default="电视剧")
                 return self._category_collection(page, collection, ext)
             if tid == "moviefilter":
                 return self._category_recommend("movie", page, ext)
@@ -338,7 +345,7 @@ class Spider(BaseSpider):
             log.exception("Add to wishlist error for %s", subject_id)
             return json.dumps({"msg": "加入想看失败：%s" % self._short_error(exc)}, ensure_ascii=False)
 
-    def _category_media(self, media, page, ext):
+    def _category_media(self, media, page, ext, form_default=""):
         limit = 20
         sort = self._value(ext, "sort", "U")
         if sort not in {item[1] for item in self.SORTS}:
@@ -354,7 +361,7 @@ class Spider(BaseSpider):
             expected_type = "movie"
         else:
             endpoint = "tv"
-            form = "综艺" if media == "show" else (self._value(ext, "form", "") or "电视剧")
+            form = "综艺" if media == "show" else (self._value(ext, "form", "") or form_default)
             expected_type = "tv"
         tag, sort = self._resolve_tag_sort(tag, sort)
         if form:
@@ -368,7 +375,8 @@ class Spider(BaseSpider):
             "selected_categories": json.dumps(selected, ensure_ascii=False, separators=(",", ":")),
             "uncollect": "false",
             "sort": sort,
-            "tags": self._join_tags([genre, area, year, platform, tag]),
+            # 推荐接口实测忽略 selected_categories,过滤只认 tags —— 形式必须进 tags 否则形同虚设
+            "tags": self._join_tags([form, genre, area, year, platform, tag]),
         }
         items, data = self._fetch_recommend(endpoint, params, expected_type, ext)
         total = self._positive_int(data.get("total"), 0)
@@ -419,12 +427,21 @@ class Spider(BaseSpider):
         data = self._get_json(url, params=params, ttl=self.list_cache_ttl)
         items = self._parse_recommend_items(data, expected_type, ext)
         if not items and params.get("tags"):
-            fallback = dict(params)
-            fallback["tags"] = ""
-            if fallback.get("sort") not in ("U", "S", "R"):
-                fallback["sort"] = "U"
-            data = self._get_json(url, params=fallback, ttl=self.list_cache_ttl)
-            items = self._parse_recommend_items(data, expected_type, ext)
+            # 整包标签组合为空时从尾部逐级剥离可选标签重试,始终保住首标签锚点(形式/动画)——
+            # 全丢会把别的内容端上来(实测: 动漫 剧场版+地区组合为空后曾退成电视剧列表);
+            # 标签顺序: 分类身份在前、可选项在后(形式/动画 → 题材 → 地区 → 年份/平台 → 形式标签),
+            # 故从尾部剥优先丢最冷门维度,命中的中间态仍保留其余已选维度
+            tags_list = [part.strip() for part in str(params.get("tags") or "").split(",") if part.strip()]
+            if len(tags_list) > 1:
+                fallback = dict(params)
+                if fallback.get("sort") not in ("U", "S", "R"):
+                    fallback["sort"] = "U"
+                for keep in range(len(tags_list) - 1, 0, -1):
+                    fallback["tags"] = ",".join(tags_list[:keep])
+                    data = self._get_json(url, params=fallback, ttl=self.list_cache_ttl)
+                    items = self._parse_recommend_items(data, expected_type, ext)
+                    if items:
+                        break
         return items, data
 
     def _parse_recommend_items(self, data, expected_type, ext):
@@ -672,6 +689,8 @@ class Spider(BaseSpider):
 
         try:
             if is_tv:
+                # 类型节点(type=类型, tag_groups=形式): data[0]=形式行(tags: 不限类型/全部剧集/全部综艺),
+                # data[1:]=电视剧/综艺行、各行 tags 才是题材;地区在节点1(此前误把节点1当题材、节点2当地区)
                 first = category(0)
                 type_data = (first.get("data") or []) if first else []
                 if type_data and isinstance(type_data[0], dict):
@@ -682,15 +701,20 @@ class Spider(BaseSpider):
                         values.append((name, name))
                     if values:
                         self._set_filter_values(target, "form", [("全部形式", "")] + values)
+                genre_seen = set()
+                genre_values = []
+                for row in type_data[1:]:
+                    if not isinstance(row, dict):
+                        continue
+                    for item in row.get("tags") or []:
+                        text = str(item)
+                        if text and text not in genre_seen:
+                            genre_seen.add(text)
+                            genre_values.append((text, text))
+                if genre_values:
+                    self._set_filter_values(target, "genre", [("全部题材", "")] + genre_values)
                 second = category(1)
-                genre_data = (second.get("data") or []) if second else []
-                if genre_data and isinstance(genre_data[0], dict):
-                    genre_tags = genre_data[0].get("tags") or []
-                    genre_values = [(str(t), str(t)) for t in genre_tags[1:] if t]
-                    if genre_values:
-                        self._set_filter_values(target, "genre", [("全部题材", "")] + genre_values)
-                third = category(2)
-                areas = (third.get("data") or []) if third else []
+                areas = (second.get("data") or []) if second else []
                 values = [(str(v.get("text")), str(v.get("text"))) for v in areas[1:] if isinstance(v, dict) and v.get("text")]
                 if values:
                     self._set_filter_values(target, "area", [("全部地区", "")] + values)
