@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 # //@name:豆瓣导航
 # //@id:douban_meta_wish
-# //@version:1.1.6
+# //@version:1.1.7
 #
 # 更新日志:
+# 1.1.7  修复筛选「标签」热门/高分点击后无海报：这两类不是推荐接口题材标签，改映射为「近期热度/高分优先」排序；
+#        「最新」映射首播时间；推荐列表为空时自动去掉标签重试，避免个别标签导致整页空；
+#        合并 电影/剧集筛选 与 热门分类 的推荐请求逻辑，统一排序校验与标签拼接
 # 1.1.6  工程加固：动态筛选合并改用独立线程池（消除嵌套池死锁隐患）；user_id 懒解析+节流（init 不再阻塞网络）；
 #        推荐元数据合并逐项容错（分类缺失不再连带丢排序）；筛选类 sort 白名单校验；补充类型注解
 # 1.1.5  质量修复：持久化筛选校验 expiresAt（过期回退动态重建）；destroy 后重新 init 恢复线程池；
@@ -47,7 +50,7 @@ class Spider(BaseSpider):
     ACTION_PREFIX = "douban-wish:add:"
     ERROR_PREFIX = "douban-error:"
     CACHE_PREFIX = "douban_meta_wish:"
-    FILTER_CACHE_KEY = CACHE_PREFIX + "filters_v4"
+    FILTER_CACHE_KEY = CACHE_PREFIX + "filters_v5"
 
     CATEGORIES = (
         ("hottv", "热门剧集"),
@@ -80,6 +83,7 @@ class Spider(BaseSpider):
     TAGS = ("经典", "热门", "高分", "青春", "家庭", "治愈", "女性", "成长", "推理", "真实事件改编")
     PLATFORMS = ("Netflix", "HBO", "Disney+", "BBC", "NHK", "TVB", "爱奇艺", "腾讯视频", "优酷", "芒果TV")
     SORTS = (("综合排序", "T"), ("近期热度", "U"), ("首映/首播时间", "R"), ("高分优先", "S"))
+    TAG_SORTS = {"热门": "U", "高分": "S", "最新": "R"}
     ANIME_SORTS = (("热度", "U"), ("更新时间", "R"), ("评分", "S"))
     ANIME_REGIONS = {
         "cn": "中国大陆",
@@ -346,15 +350,17 @@ class Spider(BaseSpider):
         tag = self._value(ext, "tag", "")
         if media == "movie":
             endpoint = "movie"
-            selected = {"类型": genre, "地区": area}
+            form = ""
             expected_type = "movie"
-            tags = [genre, area, year, platform, tag]
         else:
             endpoint = "tv"
-            form = "电视剧" if media == "tv" else "综艺"
-            selected = {"类型": genre, "形式": form, "地区": area}
+            form = "综艺" if media == "show" else (self._value(ext, "form", "") or "电视剧")
             expected_type = "tv"
-            tags = [form, genre, area, year, platform, tag]
+        tag, sort = self._resolve_tag_sort(tag, sort)
+        if form:
+            selected = {"类型": genre, "形式": form, "地区": area}
+        else:
+            selected = {"类型": genre, "地区": area}
         params = {
             "refresh": 0,
             "start": (page - 1) * limit,
@@ -362,15 +368,9 @@ class Spider(BaseSpider):
             "selected_categories": json.dumps(selected, ensure_ascii=False, separators=(",", ":")),
             "uncollect": "false",
             "sort": sort,
-            "tags": ",".join([item for item in tags if item]),
+            "tags": self._join_tags([genre, area, year, platform, tag]),
         }
-        data = self._get_json(self.API + "/%s/recommend" % endpoint, params=params, ttl=self.list_cache_ttl)
-        items = []
-        for raw in data.get("items") or []:
-            raw_type = str(raw.get("type") or "")
-            if raw_type and raw_type != expected_type:
-                continue
-            items.append(self._collection_card(raw, ext))
+        items, data = self._fetch_recommend(endpoint, params, expected_type, ext)
         total = self._positive_int(data.get("total"), 0)
         pagecount = int(math.ceil(float(total) / limit)) if total else page + (1 if len(items) >= limit else 0)
         return self._page_result(items, page, max(page, pagecount), total or pagecount * limit, limit)
@@ -412,46 +412,42 @@ class Spider(BaseSpider):
         return self._page_result(items, page, 10, 250, limit)
 
     def _category_recommend(self, kind, page, ext):
-        limit = 20
-        if kind == "movie":
-            type_value = self._value(ext, "type", "")
-            area = self._value(ext, "area", "")
-            year = self._value(ext, "year", "")
-            platform = self._value(ext, "platform", "")
-            tag = self._value(ext, "tag", "")
-            tags = [type_value, area, year, platform, tag]
-            selected = {"类型": type_value, "地区": area}
-            sort = self._value(ext, "sort", "U")
-        else:
-            form = self._value(ext, "form", "")
-            genre = self._value(ext, "genre", "")
-            area = self._value(ext, "area", "")
-            year = self._value(ext, "year", "")
-            platform = self._value(ext, "platform", "")
-            tag = self._value(ext, "tag", "")
-            tags = [form, genre, area, year, platform, tag]
-            selected = {"类型": genre, "形式": form, "地区": area}
-            sort = self._value(ext, "sort", "U")
-        if sort not in {item[1] for item in self.SORTS}:
-            sort = "U"
-        params = {
-            "refresh": 0,
-            "start": (page - 1) * limit,
-            "count": limit,
-            "selected_categories": json.dumps(selected, ensure_ascii=False, separators=(",", ":")),
-            "uncollect": "false",
-            "sort": sort,
-            "tags": ",".join([item for item in tags if item]),
-        }
-        data = self._get_json(self.API + "/%s/recommend" % kind, params=params, ttl=self.list_cache_ttl)
+        return self._category_media(kind, page, ext)
+
+    def _fetch_recommend(self, endpoint, params, expected_type, ext):
+        url = self.API + "/%s/recommend" % endpoint
+        data = self._get_json(url, params=params, ttl=self.list_cache_ttl)
+        items = self._parse_recommend_items(data, expected_type, ext)
+        if not items and params.get("tags"):
+            fallback = dict(params)
+            fallback["tags"] = ""
+            if fallback.get("sort") not in ("U", "S", "R"):
+                fallback["sort"] = "U"
+            data = self._get_json(url, params=fallback, ttl=self.list_cache_ttl)
+            items = self._parse_recommend_items(data, expected_type, ext)
+        return items, data
+
+    def _parse_recommend_items(self, data, expected_type, ext):
         items = []
         for raw in data.get("items") or []:
-            if raw.get("type") and raw.get("type") != kind:
+            if not isinstance(raw, dict):
+                continue
+            raw_type = str(raw.get("type") or "")
+            if raw_type and raw_type != expected_type:
                 continue
             items.append(self._collection_card(raw, ext))
-        total = self._positive_int(data.get("total"), 0)
-        pagecount = int(math.ceil(float(total) / limit)) if total else page + (1 if len(items) >= limit else 0)
-        return self._page_result(items, page, max(page, pagecount), total or pagecount * limit, limit)
+        return items
+
+    def _resolve_tag_sort(self, tag, sort):
+        value = str(tag or "").strip()
+        override = self.TAG_SORTS.get(value)
+        if override:
+            return "", override
+        return value, sort
+
+    @staticmethod
+    def _join_tags(values):
+        return ",".join([str(item).strip() for item in values if str(item).strip()])
 
     def _category_wishlist(self, page):
         user_id = self.user_id or self._resolve_user_id()
@@ -506,15 +502,9 @@ class Spider(BaseSpider):
             "selected_categories": json.dumps(selected, ensure_ascii=False, separators=(",", ":")),
             "uncollect": "false",
             "sort": sort,
-            "tags": ",".join([item for item in tags if item]),
+            "tags": self._join_tags(tags),
         }
-        data = self._get_json(self.API + "/%s/recommend" % kind, params=params, ttl=self.list_cache_ttl)
-        items = []
-        for raw in data.get("items") or []:
-            raw_type = str(raw.get("type") or "")
-            if raw_type and raw_type != kind:
-                continue
-            items.append(self._collection_card(raw, ext))
+        items, data = self._fetch_recommend(kind, params, kind, ext)
         total = self._positive_int(data.get("total"), 0)
         pagecount = int(math.ceil(float(total) / limit)) if total else page + (1 if len(items) >= limit else 0)
         return self._page_result(items, page, max(page, pagecount), total or pagecount * limit, limit)
