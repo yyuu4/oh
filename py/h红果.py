@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-VERSION = "1.3.0"
+VERSION = "1.5.0"
 VERSION_NOTE = (
-    "2026-10-27：1.3.0 失败冷却按批递增(8→16→封顶30s)自保，冷却期有旧数据直接回放不空等网络；"
-    "1.2.1 搜索空结果/异常重试一次；1.2.0 站点节流+页面 stale 缓存护生命周期；1.1.x 清死代码补单测并对齐官网。"
+    "1.5.0 首页补“更新推荐”(官网轮播+四榜单首屏，去重限量)，OK影视首页不再空；"
+    "1.4.0 首页追加官网四榜单分类(红果/真人/AI/漫剧热播榜)且全分类支持无限翻页；"
+    "真人剧筛选拆双组补全战争/综艺/剧情(OK影视单组约20项截断)；"
+    "列表空载视作失败重试、冷却期2.5s快速失败、越界404按真到底收口，修偶发‘找不到数据’要刷新；"
+    "1.3.0 失败冷却按批递增(8→16→封顶30s)自保，冷却期有旧数据直接回放；"
+    "1.2.1 搜索空结果/异常重试一次；1.2.0 站点节流+页面 stale 缓存护生命周期。"
 )
 
 import base64
@@ -22,6 +26,7 @@ import concurrent.futures
 import threading
 import time
 from collections.abc import Mapping
+from html import unescape as _htmlescape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, quote, urlencode, urlparse
@@ -551,11 +556,22 @@ _HG_CONTENT_TYPES = [
         ("apocalypse", "末世"), ("wealthy-family", "豪门"), ("wonder", "奇幻"),
         ("sci-fi", "科幻"), ("adventure", "冒险"),
     ]),
-    # 漫画类：按官网保留展示（2026-10-27 拍板）。上游 multi_video_model 对漫画 vid 回
+    # 漫画类：按官网保留展示（已拍板）。上游 multi_video_model 对漫画 vid 回
     # 101000 无播放源（已试遍 map key/platform 变体），播放失败属上游限制而非插件缺陷。
     ("comic", "漫画", [("", "全部")]),
+    # 官网导航“榜单”四路由(排在四个内容分类之后)，列表在内嵌 fn-args 里(见 _hg_rank_page)
+    ("hot-drama", "红果热播榜", [("", "全部")]),
+    ("hot-real-drama", "真人剧热播榜", [("", "全部")]),
+    ("hot-ai-drama", "AI剧热播榜", [("", "全部")]),
+    ("hot-comic-drama", "漫剧热播榜", [("", "全部")]),
 ]
 _HG_ROUTES = {k: v for k, v in ((a, b) for a, b, _ in _HG_CONTENT_TYPES)}
+_HG_RANK_ROUTES = frozenset(("hot-drama", "hot-real-drama", "hot-ai-drama", "hot-comic-drama"))
+# 单个筛选组的值上限：OK影视实测单组只渲染前约20项(真人剧24项时战争/综艺/剧情被截掉)，
+# 超出的拆进第二组(cat2)保证全部可见。
+_HG_FILTER_GROUP_MAX = 20
+# 首页“更新推荐”最多条数：官网轮播4条+四榜单首屏36条(跨源去重后可能更少)
+_HOME_VIDEO_MAX = 40
 _HG_ALIAS = {
     "all": "real-drama", "latest": "real-drama", "hot": "real-drama",
     "male": "real-drama", "female": "real-drama", "短剧": "real-drama",
@@ -588,21 +604,34 @@ def _hg_category_page(route, cat, page):
     def once():
         sess = None
         try:
-            _net_gate()
+            _net_gate(max_wait=_NET_BUSY_MAX_WAIT)
             sess = requests.Session()
             sess.trust_env = False
             sess.headers.update({"User-Agent": UA, "Referer": SITE + "/"})
             r = sess.get(
                 SITE + path,
                 params={"page": str(max(1, int(page or 1)))},
-                timeout=25,
+                timeout=12,
             )
+            if r.status_code == 404:
+                raise _HGDataEnd("分类页超出站点范围(404)")
             r.raise_for_status()
             v = _router_payload(r.text or "")
             if not isinstance(v, Mapping):
                 raise HongguoPluginError("分类页路由数据格式错误")
+            cat = ((v.get("loaderData") or {}).get("category_$") or {})
+            # 200但空载=站点抖动(真·空子分类会带 pagination.total=0)：算失败走重试，
+            # 但不计连续失败(站点在响应，别拿冷却惩罚自己)
+            if not (cat.get("recommendList") or cat.get("pagination")):
+                raise _HGDataEmpty("分类页空载")
             _net_result(True)
-            return ((v.get("loaderData") or {}).get("category_$") or {})
+            return cat
+        except _SiteBusy:
+            raise
+        except _HGDataEmpty:
+            raise
+        except _HGDataEnd:
+            raise
         except Exception:
             _net_result(False)
             raise
@@ -615,6 +644,12 @@ def _hg_category_page(route, cat, page):
 
     try:
         result = _retry(once, 3, 0.6)
+    except _HGDataEnd:
+        # 越界=真到底：合成空页让客户端 page>=pagecount 停止翻页，不走报错
+        pg_n = max(1, int(page or 1))
+        end_result = {"recommendList": [], "pagination": {"pageNum": pg_n, "totalPages": pg_n}}
+        _page_cache_put(cache_key, end_result)
+        return end_result
     except Exception as err:
         stale = _page_cache_get(cache_key, allow_stale=True)
         if stale is not None:
@@ -623,6 +658,143 @@ def _hg_category_page(route, cat, page):
     if isinstance(result, dict):
         _page_cache_put(cache_key, result)
     return result
+
+
+def _rank_content_from_html(html_text, slug):
+    """榜单列表在内嵌 data-fn-args 脚本里(客户端 mergeLoaderData 注入 loaderData)：
+    args = ["rank_<slug>/page", "content", {"isSuccess","pagination","rankList"}]，
+    loaderData.content 本身为空壳，必须从 fn-args 取。"""
+    marker = "rank_%s/page" % slug
+    for m in re.finditer(r"data-fn-args=(['\"])(.*?)\1", html_text or ""):
+        try:
+            args = json.loads(_htmlescape(m.group(2)))
+        except (ValueError, TypeError):
+            continue
+        if isinstance(args, list) and len(args) >= 3 and args[0] == marker and isinstance(args[2], Mapping):
+            if "rankList" in args[2]:
+                return dict(args[2])
+    raise _HGDataEmpty("榜单数据缺失")
+
+
+def _hg_rank_page(slug, page):
+    """官网榜单页 /rank/{slug}?page=N(每页20条)，数据结构同分类页缓存/重试/stale 一套。"""
+    slug = str(slug or "").strip().strip("/")
+    cache_key = "rank|%s|%s" % (slug, page)
+    hit = _page_cache_get(cache_key)
+    if hit is not None:
+        return hit
+    if _net_in_cooldown():
+        stale = _page_cache_get(cache_key, allow_stale=True)
+        if stale is not None:
+            return stale
+
+    def once():
+        sess = None
+        try:
+            _net_gate(max_wait=_NET_BUSY_MAX_WAIT)
+            sess = requests.Session()
+            sess.trust_env = False
+            sess.headers.update({"User-Agent": UA, "Referer": SITE + "/"})
+            r = sess.get(
+                SITE + "/rank/" + slug,
+                params={"page": str(max(1, int(page or 1)))},
+                timeout=12,
+            )
+            if r.status_code == 404:
+                raise _HGDataEnd("榜单页超出站点范围(404)")
+            r.raise_for_status()
+            payload = _router_payload(r.text or "")
+            if not isinstance(payload, Mapping):
+                raise HongguoPluginError("榜单页路由数据格式错误")
+            content = _rank_content_from_html(r.text or "", slug)
+            if not (content.get("rankList") or content.get("pagination")):
+                raise _HGDataEmpty("榜单页空载")
+            _net_result(True)
+            return content
+        except _SiteBusy:
+            raise
+        except _HGDataEmpty:
+            raise
+        except _HGDataEnd:
+            raise
+        except Exception:
+            _net_result(False)
+            raise
+        finally:
+            if sess is not None:
+                try:
+                    sess.close()
+                except Exception:
+                    pass
+
+    try:
+        result = _retry(once, 3, 0.6)
+    except _HGDataEnd:
+        # 榜单越界=真到底(站点每页20条,总计5页)：合成空页停止客户端继续要
+        pg_n = max(1, int(page or 1))
+        end_result = {"rankList": [], "pagination": {"pageNum": pg_n, "totalPages": pg_n}}
+        _page_cache_put(cache_key, end_result)
+        return end_result
+    except Exception as err:
+        stale = _page_cache_get(cache_key, allow_stale=True)
+        if stale is not None:
+            return stale
+        raise HongguoPluginError("榜单页获取失败: %s" % err)
+    if isinstance(result, dict):
+        _page_cache_put(cache_key, result)
+    return result
+
+
+def _rank_item(x):
+    x = x if isinstance(x, Mapping) else {}
+    try:
+        ep_cnt = int(x.get("episodeCount") or 0)
+    except (TypeError, ValueError):
+        ep_cnt = 0
+    parts = []
+    if ep_cnt > 0:
+        parts.append("全%d集" % ep_cnt)
+    heat = _text(x.get("heatText"))
+    if heat:
+        parts.append(heat)
+    item = {
+        "vod_id": str(x.get("seriesId") or x.get("id") or ""),
+        "vod_name": _text(x.get("title")),
+        "vod_pic": _text(x.get("cover")),
+        "vod_remarks": " · ".join(parts),
+        "vod_content": str(x.get("description") or ""),
+    }
+    tags = x.get("tags")
+    if isinstance(tags, list) and tags:
+        item["vod_class"] = "/".join(str(t) for t in tags[:5])
+    return item
+
+
+def _list_page_result(page, items, page_data):
+    """分类/榜单统一列表响应：有分页按站点 totalPages(真到底时 page≥pagecount 客户端停)；
+    瞬时失败且无分页时 pagecount=page+1，让 OK影视无限翻页下次手势继续(否则空列表被当到底)。"""
+    page_data = page_data if isinstance(page_data, Mapping) else {}
+    try:
+        pagecount = int(page_data.get("totalPages") or 1)
+    except (TypeError, ValueError):
+        pagecount = 1
+    try:
+        total = int(page_data.get("total") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    if not page_data and page > 1 and not items:
+        pagecount = page + 1
+    if total <= 0 and page_data.get("totalPages") and items:
+        # 榜单分页只有 {pageNum,totalPages,nextUrl}：总数按 每页条数×页数 估算
+        total = pagecount * len(items)
+    return {
+        "page": page,
+        "pagecount": max(1, pagecount),
+        "limit": len(items),
+        "total": total or len(items),
+        "list": items,
+    }
+
 
 VIDEO_URL = "https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/"
 UA = "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
@@ -637,6 +809,14 @@ class HongguoPluginError(RuntimeError):
     pass
 
 
+class _HGDataEmpty(HongguoPluginError):
+    """站点 200 但页面数据缺失(抖动)：可重试，但不计入连续失败冷却。"""
+
+
+class _HGDataEnd(HongguoPluginError):
+    """请求页超出站点范围(404)：真到底，不重试也不计失败，直接回合成空页。"""
+
+
 # ---------- 站点保护：请求节流 / 连续失败冷却 / 页面 stale 缓存 ----------
 # 红果站两类常见死法：①短时高频请求触发 104 reset 或风控；②上游抖动致列表页间歇不可用。
 # 统一节流（最小间隔+抖动）、连续失败后自动冷却、页面数据失败时回放 stale 缓存，站点恢复即自愈。
@@ -645,6 +825,8 @@ _NET_GATE_JITTER = 0.25
 _NET_FAIL_LIMIT = 5
 _NET_FAIL_COOLDOWN = 8.0
 _NET_COOLDOWN_MAX = 30.0
+# 列表/页面请求在冷却期最多等 2.5s：冷却 8~30s 里干等必超 OK影视超时，快速失败让客户端重试
+_NET_BUSY_MAX_WAIT = 2.5
 _PAGE_FRESH_TTL = 180
 _PAGE_STALE_TTL = 6 * 3600
 _PAGE_CACHE_MAX = 128
@@ -656,8 +838,13 @@ _net_cooldown_until = 0.0
 _PAGE_CACHE: dict[str, tuple[float, Any]] = {}
 
 
-def _net_gate() -> None:
-    """站点请求统一节流；连续失败达阈值触发一次性冷却（时间戳到期自动放行）。"""
+class _SiteBusy(RuntimeError):
+    """站点冷却中且本次调用等不起：快速失败，不计入连续失败(不是上游真的又错了一次)。"""
+
+
+def _net_gate(max_wait=None) -> None:
+    """站点请求统一节流；连续失败达阈值触发一次性冷却。
+    max_wait 给定且等待超过它时抛 _SiteBusy 快速失败，避免冷却期干等到客户端超时。"""
     global _net_next_at
     while True:
         with _net_lock:
@@ -666,6 +853,8 @@ def _net_gate() -> None:
             if wait <= 0:
                 _net_next_at = now + _NET_GATE_INTERVAL + random.random() * _NET_GATE_JITTER
                 return
+            if max_wait is not None and wait > max_wait:
+                raise _SiteBusy("站点冷却中，跳过 %.1fs 等待" % wait)
         time.sleep(min(wait, 1.0))
 
 
@@ -738,11 +927,15 @@ def _router_payload(html: str) -> Any:
 
 
 def _retry(fetch, attempts: int = 3, base: float = 0.6):
-    """通用重试：退避后重抛最后一次错误（收敛 _page/_hg_category_page 重复样板）。"""
+    """通用重试：退避后重抛最后一次错误（收敛 _page/_hg_category_page 重复样板）。
+    _SiteBusy 是“等不起”而非瞬时网络错，重试也一样等不起，直接上抛。"""
     last = None
     for i in range(max(1, int(attempts))):
         try:
             return fetch()
+        except (_SiteBusy, _HGDataEnd):
+            # 等不起 / 真到底：重试没有意义，直接上抛
+            raise
         except Exception as err:
             last = err
             if i + 1 < attempts:
@@ -3889,7 +4082,7 @@ def _key_seed_from_model(model: Mapping[str, Any]) -> bytes:
     return b""
 def _page(url):
     def once():
-        _net_gate()
+        _net_gate(max_wait=_NET_BUSY_MAX_WAIT)
         try:
             r = requests.get(
                 url,
@@ -3899,7 +4092,7 @@ def _page(url):
                     "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
                     "Cache-Control": "no-cache",
                 },
-                timeout=30,
+                timeout=15,
             )
             r.raise_for_status()
             r.encoding = r.encoding or "utf-8"
@@ -4129,7 +4322,8 @@ def _hg_search_scan(key, page=1, max_pages=8):
     empty = {"page": page, "pagecount": 1, "limit": 0, "total": 0, "list": []}
     if not key:
         return empty
-    routes = [r for r, _n, _c in _HG_CONTENT_TYPES]
+    # 榜单路由是 /rank/*(数据结构不同且不是 /category/*)，搜索兜底只扫四个内容分类
+    routes = [r for r, _n, _c in _HG_CONTENT_TYPES if r not in _HG_RANK_ROUTES]
     per = 20
     need = page * per
 
@@ -4230,16 +4424,55 @@ class Spider(_BaseSpider):
             pass
 
     def homeContent(self, filter):
-        """分类=官网四套内容类型，二级分类按官网 selectorList 对齐，并隐藏空筛选项。"""
+        """分类=官网四套内容类型+官网四榜单(排后)；>20项的筛选拆双组防 OK影视截断。"""
         class_list = [{"type_id": k, "type_name": n} for k, n, _ in _HG_CONTENT_TYPES]
         filters = {}
         for k, _n, cats in _HG_CONTENT_TYPES:
-            if len(cats) > 1:
-                filters[k] = [_filter_group("cat", "分类", [(nm, v) for v, nm in cats])]
+            if len(cats) <= 1:
+                continue
+            vals = [(nm, v) for v, nm in cats]
+            if len(vals) <= _HG_FILTER_GROUP_MAX:
+                filters[k] = [_filter_group("cat", "分类", vals)]
+            else:
+                filters[k] = [
+                    _filter_group("cat", "分类", vals[: _HG_FILTER_GROUP_MAX]),
+                    _filter_group("cat2", "更多分类", vals[_HG_FILTER_GROUP_MAX:]),
+                ]
         return {"class": class_list, "filters": filters}
 
+    def homeVideoContent(self):
+        """首页“更新推荐”(OK影视首页)：官网头部轮播 bannerList + 四榜单首屏，跨源去重限量。
+        数据源故障时回空列表，绝不让首页请求报错。"""
+        items = []
+        seen = set()
+
+        def push(x):
+            x = x if isinstance(x, dict) else {}
+            it = _item(x)
+            vid = it.get("vod_id") or ""
+            if not vid or not it.get("vod_pic") or vid in seen:
+                return
+            if not it.get("vod_remarks"):
+                right_text = _text(x.get("episode_right_text"))
+                if right_text:
+                    it["vod_remarks"] = right_text
+            seen.add(vid)
+            items.append(it)
+
+        try:
+            page = ((_data(SITE + "/").get("loaderData") or {}).get("page") or {})
+        except Exception:
+            page = {}
+        for x in (page.get("bannerList") or []):
+            push(x)
+        for sec in (page.get("homeSections") or []):
+            for x in ((sec if isinstance(sec, dict) else {}).get("video_list") or []):
+                push(x)
+        return {"list": items[:_HOME_VIDEO_MAX]}
+
     def categoryContent(self, tid, pg, filter, extend):
-        """走官方分类页 /category/{route}/{item}?page=N，标题取官方 series_name。"""
+        """分类页走 /category/{route}/{item}?page=N，榜单 tid 走 /rank/{slug}?page=N。
+        筛选拆双组时 cat2(更多分类)优先于 cat；标题取官方 series_name/title。"""
         try:
             page = max(1, int(pg))
         except (TypeError, ValueError):
@@ -4253,13 +4486,25 @@ class Spider(_BaseSpider):
                 ext = {}
         elif isinstance(extend, dict):
             ext = dict(extend)
-        cat = str(ext.get("cat") or ext.get("分类") or "").strip()
+        cat = str(ext.get("cat2") or ext.get("cat") or ext.get("分类") or "").strip()
         if isinstance(filter, dict):
-            f2 = str(filter.get("cat") or filter.get("分类") or "").strip()
+            f2 = str(filter.get("cat2") or filter.get("cat") or filter.get("分类") or "").strip()
             if f2 and not cat:
                 cat = f2
         if cat in ("all", "全部", "0", "all_cat"):
             cat = ""
+        if route in _HG_RANK_ROUTES:
+            try:
+                p = _hg_rank_page(route, page)
+            except Exception:
+                p = {}
+            rows = p.get("rankList") or []
+            items = []
+            for x in rows:
+                it = _rank_item(x)
+                if it.get("vod_pic"):
+                    items.append(it)
+            return _list_page_result(page, items, p.get("pagination") or {})
         try:
             p = _hg_category_page(route, cat, page)
         except Exception:
@@ -4269,19 +4514,12 @@ class Spider(_BaseSpider):
             except Exception:
                 p = {}
         rows = p.get("recommendList") or []
-        page_data = p.get("pagination") or {}
         items = []
         for x in rows:
             it = _cat_item(x)
             if it.get("vod_pic"):
                 items.append(it)
-        return {
-            "page": page,
-            "pagecount": int(page_data.get("totalPages") or 1),
-            "limit": len(items),
-            "total": int(page_data.get("total") or len(rows)),
-            "list": items,
-        }
+        return _list_page_result(page, items, p.get("pagination") or {})
 
     def searchContent(self, key, quick=False, pg="1"):
         try:
