@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 VERSION_NOTE = (
+    "1.5.1 修搜索空结果误计站点失败(无词搜索反触发冷却+冷却期卡30s)：空=有效答案不计数、"
+    "冷却快速失败、45s 搜索负缓存、session 必关；cat2 筛选组补‘全部’防默认串成灾难；"
+    "分类/榜单补 vod_id 与海报回退；连接重置(104)额外补 1 次抖动重试。"
     "1.5.0 首页补“更新推荐”(官网轮播+四榜单首屏，去重限量)，OK影视首页不再空；"
     "1.4.0 首页追加官网四榜单分类(红果/真人/AI/漫剧热播榜)且全分类支持无限翻页；"
     "真人剧筛选拆双组补全战争/综艺/剧情(OK影视单组约20项截断)；"
@@ -760,7 +763,13 @@ def _rank_item(x):
     item = {
         "vod_id": str(x.get("seriesId") or x.get("id") or ""),
         "vod_name": _text(x.get("title")),
-        "vod_pic": _text(x.get("cover")),
+        "vod_pic": _first(
+            x.get("cover"),
+            x.get("series_cover"),
+            x.get("cover_url"),
+            x.get("series_cover_url"),
+            x.get("pic"),
+        ),
         "vod_remarks": " · ".join(parts),
         "vod_content": str(x.get("description") or ""),
     }
@@ -827,6 +836,10 @@ _NET_FAIL_COOLDOWN = 8.0
 _NET_COOLDOWN_MAX = 30.0
 # 列表/页面请求在冷却期最多等 2.5s：冷却 8~30s 里干等必超 OK影视超时，快速失败让客户端重试
 _NET_BUSY_MAX_WAIT = 2.5
+# 连接重置(104)是“快失败”：常规退避耗尽后再补的重试延迟(带抖动)
+_NET_RESET_RETRY_DELAY = 1.5
+# 搜索负缓存：搜不到的词 45s 内不再打接口/扫分类页
+_SEARCH_NEG_TTL = 45.0
 _PAGE_FRESH_TTL = 180
 _PAGE_STALE_TTL = 6 * 3600
 _PAGE_CACHE_MAX = 128
@@ -836,6 +849,15 @@ _net_next_at = 0.0
 _net_fail_streak = 0
 _net_cooldown_until = 0.0
 _PAGE_CACHE: dict[str, tuple[float, Any]] = {}
+_SEARCH_NEG: dict[str, float] = {}
+
+
+def _is_conn_reset(err) -> bool:
+    """104/连接类错误判定：只给这类快失败补重试，超时/解析错不加重试(防放大风控)。"""
+    if isinstance(err, ConnectionError):
+        return True
+    req_conn = getattr(requests.exceptions, "ConnectionError", None)
+    return req_conn is not None and isinstance(err, req_conn)
 
 
 class _SiteBusy(RuntimeError):
@@ -928,13 +950,13 @@ def _router_payload(html: str) -> Any:
 
 def _retry(fetch, attempts: int = 3, base: float = 0.6):
     """通用重试：退避后重抛最后一次错误（收敛 _page/_hg_category_page 重复样板）。
-    _SiteBusy 是“等不起”而非瞬时网络错，重试也一样等不起，直接上抛。"""
+    _SiteBusy 是“等不起”而非瞬时网络错，重试也一样等不起，直接上抛；
+    _HGDataEnd 是真到底，同理；连接重置(104)额外补 1 次带抖动重试。"""
     last = None
     for i in range(max(1, int(attempts))):
         try:
             return fetch()
         except (_SiteBusy, _HGDataEnd):
-            # 等不起 / 真到底：重试没有意义，直接上抛
             raise
         except Exception as err:
             last = err
@@ -943,6 +965,14 @@ def _retry(fetch, attempts: int = 3, base: float = 0.6):
                     time.sleep(base * (i + 1))
                 except Exception:
                     pass
+    if _is_conn_reset(last):
+        try:
+            time.sleep(_NET_RESET_RETRY_DELAY + random.random() * 0.5)
+            return fetch()
+        except (_SiteBusy, _HGDataEnd):
+            raise
+        except Exception as err:
+            last = err
     raise last
 
 def _text(value: Any) -> str:
@@ -4186,14 +4216,16 @@ def _filter_group(key, name, values):
 
 def _search_api(key: str, page: int = 1) -> dict:
     """官网搜索接口 /api/search/result（搜索页已改客户端渲染，SSR 无数据）。
-    空结果/异常重试一次：扛首访 ttwid 未就绪与站点瞬时 104 RST 抖动。"""
+    空结果重试一次扛首访 ttwid；200+空列表=有效答案(词不存在)，不计站点失败——
+    否则搜几个无结果的词就会误触冷却，冷却期还会卡到 30s(见 _net_gate max_wait)。"""
     empty = {"searchList": [], "totalCount": 0, "totalPages": 1, "hasMore": False}
     for attempt in range(2):
+        sess = None
         try:
-            _net_gate()
-            session = requests.Session()
-            session.trust_env = False
-            session.headers.update(
+            _net_gate(max_wait=_NET_BUSY_MAX_WAIT)
+            sess = requests.Session()
+            sess.trust_env = False
+            sess.headers.update(
                 {
                     "User-Agent": UA,
                     "Accept": "application/json, text/plain, */*",
@@ -4202,10 +4234,10 @@ def _search_api(key: str, page: int = 1) -> dict:
             )
             # 首访拿 ttwid，缺了上游只回空列表
             try:
-                session.get(SITE + "/", timeout=10)
+                sess.get(SITE + "/", timeout=10)
             except Exception:
                 pass
-            r = session.get(
+            r = sess.get(
                 SITE + "/api/search/result",
                 params={
                     "aid": "8662",
@@ -4214,33 +4246,46 @@ def _search_api(key: str, page: int = 1) -> dict:
                 },
                 timeout=20,
             )
-            data = {}
-            rows = []
-            if r.status_code == 200:
+            if r.status_code != 200:
+                _net_result(False)
+            else:
                 try:
                     data = r.json()
                 except Exception:
-                    data = {}
-                rows = data.get("searchList") or []
-            if isinstance(rows, list) and rows:
-                try:
-                    total_pages = int(data.get("totalPages") or 1)
-                except Exception:
-                    total_pages = 1
-                try:
-                    total_count = int(data.get("totalCount") or 0)
-                except Exception:
-                    total_count = 0
-                _net_result(True)
-                return {
-                    "searchList": rows,
-                    "totalCount": total_count,
-                    "totalPages": max(1, total_pages),
-                    "hasMore": bool(data.get("hasMore")),
-                }
-            _net_result(False)
+                    data = None
+                if isinstance(data, dict) and "searchList" in data:
+                    rows = data.get("searchList") or []
+                    if isinstance(rows, list) and rows:
+                        try:
+                            total_pages = int(data.get("totalPages") or 1)
+                        except Exception:
+                            total_pages = 1
+                        try:
+                            total_count = int(data.get("totalCount") or 0)
+                        except Exception:
+                            total_count = 0
+                        _net_result(True)
+                        return {
+                            "searchList": rows,
+                            "totalCount": total_count,
+                            "totalPages": max(1, total_pages),
+                            "hasMore": bool(data.get("hasMore")),
+                        }
+                    # 200 + 结构正常 + 空列表：正常答案，不计成功也不计失败
+                else:
+                    # 200 但结构不对(风控错误包/非JSON)：算站点异常
+                    _net_result(False)
+        except _SiteBusy:
+            # 冷却中等不起：直接回空让客户端快速重试，不计失败
+            return empty
         except Exception:
             _net_result(False)
+        finally:
+            if sess is not None:
+                try:
+                    sess.close()
+                except Exception:
+                    pass
         if attempt == 0:
             try:
                 time.sleep(0.6)
@@ -4259,6 +4304,8 @@ def _search_loader(key: str, page: int = 1) -> dict:
         stale = _page_cache_get(cache_key, allow_stale=True)
         if stale is not None:
             return stale
+        # 冷却中且无旧数据：直接回空让客户端快速重试，别再连环撞接口
+        return {"searchList": [], "totalCount": 0, "totalPages": 1, "hasMore": False}
     api = _search_api(key, page)
     if api.get("searchList"):
         _page_cache_put(cache_key, api)
@@ -4282,6 +4329,28 @@ def _search_loader(key: str, page: int = 1) -> dict:
     if stale is not None:
         return stale
     return last
+
+
+def _search_neg_key(key, page) -> str:
+    return "neg|%s|%s" % (str(key or ""), max(1, int(page or 1)))
+
+
+def _search_neg_put(key, page) -> None:
+    _SEARCH_NEG[_search_neg_key(key, page)] = time.time()
+
+
+def _search_neg_hit(key, page) -> bool:
+    ts = _SEARCH_NEG.get(_search_neg_key(key, page))
+    if ts is None:
+        return False
+    if time.time() - ts > _SEARCH_NEG_TTL:
+        _SEARCH_NEG.pop(_search_neg_key(key, page), None)
+        return False
+    return True
+
+
+def _search_empty_page(page) -> dict:
+    return {"page": max(1, int(page or 1)), "pagecount": 1, "limit": 0, "total": 0, "list": []}
 
 
 def _search_by_keywords(keywords, page: int) -> dict:
@@ -4422,6 +4491,7 @@ class Spider(_BaseSpider):
             _page_cache_clear()
         except Exception:
             pass
+        _SEARCH_NEG.clear()
 
     def homeContent(self, filter):
         """分类=官网四套内容类型+官网四榜单(排后)；>20项的筛选拆双组防 OK影视截断。"""
@@ -4434,9 +4504,13 @@ class Spider(_BaseSpider):
             if len(vals) <= _HG_FILTER_GROUP_MAX:
                 filters[k] = [_filter_group("cat", "分类", vals)]
             else:
+                tail = list(vals[_HG_FILTER_GROUP_MAX:])
+                # 次组首位补“全部”：宿主若默认选中每组首项，不会串成具体子类(如灾难)
+                if tail and tail[0][1] != "":
+                    tail.insert(0, ("全部", ""))
                 filters[k] = [
                     _filter_group("cat", "分类", vals[: _HG_FILTER_GROUP_MAX]),
-                    _filter_group("cat2", "更多分类", vals[_HG_FILTER_GROUP_MAX:]),
+                    _filter_group("cat2", "更多分类", tail),
                 ]
         return {"class": class_list, "filters": filters}
 
@@ -4502,7 +4576,7 @@ class Spider(_BaseSpider):
             items = []
             for x in rows:
                 it = _rank_item(x)
-                if it.get("vod_pic"):
+                if it.get("vod_id") and it.get("vod_pic"):
                     items.append(it)
             return _list_page_result(page, items, p.get("pagination") or {})
         try:
@@ -4517,7 +4591,7 @@ class Spider(_BaseSpider):
         items = []
         for x in rows:
             it = _cat_item(x)
-            if it.get("vod_pic"):
+            if it.get("vod_id") and it.get("vod_pic"):
                 items.append(it)
         return _list_page_result(page, items, p.get("pagination") or {})
 
@@ -4534,6 +4608,10 @@ class Spider(_BaseSpider):
         if key in ("漫剧", "动漫短剧"):
             return _search_by_keywords(_MANJU_KEYWORDS, page)
 
+        # 负缓存命中(45s内同词同页全 miss)：直接回空，跳过接口与分类页扫描
+        if _search_neg_hit(key, page):
+            return _search_empty_page(page)
+
         p = _search_loader(key, page)
         rows = p.get("searchList") or []
         if not rows:
@@ -4541,6 +4619,10 @@ class Spider(_BaseSpider):
             scanned = _hg_search_scan(key, page)
             if scanned.get("list"):
                 return scanned
+            # 全 miss：45s 负缓存，短时间重复搜同词不再打接口/扫分类页
+            # (冷却期的空不算“真没词”，不当负缓存)
+            if not _net_in_cooldown():
+                _search_neg_put(key, page)
         try:
             total = int(p.get("totalCount") or 0)
         except Exception:
@@ -4585,7 +4667,7 @@ class Spider(_BaseSpider):
             )
             play_from.append(line_name)
             play_url.append(eps)
-        return {"list": [{"vod_id": sid, "vod_name": str(s.get("series_name") or ""), "vod_pic": str(s.get("series_cover") or ""), "vod_year": "", "vod_area": "", "vod_director": "", "vod_actor": ",".join(actors), "vod_content": str(s.get("series_intro") or ""), "vod_remarks": str(s.get("episode_right_text") or ""), "vod_play_from": "$$$".join(play_from), "vod_play_url": "$$$".join(play_url)}]}
+        return {"list": [{"vod_id": sid, "vod_name": str(s.get("series_name") or ""), "vod_pic": _first(s.get("series_cover"), s.get("cover"), s.get("series_cover_url"), s.get("pic"), ""), "vod_year": "", "vod_area": "", "vod_director": "", "vod_actor": ",".join(actors), "vod_content": str(s.get("series_intro") or ""), "vod_remarks": str(s.get("episode_right_text") or ""), "vod_play_from": "$$$".join(play_from), "vod_play_url": "$$$".join(play_url)}]}
     def playerContent(self, flag, id, vipFlags=None):
         self._adopt_working_pair()
         # 从线路名（flag，如“红果超清/红果高清”）与集 token 双路解析清晰度。
