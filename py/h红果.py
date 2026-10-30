@@ -2079,7 +2079,8 @@ def _tee_complete_locked(state: dict[str, Any]) -> None:
     try:
         os.replace(state["path"], state["final"])
         _hg_trace("边播边落盘完成 %s" % os.path.basename(state["final"]))
-    except Exception:
+    except Exception as err:
+        _hg_trace("落盘改名失败 %s: %s" % (os.path.basename(state["path"]), err))
         try:
             os.remove(state["path"])
         except OSError:
