@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-VERSION = "1.5.1"
+VERSION = "1.6.0"
 VERSION_NOTE = (
+    "1.6.0 搜完即播防闪退提速套(刀法移植自红果omn.js v1.7.x)：注册设备对落盘复用(重载/重启不丢、"
+    "轮换先作废)、detail 即预热首集会话(点播瞬间只剩出流)、流服务端口探活复用(重载不漏端口、"
+    "不掉壳代理回退)、CDN 忽略 Range 时整片只落盘一次再切片(每片重下整片→一次)、"
+    "完整缓存优先直接出流+边播边落盘(重进/切回秒开)、分段耗时写 hg_trace.log 便于现地定位、"
+    "HTTP 服务加固(request_queue/连接超时防线程滞留)。"
     "1.5.1 修搜索空结果误计站点失败(无词搜索反触发冷却+冷却期卡30s)：空=有效答案不计数、"
     "冷却快速失败、45s 搜索负缓存、session 必关；cat2 筛选组补‘全部’防默认串成灾难；"
     "分类/榜单补 vod_id 与海报回退；连接重置(104)额外补 1 次抖动重试。"
@@ -369,12 +374,20 @@ def _hg_cache_cleanup(force: bool = False) -> None:
             except Exception:
                 pass
             total -= old["size"]
-        # 3) 清理残留 tmp
+        # 3) 清理残留 tmp / 过期 .part(增量落盘半成品)
         root = _hg_cache_dir()
+        now = time.time()
         for name in os.listdir(root):
+            fp = os.path.join(root, name)
             if name.endswith(".tmp") or name == ".w":
                 try:
-                    os.remove(os.path.join(root, name))
+                    os.remove(fp)
+                except Exception:
+                    pass
+            elif name.endswith(".part"):
+                try:
+                    if now - os.stat(fp).st_mtime > 3600:
+                        os.remove(fp)
                 except Exception:
                     pass
     except Exception:
@@ -415,6 +428,29 @@ def _hg_cache_put(vid: str, quality: str, data: bytes) -> None:
                 os.remove(path + ".tmp")
         except Exception:
             pass
+
+
+_HG_TRACE_MAX_BYTES = 200 * 1024
+
+
+def _hg_trace(msg: str) -> None:
+    """分段耗时/关键事件落盘(自限约200KB)，现地排查起播慢与端口复用用。"""
+    try:
+        path = os.path.join(_hg_cache_dir(), "hg_trace.log")
+        line = "%s %s\n" % (time.strftime("%m-%d %H:%M:%S"), str(msg))
+        try:
+            if os.path.getsize(path) > _HG_TRACE_MAX_BYTES:
+                with open(path, "rb") as fh:
+                    fh.seek(_HG_TRACE_MAX_BYTES // 4)
+                    tail = fh.read()
+                with open(path, "wb") as fh:
+                    fh.write(tail)
+        except OSError:
+            pass
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:
+        pass
 
 
 def _aes_is_fast() -> bool:
@@ -1254,7 +1290,64 @@ def _toplevel_boxes(buf: bytes) -> list[tuple[int, int, bytes]]:
     return boxes
 
 
+_RANGE_STASH: dict[str, str] = {}   # url -> 落盘路径(仅本进程生命周期)
+_RANGE_STASH_MIN = 1 << 20          # 整片落盘阈值：>1MB 才值得(兼防单测小包跨次运行串味)
+
+
+def _range_stash_path(url: str) -> str:
+    return os.path.join(_hg_cache_dir(), "r%s.mp4" % hashlib.sha1(url.encode("utf-8")).hexdigest()[:32])
+
+
+def _range_stash_read(url: str, start: int, end: int) -> tuple[bytes, int] | None:
+    path = _RANGE_STASH.get(url)
+    if not path:
+        return None
+    try:
+        total = os.path.getsize(path)
+        if total <= 0 or start >= total:
+            _RANGE_STASH.pop(url, None)
+            return None
+        with open(path, "rb") as fh:
+            fh.seek(start)
+            data = fh.read(end - start + 1)
+        if len(data) != end - start + 1:
+            _RANGE_STASH.pop(url, None)
+            return None
+        try:
+            os.utime(path, None)
+        except OSError:
+            pass
+        return data, total
+    except OSError:
+        _RANGE_STASH.pop(url, None)
+        return None
+
+
+def _range_stash_write(url: str, body: bytes, total: int) -> None:
+    path = _range_stash_path(url)
+    try:
+        if os.path.isfile(path) and os.path.getsize(path) == len(body):
+            _RANGE_STASH[url] = path
+            return
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as fh:
+            fh.write(body)
+        os.replace(tmp, path)
+        _RANGE_STASH[url] = path
+        _hg_trace("Range被忽略CDN整片落盘 %dB" % len(body))
+    except Exception:
+        try:
+            if os.path.exists(path + ".tmp"):
+                os.remove(path + ".tmp")
+        except Exception:
+            pass
+
+
 def _range_get(url: str, start: int, end: int) -> tuple[bytes, int]:
+    # 本次运行内整片已落盘 → 直接切片，绝不再向 CDN 重下整片
+    stashed = _range_stash_read(url, start, end)
+    if stashed is not None:
+        return stashed
     headers = dict(MEDIA_HEADERS)
     headers["Range"] = "bytes=%d-%d" % (start, end)
     expected = end - start + 1
@@ -1282,6 +1375,12 @@ def _range_get(url: str, start: int, end: int) -> tuple[bytes, int]:
         if response.status_code == 200:
             # 有 CDN 会忽略 Range 直接回整文件；按请求区间切片，避免把整包当分片。
             total = length_hint or len(body)
+            if (
+                len(body) > expected
+                and len(body) > _RANGE_STASH_MIN
+                and (not length_hint or length_hint == len(body))
+            ):
+                _range_stash_write(url, body, total)
             if start == 0:
                 if len(body) < expected:
                     last_error = HongguoPluginError(
@@ -1544,7 +1643,63 @@ def _register_device_pair() -> tuple[str, str] | None:
     return None
 
 
+def _device_memo_path() -> str:
+    return os.path.join(_hg_cache_dir(), "hg_device.json")
+
+
+_DEVICE_MEMO_MAX_AGE = 30 * 86400
+
+
+def _device_memo_load() -> dict[str, str] | None:
+    """盘上已注册设备对(30天内)：重载/重启不再从裸对重来，首播直接是熟对。"""
+    try:
+        with open(_device_memo_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict) or not data.get("registered"):
+            return None
+        device_id = str(data.get("device_id") or "")
+        install_id = str(data.get("install_id") or "")
+        if not (device_id.isdigit() and install_id.isdigit()):
+            return None
+        if time.time() - float(data.get("time") or 0) > _DEVICE_MEMO_MAX_AGE:
+            return None
+        return {"device_id": device_id, "install_id": install_id}
+    except Exception:
+        return None
+
+
+def _device_memo_save(pair: Mapping[str, Any], registered: bool) -> None:
+    # 只有注册成功的对才落盘；裸对存盘只会把空模型风险带到下一次启动。
+    if not registered:
+        return
+    device_id = str(pair.get("device_id") or "")
+    install_id = str(pair.get("install_id") or "")
+    if not (device_id.isdigit() and install_id.isdigit()):
+        return
+    try:
+        path = _device_memo_path()
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(
+                {"device_id": device_id, "install_id": install_id, "registered": True, "time": time.time()},
+                fh,
+            )
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _device_memo_discard() -> None:
+    try:
+        os.remove(_device_memo_path())
+    except OSError:
+        pass
+
+
 def _rotate_stream_device() -> dict[str, str]:
+    # 轮换的触发条件=当前对被上游判为空模型(已被拉黑/失效)：先作废盘上 memo，
+    # 防止本次失败后下次启动又把同一坏对捞回来；注册成功后再写入新对。
+    _device_memo_discard()
     registered = _register_device_pair()
     if registered is not None:
         device_id, install_id = registered
@@ -1557,6 +1712,9 @@ def _rotate_stream_device() -> dict[str, str]:
         stored = dict(pair)
         stored["registered"] = is_registered
         _STREAM_STATE["device"] = stored
+    if is_registered:
+        _device_memo_save(stored, True)
+        _hg_trace("设备轮换注册成功 did=%s" % device_id[:6])
     return pair
 
 
@@ -1565,6 +1723,16 @@ def _working_device_pair() -> dict[str, str] | None:
         pair = _STREAM_STATE.get("device")
     if isinstance(pair, dict) and pair.get("device_id") and pair.get("install_id"):
         return {"device_id": str(pair["device_id"]), "install_id": str(pair["install_id"])}
+    # 内存无对 → 兜底读盘(重载后模块内存态清零，但注册对不该丢)
+    memo = _device_memo_load()
+    if memo:
+        with _STREAM_LOCK:
+            _STREAM_STATE["device"] = {
+                "device_id": memo["device_id"],
+                "install_id": memo["install_id"],
+                "registered": True,
+            }
+        return dict(memo)
     return None
 
 
@@ -1585,6 +1753,14 @@ def _video_model_rotating(video_id: str, config: Mapping[str, Any]) -> dict[str,
 
 def _stream_session(video_id: str, config: Mapping[str, Any], quality: str = "1080") -> "_StreamSession":
     quality = quality if quality in _QUALITY_LINE_NAME_TO_Q else "1080"
+    # 调用方(壳 URL 参数/实例随机对)可能带空 did/iid：先用水中或盘上的熟对补齐，
+    # 否则空对打 video_model 必空模型，白白多吃一次轮换注册(冷启动最大的一段)。
+    cfg = dict(config) if isinstance(config, Mapping) else {}
+    if not (str(cfg.get("device_id") or "").strip() and str(cfg.get("install_id") or "").strip()):
+        pair = _working_device_pair()
+        if pair:
+            cfg["device_id"] = pair["device_id"]
+            cfg["install_id"] = pair["install_id"]
     cache_key = "%s|%s" % (video_id, quality)
     with _STREAM_LOCK:
         sessions = _STREAM_STATE["sessions"]
@@ -1609,11 +1785,12 @@ def _stream_session(video_id: str, config: Mapping[str, Any], quality: str = "10
         if session is not None:
             return session
     last_err = None
+    build_t0 = time.time()
     try:
         # 上游偶发抖动（同一集首次 502、重试即通）——冷启动这里做短重试。
         for _attempt in range(3):
             try:
-                model = _video_model_rotating(video_id, config)
+                model = _video_model_rotating(video_id, cfg)
                 _, item = _select_quality(_video_list_from_model(model), quality)
                 url = _media_url(item)
                 spade = _spade_value(item)
@@ -1632,6 +1809,10 @@ def _stream_session(video_id: str, config: Mapping[str, Any], quality: str = "10
                     while len(sessions) >= _STREAM_MAX_SESSIONS:
                         sessions.pop(next(iter(sessions)), None)
                     sessions[cache_key] = session
+                _hg_trace(
+                    "会话构建完成 vid=%s q=%s attempt=%d %dms"
+                    % (video_id, quality, _attempt + 1, int((time.time() - build_t0) * 1000))
+                )
                 return session
             except Exception as err:
                 last_err = err
@@ -1680,6 +1861,9 @@ def _parse_range(value: str, total: int) -> Any:
 class _StreamHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "hg-stream"
+    # 连接超时：播放器断/暂停后不再读，wfile.write 会永久卡住线程(32位下是水位帮凶)；
+    # 超时后线程自动收场，播放器恢复时按 Range 重连即可。
+    timeout = 120
 
     def log_message(self, *args: Any) -> None:
         return None
@@ -1714,6 +1898,56 @@ class _StreamHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - 标准库回调命名
         self._serve(body=True)
 
+    def _emit_media_headers(self, code: int, start: int, end: int, total: int, ranged: bool) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(end - start + 1))
+        if ranged:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, total))
+        self.end_headers()
+
+    def _serve_from_cache(self, cpath: str, body: bool, vid: str, quality: str) -> None:
+        """完整缓存直读出流：不建会话、不碰上游，重进/切回秒开。"""
+        total = os.path.getsize(cpath)
+        try:
+            os.utime(cpath, None)
+        except OSError:
+            pass
+        raw_range = self.headers.get("Range") or ""
+        requested = _parse_range(raw_range, total)
+        if requested is _RANGE_UNSATISFIABLE:
+            self.send_response(416)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Range", "bytes */%d" % total)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            return
+        start, end = requested if requested else (0, total - 1)
+        self._emit_media_headers(206 if requested else 200, start, end, total, bool(requested))
+        if not body:
+            return
+        t0 = time.time()
+        first = True
+        try:
+            with open(cpath, "rb") as fh:
+                fh.seek(start)
+                remaining = end - start + 1
+                while remaining > 0:
+                    block = fh.read(min(_STREAM_CHUNK, remaining))
+                    if not block:
+                        break
+                    self.wfile.write(block)
+                    if first:
+                        _hg_trace("首字节(本机缓存) vid=%s q=%s %dms" % (vid, quality, int((time.time() - t0) * 1000)))
+                        first = False
+                    remaining -= len(block)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except Exception:
+            self.close_connection = True
+
     def _serve(self, body: bool) -> None:
         route = urlparse(self.path).path
         if not route.endswith(".mp4"):
@@ -1723,6 +1957,16 @@ class _StreamHandler(BaseHTTPRequestHandler):
         if not params["vid"]:
             self._fail(400, b"missing vid")
             return
+        params["quality"] = params["quality"] if params["quality"] in _QUALITY_LINE_NAME_TO_Q else "1080"
+        # 完整缓存(壳代理回放/边播落盘产物) → 直接从盘出流，免建会话免上游
+        try:
+            cpath = _hg_cache_path(params["vid"], params["quality"])
+            if os.path.isfile(cpath) and os.path.getsize(cpath) > 65536:
+                self._serve_from_cache(cpath, body, params["vid"], params["quality"])
+                return
+        except Exception:
+            pass
+        t0 = time.time()
         try:
             session = _stream_session(
                 params["vid"],
@@ -1746,25 +1990,141 @@ class _StreamHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         start, end = requested if requested else (0, session.total - 1)
-        self.send_response(206 if requested else 200)
-        self.send_header("Content-Type", "video/mp4")
-        self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Content-Length", str(end - start + 1))
-        if requested:
-            self.send_header(
-                "Content-Range",
-                "bytes %d-%d/%d" % (start, end, session.total),
-            )
-        self.end_headers()
+        self._emit_media_headers(206 if requested else 200, start, end, session.total, bool(requested))
         if not body:
             return
+        # 边播边把解密后的明文录进缓存：完整看一集 → 下次直接走盘
+        tee = _tee_begin(params["vid"], params["quality"], start, session.total)
+        cursor = start
+        first = True
         try:
             for block in session.iter_range(start, end):
                 self.wfile.write(block)
+                if tee is not None and not _tee_write(tee, cursor, block):
+                    tee = None
+                cursor += len(block)
+                if first:
+                    _hg_trace("首字节(网络会话) vid=%s q=%s %dms" % (params["vid"], params["quality"], int((time.time() - t0) * 1000)))
+                    first = False
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
         except Exception:
             self.close_connection = True
+
+
+_TEE_STATE: dict[str, dict[str, Any]] = {}   # "vid|q" -> 增量落盘半成品
+_TEE_LOCK = threading.Lock()
+_TEE_IDLE_SECONDS = 600
+
+
+def _tee_sweep_locked() -> None:
+    now = time.time()
+    for key in [k for k, s in _TEE_STATE.items() if now - float(s.get("time") or 0) > _TEE_IDLE_SECONDS]:
+        state = _TEE_STATE.pop(key, None)
+        if not state:
+            continue
+        try:
+            state["fh"].close()
+        except Exception:
+            pass
+        try:
+            os.remove(state["path"])
+        except OSError:
+            pass
+
+
+def _tee_begin(vid: str, quality: str, start: int, total: int):
+    """从 0 开始的完整流才记录；断点续传可挂回半成品，接不上就不录(绝不写坏)。"""
+    key = "%s|%s" % (vid, quality)
+    with _TEE_LOCK:
+        _tee_sweep_locked()
+        state = _TEE_STATE.get(key)
+        if state is not None:
+            if state["next"] == start and state.get("total") == total:
+                state["time"] = time.time()
+                return state
+            if start != 0:
+                return None
+            # 从头再来(典型=小探测先到、正片现在才到)：丢弃旧半成品重开
+            try:
+                state["fh"].close()
+            except Exception:
+                pass
+            try:
+                os.remove(state["path"])
+            except OSError:
+                pass
+            _TEE_STATE.pop(key, None)
+        if start != 0:
+            return None
+        try:
+            final = _hg_cache_path(vid, quality)
+            path = final + ".part"
+            fh = open(path, "wb")
+        except Exception:
+            return None
+        state = {"fh": fh, "path": path, "final": final, "next": 0, "total": total, "time": time.time(), "key": key}
+        _TEE_STATE[key] = state
+        return state
+
+
+def _tee_complete_locked(state: dict[str, Any]) -> None:
+    key = state["key"]
+    try:
+        state["fh"].flush()
+        state["fh"].close()
+    except Exception:
+        pass
+    _TEE_STATE.pop(key, None)
+    try:
+        os.replace(state["path"], state["final"])
+        _hg_trace("边播边落盘完成 %s" % os.path.basename(state["final"]))
+    except Exception:
+        try:
+            os.remove(state["path"])
+        except OSError:
+            pass
+
+
+def _tee_write(state: dict[str, Any] | None, cursor: int, block: bytes) -> bool:
+    """按绝对偏移连续才写；断流/被接管/写盘失败返回False(本连接停录，播放不受影响)。"""
+    if state is None:
+        return False
+    with _TEE_LOCK:
+        if _TEE_STATE.get(state["key"]) is not state or state["next"] != cursor:
+            return False
+        try:
+            state["fh"].write(block)
+            state["next"] = cursor + len(block)
+            state["time"] = time.time()
+        except Exception:
+            _TEE_STATE.pop(state["key"], None)
+            try:
+                state["fh"].close()
+            except Exception:
+                pass
+            try:
+                os.remove(state["path"])
+            except OSError:
+                pass
+            return False
+        if state["next"] >= state["total"]:
+            _tee_complete_locked(state)
+        return True
+
+
+class _HgThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True   # 重载后旧 TIME_WAIT 不占坑
+    request_queue_size = 32      # 32位上预热/播放短时并发打满 accept 队列会丢连接
+
+
+def _probe_hg_stream(port: int) -> bool:
+    """端口被占时探一下是不是自己的 hg-stream(404 也带 Server 头，不会触发建会话)。"""
+    try:
+        response = requests.get("http://127.0.0.1:%d/hg-probe" % port, timeout=1.5)
+        return str(response.headers.get("Server") or "").startswith("hg-stream")
+    except Exception:
+        return False
 
 
 def _start_stream_server() -> int:
@@ -1773,15 +2133,24 @@ def _start_stream_server() -> int:
             return int(_STREAM_STATE["port"])
         for port in range(_STREAM_PORT_RANGE[0], _STREAM_PORT_RANGE[1]):
             try:
-                server = ThreadingHTTPServer(("127.0.0.1", port), _StreamHandler)
+                server = _HgThreadingHTTPServer(("127.0.0.1", port), _StreamHandler)
             except OSError:
+                # 端口被占=多半是重载前的自己还活着：探活到 hg-stream 就复用，
+                # 否则 20 个端口在频繁重载下会被耗光，壳代理回退也跟着丢。
+                if _probe_hg_stream(port):
+                    _STREAM_STATE["port"] = port
+                    _STREAM_STATE["server"] = None
+                    _hg_trace("流服务端口复用(旧server仍活) port=%d" % port)
+                    return port
                 continue
             server.daemon_threads = True
             threading.Thread(target=server.serve_forever, daemon=True).start()
             _STREAM_STATE["port"] = port
             _STREAM_STATE["server"] = server
+            _hg_trace("流服务启动 port=%d" % port)
             return port
     return 0
+
 
 def _b64(value: str) -> bytes:
     text = _text(value)
@@ -4438,6 +4807,32 @@ def _hg_search_scan(key, page=1, max_pages=8):
         "list": chunk,
     }
 
+def _warm_detail_first(video_id: str, device_id: str, install_id: str) -> None:
+    """detail 即预热首集会话(P0-②)：搜索/分类两线并行垫高进程水位时，点播瞬间
+只剩出流，不再在播放器起跑的同一瞬间冷建会话(3~18s)挤爆 32 位内存被 LMK 杀。
+本机已有该集完整缓存时跳过——缓存走盘直出，不需要会话。"""
+    try:
+        if os.environ.get("HG_DETAIL_WARM", "1") == "0":
+            return
+        cfg = {"device_id": str(device_id or ""), "install_id": str(install_id or "")}
+        if not (cfg["device_id"] and cfg["install_id"]):
+            pair = _working_device_pair() or {}
+            cfg = {"device_id": str(pair.get("device_id", "")), "install_id": str(pair.get("install_id", ""))}
+        order = ["1080", "720"] if _aes_is_fast() else ["720", "1080"]
+        for q in order:
+            try:
+                cpath = _hg_cache_path(video_id, q)
+                if os.path.isfile(cpath) and os.path.getsize(cpath) > 65536:
+                    continue
+                t0 = time.time()
+                _stream_session(video_id, cfg, q)
+                _hg_trace("detail预热会话 vid=%s q=%s %dms" % (video_id, q, int((time.time() - t0) * 1000)))
+            except Exception as err:
+                _hg_trace("detail预热失败 vid=%s q=%s %s" % (video_id, q, str(err)[:80]))
+    except Exception:
+        pass
+
+
 class Spider(_BaseSpider):
     def __init__(self):
         self.device_id = str(random.randint(10**17, 10**18 - 1))
@@ -4667,6 +5062,18 @@ class Spider(_BaseSpider):
             )
             play_from.append(line_name)
             play_url.append(eps)
+        # 进详情页=马上要播：预热首集会话，点播瞬间不再冷建(P0-②)
+        first_vid = str(vids[0]) if vids and str(vids[0]).isdigit() else ""
+        if first_vid and os.environ.get("HG_DETAIL_WARM", "1") != "0":
+            try:
+                self._adopt_working_pair()
+                threading.Thread(
+                    target=_warm_detail_first,
+                    args=(first_vid, self.device_id, self.install_id),
+                    daemon=True,
+                ).start()
+            except Exception:
+                pass
         return {"list": [{"vod_id": sid, "vod_name": str(s.get("series_name") or ""), "vod_pic": _first(s.get("series_cover"), s.get("cover"), s.get("series_cover_url"), s.get("pic"), ""), "vod_year": "", "vod_area": "", "vod_director": "", "vod_actor": ",".join(actors), "vod_content": str(s.get("series_intro") or ""), "vod_remarks": str(s.get("episode_right_text") or ""), "vod_play_from": "$$$".join(play_from), "vod_play_url": "$$$".join(play_url)}]}
     def playerContent(self, flag, id, vipFlags=None):
         self._adopt_working_pair()
@@ -4730,6 +5137,7 @@ class Spider(_BaseSpider):
                 "header": {"User-Agent": UA},
             }
         # 回退：壳代理（保留壳自带的 do=py，不要覆盖 do）
+        _hg_trace("流服务不可用→壳代理回退 vid=%s q=%s" % (vid, q))
         proxy = ""
         try:
             if hasattr(self, "getProxyUrl"):
