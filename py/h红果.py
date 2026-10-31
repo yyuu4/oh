@@ -1,8 +1,25 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-VERSION = "1.6.2"
+VERSION = "1.6.6"
 VERSION_NOTE = (
+    "1.6.6 第五轮复检(换角度：格式串/裸except/finally/入口入参/并发/分页语义)三修："
+    "① detailContent 传空列表原地 IndexError(壳传 [] 即炸) → 空列表回 str(ids) 走空详情；"
+    "② _search_by_keywords 用站点 totalCount 放大 pagecount(关键词轮换恒取各词首页，"
+    "超出关键词数的页全是重复内容) → pagecount=关键词数，total 仍如实回报；"
+    "③ _range_stash_write 无锁并发写同一 .tmp(CDN 忽略 Range 整片落盘，双客户端撞同一 URL 会撕裂文件"
+    "→ 之后切片读到花数据) → 照 _TEE_LOCK 惯例加 _RANGE_STASH_LOCK 串行化写方(读方靠 os.replace 原子性免锁)。"
+    "1.6.5 第四轮复检：补 7 处真盲区留痕——起播会话失败(502前零日志)、网络/本机缓存播放中断"
+    "(客户端只见断流日志无痕)、取页失败回旧/取页解析失败(SWR后台与冷取共用，陈旧不新与首页少内容零日志)、"
+    "整片缓存写失败(缓存永不生效隐形)、"
+    "设备信息落盘失败(重载丢对不可查)、设备注册失败含HTTP非200(原先直接 return None 无痕)；"
+    "冷却包裹(站点冷却中)仍按约定跳过留痕防刷屏。"
+    "1.6.4 第三轮复检：搜索SSR兜底/分类页扫描失败补 _hg_trace(冷却包裹的跳过防刷屏、线程池异常也留痕)；"
+    "冷却中直接跳过注定失败的SSR兜底轮(省2轮白跑+0.4~1.2s)；"
+    "修 _search_by_keywords 对 totalCount 裸 int() 的崩溃隐患(非数字即 ValueError，同款解析其余7处均有兜底)。"
+    "1.6.3 搜索失败全路径补 _hg_trace 留痕(HTTP≠200 / 风控包非JSON / 连接异常含RST / 首访ttwid失败——"
+    "原只计失败无文字，排查搜索空不可见)；"
+    "搜索负缓存封顶512条(先扫过期、再挤最老，防未再查的键只增不减)。"
     "1.6.2 首页经验移植(刀法源自红果omn.js v1.7.12)：① 首页/榜单/分类三处静默吞错补 _hg_trace——"
     "原异常 p={} 直接回空且零日志(JS 正是靠补 warn 才抓到 read ECONNRESET 根因)；"
     "② _data 加 SWR：陈旧(≤6h)即回 + 后台全进程单槽刷新(同键单飞+全局只一个槽、冷却即让位，"
@@ -438,7 +455,11 @@ def _hg_cache_put(vid: str, quality: str, data: bytes) -> None:
             fh.write(data)
         os.replace(tmp, path)
         _hg_cache_cleanup(False)
-    except Exception:
+    except Exception as err:
+        try:  # 写不进=整片缓存永不生效(播放仍走网络)，要可查
+            _hg_trace("缓存写入失败 vid=%s q=%s %s" % (vid, quality, str(err)[:80]))
+        except Exception:
+            pass
         try:
             if os.path.exists(path + ".tmp"):
                 os.remove(path + ".tmp")
@@ -932,6 +953,7 @@ _NET_BUSY_MAX_WAIT = 2.5
 _NET_RESET_RETRY_DELAY = 1.5
 # 搜索负缓存：搜不到的词 45s 内不再打接口/扫分类页
 _SEARCH_NEG_TTL = 45.0
+_SEARCH_NEG_MAX = 512    # 负缓存条目封顶：过期只在再查同词时才弹，未再查的键会只增不减
 _PAGE_FRESH_TTL = 180
 _PAGE_STALE_TTL = 6 * 3600
 _PAGE_CACHE_MAX = 128
@@ -1348,6 +1370,7 @@ def _toplevel_boxes(buf: bytes) -> list[tuple[int, int, bytes]]:
 
 _RANGE_STASH: dict[str, str] = {}   # url -> 落盘路径(仅本进程生命周期)
 _RANGE_STASH_MIN = 1 << 20          # 整片落盘阈值：>1MB 才值得(兼防单测小包跨次运行串味)
+_RANGE_STASH_LOCK = threading.Lock()  # 同 URL 双写方会撕 .tmp(读方靠 os.replace 原子性免锁)
 
 
 def _range_stash_path(url: str) -> str:
@@ -1381,22 +1404,23 @@ def _range_stash_read(url: str, start: int, end: int) -> tuple[bytes, int] | Non
 
 def _range_stash_write(url: str, body: bytes, total: int) -> None:
     path = _range_stash_path(url)
-    try:
-        if os.path.isfile(path) and os.path.getsize(path) == len(body):
-            _RANGE_STASH[url] = path
-            return
-        tmp = path + ".tmp"
-        with open(tmp, "wb") as fh:
-            fh.write(body)
-        os.replace(tmp, path)
-        _RANGE_STASH[url] = path
-        _hg_trace("Range被忽略CDN整片落盘 %dB" % len(body))
-    except Exception:
+    with _RANGE_STASH_LOCK:
         try:
-            if os.path.exists(path + ".tmp"):
-                os.remove(path + ".tmp")
+            if os.path.isfile(path) and os.path.getsize(path) == len(body):
+                _RANGE_STASH[url] = path
+                return
+            tmp = path + ".tmp"
+            with open(tmp, "wb") as fh:
+                fh.write(body)
+            os.replace(tmp, path)
+            _RANGE_STASH[url] = path
+            _hg_trace("Range被忽略CDN整片落盘 %dB" % len(body))
         except Exception:
-            pass
+            try:
+                if os.path.exists(path + ".tmp"):
+                    os.remove(path + ".tmp")
+            except Exception:
+                pass
 
 
 def _range_get(url: str, start: int, end: int) -> tuple[bytes, int]:
@@ -1688,14 +1712,21 @@ def _register_device_pair() -> tuple[str, str] | None:
             timeout=20,
         )
         if resp.status_code != 200:
+            try:  # 原先直接 return None 零日志，注册总失败时根因不可查
+                _hg_trace("设备注册失败 HTTP%s" % resp.status_code)
+            except Exception:
+                pass
             return None
         data = resp.json()
         did = str(data.get("device_id_str") or data.get("device_id") or "")
         iid = str(data.get("install_id_str") or data.get("install_id") or "")
         if did.isdigit() and iid.isdigit() and did != "0" and iid != "0":
             return did, iid
-    except Exception:
-        pass
+    except Exception as err:
+        try:
+            _hg_trace("设备注册失败 %s" % str(err)[:80])
+        except Exception:
+            pass
     return None
 
 
@@ -1741,8 +1772,11 @@ def _device_memo_save(pair: Mapping[str, Any], registered: bool) -> None:
                 fh,
             )
         os.replace(tmp, path)
-    except Exception:
-        pass
+    except Exception as err:
+        try:  # 落盘失败=重载后注册对丢失、下次启动重新轮换，要可查
+            _hg_trace("设备信息落盘失败 %s" % str(err)[:80])
+        except Exception:
+            pass
 
 
 def _device_memo_discard() -> None:
@@ -2001,7 +2035,11 @@ class _StreamHandler(BaseHTTPRequestHandler):
                     remaining -= len(block)
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
-        except Exception:
+        except Exception as err:
+            try:  # 本机盘读失败是磁盘故障/文件损坏，与冷却无关，恒留痕
+                _hg_trace("播放中断(本机缓存) vid=%s q=%s %s" % (vid, quality, str(err)[:80]))
+            except Exception:
+                pass
             self.close_connection = True
 
     def _serve(self, body: bool) -> None:
@@ -2032,7 +2070,12 @@ class _StreamHandler(BaseHTTPRequestHandler):
                 },
                 params["quality"],
             )
-        except Exception:
+        except Exception as err:
+            if "站点冷却中" not in str(err):  # 冷却包裹是预期快速失败，不刷屏
+                try:
+                    _hg_trace("起播会话失败 vid=%s q=%s %s" % (params["vid"], params["quality"], str(err)[:80]))
+                except Exception:
+                    pass
             self._fail(502, b"media session failed")
             return
         raw_range = self.headers.get("Range") or ""
@@ -2064,7 +2107,13 @@ class _StreamHandler(BaseHTTPRequestHandler):
                     first = False
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
-        except Exception:
+        except Exception as err:
+            if "站点冷却中" not in str(err):  # 客户端主动断连在上一支已静默；这里只留上游真中断
+                try:
+                    _hg_trace("播放中断(网络会话) vid=%s q=%s at=%d %s" %
+                              (params["vid"], params["quality"], cursor, str(err)[:80]))
+                except Exception:
+                    pass
             self.close_connection = True
 
 
@@ -4612,15 +4661,24 @@ def _data_fetch_store(cache_key: str, url: str) -> dict:
     拉取失败先回 stale、无 stale 上抛；解析失败回 stale、无 stale 回 {} 且不落缓存。"""
     try:
         html = _page(url)
-    except Exception:
+    except Exception as err:
         stale = _page_cache_get(cache_key, allow_stale=True)
         if stale is not None:
+            if "站点冷却中" not in str(err):  # 冷却回旧是预期(竞争到冷却)；真失败留痕否则 stale 恒不新无从查
+                try:
+                    _hg_trace("取页失败(回旧) %s %s" % (cache_key, str(err)[:80]))
+                except Exception:
+                    pass
             return stale
         raise
     try:
         value = _router_payload(html)
         data = value if isinstance(value, dict) else {}
-    except Exception:
+    except Exception as err:
+        try:  # 解析失败回 {} 会让首页/分类“少内容”而零日志，必须留痕
+            _hg_trace("取页解析失败 %s %s" % (cache_key, str(err)[:80]))
+        except Exception:
+            pass
         stale = _page_cache_get(cache_key, allow_stale=True)
         return stale if stale is not None else {}
     if data:
@@ -4648,8 +4706,12 @@ def _data_refresh_bg(cache_key: str, url: str) -> None:
                 return
             if _page_cache_get(cache_key) is None:  # 已被别人(或上一轮)刷成新鲜就别再拉
                 _data_fetch_store(cache_key, url)
-        except Exception:
-            pass  # 后台刷失败保旧：前台已拿陈旧数据返回
+        except Exception as err:
+            if "站点冷却中" not in str(err):  # 冷却让位是预期；真失败留痕(否则 stale 恒不新无从查)
+                try:
+                    _hg_trace("后台刷新失败(保旧) %s %s" % (cache_key, str(err)[:80]))
+                except Exception:
+                    pass
         finally:
             with _BG_REFRESH_LOCK:
                 _BG_REFRESHING.discard(cache_key)
@@ -4745,8 +4807,11 @@ def _search_api(key: str, page: int = 1) -> dict:
             # 首访拿 ttwid，缺了上游只回空列表
             try:
                 sess.get(SITE + "/", timeout=10)
-            except Exception:
-                pass
+            except Exception as err:
+                try:
+                    _hg_trace("搜索首访拿ttwid失败(后续可能空返) %s" % str(err)[:60])
+                except Exception:
+                    pass
             r = sess.get(
                 SITE + "/api/search/result",
                 params={
@@ -4758,6 +4823,10 @@ def _search_api(key: str, page: int = 1) -> dict:
             )
             if r.status_code != 200:
                 _net_result(False)
+                try:
+                    _hg_trace("搜索API HTTP%s key=%s pg=%s" % (r.status_code, str(key or "")[:24], page))
+                except Exception:
+                    pass
             else:
                 try:
                     data = r.json()
@@ -4785,11 +4854,20 @@ def _search_api(key: str, page: int = 1) -> dict:
                 else:
                     # 200 但结构不对(风控错误包/非JSON)：算站点异常
                     _net_result(False)
+                    try:
+                        _hg_trace("搜索API风控包/非JSON key=%s pg=%s" % (str(key or "")[:24], page))
+                    except Exception:
+                        pass
         except _SiteBusy:
             # 冷却中等不起：直接回空让客户端快速重试，不计失败
             return empty
-        except Exception:
+        except Exception as err:
             _net_result(False)
+            try:
+                _hg_trace("搜索API连接/读取异常(含RST窗口) key=%s pg=%s %s" %
+                          (str(key or "")[:24], page, str(err)[:60]))
+            except Exception:
+                pass
         finally:
             if sess is not None:
                 try:
@@ -4822,6 +4900,8 @@ def _search_loader(key: str, page: int = 1) -> dict:
         return api
     last = {}
     for attempt in range(2):
+        if _net_in_cooldown():  # 冷却中 _net_gate 必抛，白跑两轮还多 0.4~1.2s 延迟
+            break
         try:
             data = _data(SITE + "/search/" + quote(str(key), safe=""))
             loaded = (data.get("loaderData") or {}).get("search_(keyword)/page") or {}
@@ -4829,8 +4909,12 @@ def _search_loader(key: str, page: int = 1) -> dict:
                 _page_cache_put(cache_key, loaded)
                 return loaded
             last = loaded or last
-        except Exception:
-            pass
+        except Exception as err:
+            if "站点冷却中" not in str(err):  # 冷却包裹是预期跳过，只留真失败
+                try:
+                    _hg_trace("搜索SSR兜底页失败 key=%s pg=%s %s" % (str(key or "")[:24], page, str(err)[:60]))
+                except Exception:
+                    pass
         try:
             time.sleep(0.4 * (attempt + 1))
         except Exception:
@@ -4847,6 +4931,14 @@ def _search_neg_key(key, page) -> str:
 
 def _search_neg_put(key, page) -> None:
     _SEARCH_NEG[_search_neg_key(key, page)] = time.time()
+    if len(_SEARCH_NEG) <= _SEARCH_NEG_MAX:
+        return
+    now = time.time()
+    for k in list(_SEARCH_NEG):  # 超限才扫：先把过期的清掉(未再查过的键此前无人弹)
+        if _SEARCH_NEG[k] <= now - _SEARCH_NEG_TTL:
+            _SEARCH_NEG.pop(k, None)
+    while len(_SEARCH_NEG) > _SEARCH_NEG_MAX and _SEARCH_NEG:  # 仍超则挤掉最早入列(插入序=时间序)
+        _SEARCH_NEG.pop(next(iter(_SEARCH_NEG)), None)
 
 
 def _search_neg_hit(key, page) -> bool:
@@ -4882,9 +4974,13 @@ def _search_by_keywords(keywords, page: int) -> dict:
             continue
         seen.add(vid)
         out.append(it)
-    # 虚拟页数：关键词数；若站点有 totalCount 也参考
-    total = int(p.get("totalCount") or 0)
-    pagecount = max(len(kws), (total + 9) // 10 if total else len(kws))
+    # 虚拟页数=关键词数：loader 恒取各关键词首页，用站点 totalCount 放大 pagecount
+    # 只会造出“翻过去还是同一批”的重复页(客户端按 page>=pagecount 停，见 _list_page_result 约定)
+    try:
+        total = int(p.get("totalCount") or 0)
+    except (TypeError, ValueError):  # 站点/风控包给非数字时别把整个搜索炸飞(其余7处同款解析均有兜底)
+        total = 0
+    pagecount = len(kws)
     return {
         "page": page,
         "pagecount": max(1, pagecount),
@@ -4910,7 +5006,12 @@ def _hg_search_scan(key, page=1, max_pages=8):
         r, p = rp
         try:
             return _hg_category_page(r, "", p).get("recommendList") or []
-        except Exception:
+        except Exception as err:
+            if "站点冷却中" not in str(err):  # 冷却跳过是预期，不刷屏；真失败要留痕
+                try:
+                    _hg_trace("搜索扫分类页失败 route=%s pg=%s %s" % (r, p, str(err)[:60]))
+                except Exception:
+                    pass
             return []
 
     hits = []
@@ -4932,8 +5033,11 @@ def _hg_search_scan(key, page=1, max_pages=8):
                             continue
                         seen.add(vid)
                         hits.append(it)
-        except Exception:
-            pass
+        except Exception as err:
+            try:
+                _hg_trace("搜索扫分类页线程池异常 pg=%s %s" % (scan_page, str(err)[:60]))
+            except Exception:
+                pass
         if len(hits) >= need:
             break
     if not hits:
@@ -5209,7 +5313,7 @@ class Spider(_BaseSpider):
 
 
     def detailContent(self, ids):
-        sid = str(ids[0] if isinstance(ids, (list, tuple)) else ids)
+        sid = str(ids[0]) if isinstance(ids, (list, tuple)) and ids else str(ids)
         sid = sid.replace("hg-series-v1:", "")
         p = ((_data(SITE + "/detail?series_id=" + quote(sid, safe="")).get("loaderData") or {}).get("detail_page") or {})
         s = p.get("seriesDetail") or {}
