@@ -1,8 +1,18 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 VERSION_NOTE = (
+    "1.6.2 首页经验移植(刀法源自红果omn.js v1.7.12)：① 首页/榜单/分类三处静默吞错补 _hg_trace——"
+    "原异常 p={} 直接回空且零日志(JS 正是靠补 warn 才抓到 read ECONNRESET 根因)；"
+    "② _data 加 SWR：陈旧(≤6h)即回 + 后台全进程单槽刷新(同键单飞+全局只一个槽、冷却即让位，"
+    "失败保旧，HG_SWR_BG=0 关)——fresh180s 一过不再前台阻塞 0.4~1.5s(首页/搜索兜底/详情页三处共用)；"
+    "③ 分类/榜单重试 3次(0.6/1.2s)→4次"
+    "(0.4/0.8/1.2s)：总耗时≈不变而 p^n→p^(n+1)(真网实测站点连片 RST 落在同一窗口)；"
+    "④ _page 改共用连接池(keepAlive，每请求省一次 TCP+TLS ~40-50ms，JS A/B 已证非 RST 元凶)，"
+    "destroy 摘源时关池。"
+    "**不搬** omn.js 的⑤ 磁盘跨进程页缓存——本进程单常驻、_PAGE_CACHE 已天然跨请求共享；"
+    "失败按批递增冷却(1.3.0 长封禁自保)原样保留。"
     "1.6.1 修首页后四个榜单分类大概率点开空白：榜单页站点按请求随机两种内联形态(实测约41%为形态B)，"
     "解析器原只认形态A(r 标签 args=[marker,content,{rankList…}])；形态B 的 r 标签缺失、榜单数据只在 "
     "mergeLoaderData 的 routerDataFnArgs(数组首元素为二次编码 JSON 字符串)里 → 抛“榜单数据缺失”空返"
@@ -44,6 +54,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 import requests
+from requests.adapters import HTTPAdapter
 try:
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -687,7 +698,7 @@ def _hg_category_page(route, cat, page):
                     pass
 
     try:
-        result = _retry(once, 3, 0.6)
+        result = _retry(once, 4, 0.4)  # v1.6.2 4次(0.4/0.8/1.2s)+RST补1次：总耗时≈原3次(0.6/1.2s)
     except _HGDataEnd:
         # 越界=真到底：合成空页让客户端 page>=pagecount 停止翻页，不走报错
         pg_n = max(1, int(page or 1))
@@ -812,7 +823,7 @@ def _hg_rank_page(slug, page):
                     pass
 
     try:
-        result = _retry(once, 3, 0.6)
+        result = _retry(once, 4, 0.4)  # v1.6.2 同分类页：5 连击、总耗时不超原预算
     except _HGDataEnd:
         # 榜单越界=真到底(站点每页20条,总计5页)：合成空页停止客户端继续要
         pg_n = max(1, int(page or 1))
@@ -4525,11 +4536,41 @@ def _key_seed_from_model(model: Mapping[str, Any]) -> bytes:
             if result:
                 return result
     return b""
+_HG_PAGE_SESSION = None
+_HG_PAGE_SESSION_LOCK = threading.Lock()
+
+
+def _hg_page_session() -> requests.Session:
+    """页面取页共用连接池(keepAlive)：每请求省一次 TCP+TLS(JS A/B 实测 ~40-50ms，且已证非 RST 元凶)。
+    只给 _page 用；分类/榜单仍每请求新建即关——单测按 Session 创建次数断言其行为，不动。"""
+    global _HG_PAGE_SESSION
+    with _HG_PAGE_SESSION_LOCK:
+        if _HG_PAGE_SESSION is None:
+            sess = requests.Session()
+            adapter = HTTPAdapter(pool_connections=4, pool_maxsize=4)
+            sess.mount("https://", adapter)
+            sess.mount("http://", adapter)
+            _HG_PAGE_SESSION = sess
+        return _HG_PAGE_SESSION
+
+
+def _hg_page_session_close() -> None:
+    """摘源(destroy)后关掉页面池空闲 socket(下次取页自动重建池，不锁死连接)。"""
+    global _HG_PAGE_SESSION
+    with _HG_PAGE_SESSION_LOCK:
+        sess, _HG_PAGE_SESSION = _HG_PAGE_SESSION, None
+    if sess is not None:
+        try:
+            sess.close()
+        except Exception:
+            pass
+
+
 def _page(url):
     def once():
         _net_gate(max_wait=_NET_BUSY_MAX_WAIT)
         try:
-            r = requests.get(
+            r = _hg_page_session().get(
                 url,
                 headers={
                     "User-Agent": UA,
@@ -4555,17 +4596,20 @@ def _page(url):
         raise RuntimeError("page fetch failed: %s" % err) from err
 
 
-def _data(url):
-    """页面 loaderData：新鲜缓存→请求→失败回放 stale；无缓存时保持旧行为（拉取错上抛、解析错回空）。"""
-    cache_key = "data|" + url
-    hit = _page_cache_get(cache_key)
-    if hit is not None:
-        return hit
-    if _net_in_cooldown():
-        # 站点封禁冷却中：有旧数据直接回放，不空等网络（快失败回 stale）
-        stale = _page_cache_get(cache_key, allow_stale=True)
-        if stale is not None:
-            return stale
+# SWR 后台刷新：同键单飞(跨请求共享) + 全进程单槽(复检加固，与 omn.js 单线程顺序预热等价，
+# 多个陈旧键不会各起一线去抢 _net_gate 节流槽)；开关每次调用时读 env(默认开，单测置 0 后各用例可临时打开)
+_BG_REFRESHING: set = set()
+_BG_RUNNING = [False]
+_BG_REFRESH_LOCK = threading.Lock()
+
+
+def _hg_swr_bg_on() -> bool:
+    return str(os.environ.get("HG_SWR_BG", "1")).lower() != "0"
+
+
+def _data_fetch_store(cache_key: str, url: str) -> dict:
+    """真取页→解析→落缓存(SWR 后台刷与首次冷取共用)；语义与旧 _data 一致：
+    拉取失败先回 stale、无 stale 上抛；解析失败回 stale、无 stale 回 {} 且不落缓存。"""
     try:
         html = _page(url)
     except Exception:
@@ -4582,6 +4626,57 @@ def _data(url):
     if data:
         _page_cache_put(cache_key, data)
     return data
+
+
+def _data_refresh_bg(cache_key: str, url: str) -> None:
+    """SWR 后台补新鲜：陈旧页已先回，这里只负责把缓存刷成新的(失败保旧)。
+    冷却中不联网(锁外查，免得 net_lock 嵌进 BG 锁)；同键在刷或全进程已有槽则跳过，
+    下一次访问再触发；进程被杀也无害(内存键，丢了下次重取)。"""
+    if not _hg_swr_bg_on():
+        return
+    if _net_in_cooldown():
+        return
+    with _BG_REFRESH_LOCK:
+        if _BG_RUNNING[0] or cache_key in _BG_REFRESHING:
+            return
+        _BG_RUNNING[0] = True
+        _BG_REFRESHING.add(cache_key)
+
+    def runner():
+        try:
+            if _net_in_cooldown():  # 排程到起跑之间冷却开了：让位，别白丢一次连击
+                return
+            if _page_cache_get(cache_key) is None:  # 已被别人(或上一轮)刷成新鲜就别再拉
+                _data_fetch_store(cache_key, url)
+        except Exception:
+            pass  # 后台刷失败保旧：前台已拿陈旧数据返回
+        finally:
+            with _BG_REFRESH_LOCK:
+                _BG_REFRESHING.discard(cache_key)
+                _BG_RUNNING[0] = False
+
+    try:
+        threading.Thread(target=runner, daemon=True).start()
+    except Exception:
+        with _BG_REFRESH_LOCK:
+            _BG_REFRESHING.discard(cache_key)
+            _BG_RUNNING[0] = False
+
+
+def _data(url):
+    """页面 loaderData：新鲜缓存→陈旧即回+后台刷(SWR)→请求→失败回放 stale；
+    无缓存时保持旧行为（拉取错上抛、解析错回空）。"""
+    cache_key = "data|" + url
+    hit = _page_cache_get(cache_key)
+    if hit is not None:
+        return hit
+    stale = _page_cache_get(cache_key, allow_stale=True)
+    if stale is not None:
+        # v1.6.2 SWR: 陈旧(≤6h)即回，不再前台阻塞重拉(原 fresh180s 一过必阻塞 0.4~1.5s)；
+        # 冷却中 _data_refresh_bg 会自行跳过，等价于旧“冷却期回 stale 不联网”
+        _data_refresh_bg(cache_key, url)
+        return stale
+    return _data_fetch_store(cache_key, url)
 
 def _item(x):
     x = x or {}
@@ -4932,6 +5027,10 @@ class Spider(_BaseSpider):
             _page_cache_clear()
         except Exception:
             pass
+        try:
+            _hg_page_session_close()
+        except Exception:
+            pass
         _SEARCH_NEG.clear()
 
     def homeContent(self, filter):
@@ -4976,7 +5075,12 @@ class Spider(_BaseSpider):
 
         try:
             page = ((_data(SITE + "/").get("loaderData") or {}).get("page") or {})
-        except Exception:
+        except Exception as err:
+            # v1.6.2: 原静默 page={} → 首页为什么空在日志里不可查(JS 侧同款吞错)
+            try:
+                _hg_trace("首页数据源失败(回空) %s" % err)
+            except Exception:
+                pass
             page = {}
         for x in (page.get("bannerList") or []):
             push(x)
@@ -5011,7 +5115,11 @@ class Spider(_BaseSpider):
         if route in _HG_RANK_ROUTES:
             try:
                 p = _hg_rank_page(route, page)
-            except Exception:
+            except Exception as err:
+                try:
+                    _hg_trace("榜单页失败(空返) slug=%s pg=%s %s" % (route, page, err))
+                except Exception:
+                    pass
                 p = {}
             rows = p.get("rankList") or []
             items = []
@@ -5022,11 +5130,19 @@ class Spider(_BaseSpider):
             return _list_page_result(page, items, p.get("pagination") or {})
         try:
             p = _hg_category_page(route, cat, page)
-        except Exception:
+        except Exception as err:
+            try:
+                _hg_trace("分类页失败(空返) route=%s cat=%s pg=%s %s" % (route, cat or "-", page, err))
+            except Exception:
+                pass
             # 子分类失败时只回退到同一内容类型的“全部”，不串到真人剧。
             try:
                 p = _hg_category_page(route, "", page) if cat else {}
-            except Exception:
+            except Exception as err2:
+                try:
+                    _hg_trace("分类页兜底失败(空返) route=%s pg=%s %s" % (route, page, err2))
+                except Exception:
+                    pass
                 p = {}
         rows = p.get("recommendList") or []
         items = []
