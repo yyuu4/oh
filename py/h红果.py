@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 VERSION_NOTE = (
+    "1.6.1 修首页后四个榜单分类大概率点开空白：榜单页站点按请求随机两种内联形态(实测约41%为形态B)，"
+    "解析器原只认形态A(r 标签 args=[marker,content,{rankList…}])；形态B 的 r 标签缺失、榜单数据只在 "
+    "mergeLoaderData 的 routerDataFnArgs(数组首元素为二次编码 JSON 字符串)里 → 抛“榜单数据缺失”空返"
+    "(分类页数据走 _ROUTER_DATA 恒在，故前四个分类不受影响)；补形态B兜底解析(_rank_payload_from_merge/"
+    "_hg_unwrap_json)，两形态互斥取到即回，真页回归 8/11→11/11。"
     "1.6.0 搜完即播防闪退提速套(刀法移植自红果omn.js v1.7.x)：注册设备对落盘复用(重载/重启不丢、"
     "轮换先作废)、detail 即预热首集会话(点播瞬间只剩出流)、流服务端口探活复用(重载不漏端口、"
     "不掉壳代理回退)、CDN 忽略 Range 时整片只落盘一次再切片(每片重下整片→一次)、"
@@ -699,19 +704,59 @@ def _hg_category_page(route, cat, page):
     return result
 
 
+def _hg_unwrap_json(value):
+    """二次编码解包：字符串→JSON，单元素字符串数组取首元素再解，最多 3 层。"""
+    v = value
+    for _ in range(3):
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except (ValueError, TypeError):
+                return None
+        elif isinstance(v, (list, tuple)) and len(v) == 1 and isinstance(v[0], str):
+            try:
+                v = json.loads(v[0])
+            except (ValueError, TypeError):
+                return None
+        else:
+            break
+    return v
+
+
+def _rank_payload_from_merge(args):
+    """形态B(站点按请求随机)：r 标签缺失，数据在 mergeLoaderData 的
+    args[1] = [{key, routerDataFnName, routerDataFnArgs: ["<二次编码 rankList JSON>"]}]。"""
+    entries = args[1] if isinstance(args, list) and len(args) > 1 and isinstance(args[1], (list, tuple)) else ()
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        raw = entry.get("routerDataFnArgs")
+        candidates = raw if isinstance(raw, (list, tuple)) else (raw,)
+        for cand in candidates:
+            payload = _hg_unwrap_json(cand)
+            if isinstance(payload, Mapping) and "rankList" in payload:
+                return dict(payload)
+    return None
+
+
 def _rank_content_from_html(html_text, slug):
-    """榜单列表在内嵌 data-fn-args 脚本里(客户端 mergeLoaderData 注入 loaderData)：
-    args = ["rank_<slug>/page", "content", {"isSuccess","pagination","rankList"}]，
-    loaderData.content 本身为空壳，必须从 fn-args 取。"""
+    """榜单列表在内嵌 data-fn-args 脚本里，站点有两种形态且按请求随机(实测约41%为形态B)：
+    形态A = data-fn-name="r" 的 args = ["rank_<slug>/page", "content", {"isSuccess","pagination","rankList"}]；
+    形态B = 该 r 标签缺失，榜单数据只在 mergeLoaderData 的 routerDataFnArgs(二次编码 JSON 字符串)里。
+    loaderData.content 本身为空壳，必须从 fn-args 取；两形态互斥，取到即回。"""
     marker = "rank_%s/page" % slug
     for m in re.finditer(r"data-fn-args=(['\"])(.*?)\1", html_text or ""):
         try:
             args = json.loads(_htmlescape(m.group(2)))
         except (ValueError, TypeError):
             continue
-        if isinstance(args, list) and len(args) >= 3 and args[0] == marker and isinstance(args[2], Mapping):
-            if "rankList" in args[2]:
-                return dict(args[2])
+        if not isinstance(args, list) or not args or args[0] != marker:
+            continue
+        if len(args) >= 3 and isinstance(args[2], Mapping) and "rankList" in args[2]:
+            return dict(args[2])
+        payload = _rank_payload_from_merge(args)
+        if payload is not None:
+            return payload
     raise _HGDataEmpty("榜单数据缺失")
 
 
