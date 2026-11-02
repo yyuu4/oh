@@ -1585,7 +1585,7 @@ def _stream_session(video_id: str, config: Mapping[str, Any], quality: str = "10
         session = sessions.get(cache_key)
     if session is not None:
         return session
-    model = _video_model(video_id, config)
+    model = _video_model_rotating(video_id, config)
     _, item = _select_quality(_video_list_from_model(model), quality)
     url = _media_url(item)
     spade = _spade_value(item)
@@ -1682,12 +1682,10 @@ class _StreamHandler(BaseHTTPRequestHandler):
             self._fail(400, b"missing vid")
             return
         try:
+            did, iid = _hg_ensure_device()
             session = _stream_session(
                 params["vid"],
-                {
-                    "device_id": params["device_id"],
-                    "install_id": params["install_id"],
-                },
+                {"device_id": did, "install_id": iid},
                 params["quality"],
             )
         except Exception:
@@ -3829,6 +3827,108 @@ def _device_config(config: Mapping[str, Any]) -> dict[str, str]:
         "ua": APP_UA,
     }
 
+_HG_DEVICE = {"device_id": "", "install_id": ""}
+_HG_DEVICE_LOCK = threading.RLock()
+
+
+def _hg_random_pair():
+    return (str(random.randint(10**17, 10**18 - 1)), str(random.randint(10**17, 10**18 - 1)))
+
+
+def _hg_register_device():
+    """device_register（omn registerDevicePair 同款）：成功返回 (did, iid)，失败 None。"""
+    hex16 = lambda: uuid.uuid4().hex[:16]
+    uid4 = lambda: str(uuid.uuid4())
+    header = {
+        "display_name": "红果免费短剧", "aid": 8662, "app_version": "7.3.5.32",
+        "version_code": 73532, "manifest_version_code": 73532, "update_version_code": 73532,
+        "channel": "update_64", "package": "com.phoenix.read", "app_language": "zh",
+        "os": "Android", "os_version": "16", "os_api": 36, "device_model": "25053RT47C",
+        "device_brand": "Redmi", "device_manufacturer": "Xiaomi", "cpu_abi": "arm64-v8a",
+        "density_dpi": 520, "display_density": "xxhdpi", "resolution": "2772x1280",
+        "language": "zh", "timezone": 8, "access": "wifi", "openudid": hex16(),
+        "clientudid": uid4(), "cdid": uid4(), "region": "CN", "tz_name": "Asia/Shanghai",
+        "tz_offset": 28800, "sim_region": "cn", "device_platform": "android",
+        "not_request_sender": 0, "is_system_app": 0, "sdk_flavor": "china",
+        "rom": "OS2.0", "rom_version": "BP2A.250605.031.A3",
+    }
+    body = json.dumps(
+        {"magic_tag": "ss_app_log", "header": header, "_gen_time": int(time.time() * 1000)},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    qs = urlencode({"req_id": uid4(), "_rticket": int(time.time() * 1000)})
+    url = "https://log.snssdk.com/service/2/device_register/?" + qs
+    try:
+        resp = requests.post(
+            url,
+            data=body,
+            timeout=20,
+            headers={
+                "User-Agent": "com.phoenix.read/73532 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)",
+                "Accept": "application/json",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json() if resp.content else {}
+        if not isinstance(data, Mapping):
+            return None
+        did = str(data.get("device_id_str") or data.get("device_id") or "")
+        iid = str(data.get("install_id_str") or data.get("install_id") or "")
+        if did.isdigit() and iid.isdigit() and did != "0" and iid != "0":
+            return did, iid
+    except Exception:
+        return None
+    return None
+
+
+def _hg_ensure_device():
+    """进程内权威设备对：首次用时注册（失败回退本地随机），之后复用。"""
+    with _HG_DEVICE_LOCK:
+        did, iid = _HG_DEVICE["device_id"], _HG_DEVICE["install_id"]
+        if did and iid:
+            return did, iid
+    pair = _hg_register_device() or _hg_random_pair()
+    with _HG_DEVICE_LOCK:
+        if not (_HG_DEVICE["device_id"] and _HG_DEVICE["install_id"]):
+            _HG_DEVICE["device_id"], _HG_DEVICE["install_id"] = pair
+        return _HG_DEVICE["device_id"], _HG_DEVICE["install_id"]
+
+
+def _hg_rotate_device():
+    """空模型后换新设备：优先重新注册拿新配额，失败回退新随机对。"""
+    pair = _hg_register_device() or _hg_random_pair()
+    with _HG_DEVICE_LOCK:
+        _HG_DEVICE["device_id"], _HG_DEVICE["install_id"] = pair
+    return pair
+
+
+_HG_EMPTY_MODEL_MARKERS = (
+    "video_model 数据为空", "video_model 为空", "上游响应不是 JSON",
+    "播放模型没有清晰度", "播放模型缺少地址或密钥材料",
+)
+
+
+def _video_model_rotating(video_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
+    """video_model + 空模型旋转重试（omn videoModelRotating 同款）。
+
+    上游 video_model 按设备(did)配额放行（实测新注册设备首打全过、同设备第二发全挂）；
+    单设备配额耗尽后返回空 200 → 这里捕获空模型错误，换新注册设备重试一次。
+    """
+    try:
+        return _video_model(video_id, config)
+    except HongguoPluginError as exc:
+        message = str(exc)
+        if not any(marker in message for marker in _HG_EMPTY_MODEL_MARKERS):
+            raise
+    did, iid = _hg_rotate_device()
+    new_config = dict(config or {})
+    new_config["device_id"] = did
+    new_config["install_id"] = iid
+    return _video_model(video_id, new_config)
+
+
 def _video_model(video_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
     devices = _device_config(config)
     params = {
@@ -4484,6 +4584,7 @@ class _HongguoSpider(_BaseSpider):
                 proxy = (self.getProxyUrl() or "").strip()
         except Exception:
             proxy = ""
+        did, iid = _hg_ensure_device()
         if proxy:
             sep = "&" if "?" in proxy else "?"
             # 保留壳自带的 do=py，只追加业务参数与清晰度线路
@@ -4492,8 +4593,8 @@ class _HongguoSpider(_BaseSpider):
                     "vid": vid,
                     "q": q,
                     "hg": "cenc",
-                    "did": self.device_id or "",
-                    "iid": self.install_id or "",
+                    "did": did,
+                    "iid": iid,
                 }
             )
             return {
@@ -4516,8 +4617,8 @@ class _HongguoSpider(_BaseSpider):
                 {
                     "vid": vid,
                     "q": q,
-                    "did": self.device_id or "",
-                    "iid": self.install_id or "",
+                    "did": did,
+                    "iid": iid,
                 }
             )
             return {
@@ -4560,10 +4661,8 @@ class _HongguoSpider(_BaseSpider):
             return [400, "text/plain; charset=utf-8", b"missing vid"]
 
         try:
-            cfg = {
-                "device_id": str(param.get("did") or self.device_id or ""),
-                "install_id": str(param.get("iid") or self.install_id or ""),
-            }
+            did, iid = _hg_ensure_device()
+            cfg = {"device_id": did, "install_id": iid}
             user_q = str(param.get("q") or param.get("quality") or "").strip()
             # 有原生 AES：优先 1080；纯 Python AES 很慢：先 720 保证能播，再尝试更高
             if user_q:
@@ -4591,7 +4690,7 @@ class _HongguoSpider(_BaseSpider):
                 if cached:
                     return [200, "video/mp4", cached]
 
-            model = _video_model(vid, cfg)
+            model = _video_model_rotating(vid, cfg)
             rows = _video_list_from_model(model)
             if not rows:
                 return [500, "text/plain; charset=utf-8", b"empty video list"]
@@ -8040,12 +8139,12 @@ class _AggSpider(_BaseSpider):
             if "好看" in flag:
                 res = _ag_post("https://sv.baidu.com/appui/api?cmd=video/relate&log=vhk&tn=1020970b&ctn=1008350n&blur=1",
                                "method=post&vid=%s" % inp, AGG_HEADERS["browser"])
-                lst = res["video/relate"]["data"]["cur_video"]["clarityUrl"]
-                urls = []
-                for i in lst:
-                    urls.append(i.get("title"))
-                    urls.append(i.get("url"))
-                return {"parse": 0, "url": urls}
+                j = (((res.get("video/relate") or {}).get("data") or {}).get("cur_video"))
+                urls = sorted([i for i in ((j or {}).get("clarityUrl") or []) if i.get("url")],
+                              key=lambda a: a.get("video_quality", 0), reverse=True)
+                if urls:
+                    return {"parse": 0, "url": urls[0]["url"]}
+                return {"parse": 0, "url": "toast://解析失败"}
             if "围观" in flag:
                 # 该站详情给的是带时效签名的 mp4 直链（super/high/normal 三档）。
                 # 兼容三种入参：url@@oneId@@分集号 / 纯直链 / playSetting JSON。
