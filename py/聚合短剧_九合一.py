@@ -3827,8 +3827,10 @@ def _device_config(config: Mapping[str, Any]) -> dict[str, str]:
         "ua": APP_UA,
     }
 
-_HG_DEVICE = {"device_id": "", "install_id": ""}
+_HG_DEVICE = {"device_id": "", "install_id": "", "registered": False}
 _HG_DEVICE_LOCK = threading.RLock()
+_HG_REGISTER_ATTEMPTS = 2
+_HG_REGISTER_RETRY_DELAY = 0.4
 
 
 def _hg_random_pair():
@@ -3883,25 +3885,46 @@ def _hg_register_device():
     return None
 
 
+def _hg_register_device_retry(attempts: int = _HG_REGISTER_ATTEMPTS, delay: float = _HG_REGISTER_RETRY_DELAY):
+    """注册重试：上游只给注册设备下发播放模型，随机设备对拿到空 200，注册失败必须重试。"""
+    for attempt in range(max(1, attempts)):
+        pair = _hg_register_device()
+        if pair:
+            return pair
+        if attempt + 1 < attempts:
+            time.sleep(delay)
+    return None
+
+
 def _hg_ensure_device():
-    """进程内权威设备对：首次用时注册（失败回退本地随机），之后复用。"""
+    """进程内权威设备对：只复用注册成功的设备；随机兜底对不标记已注册，下次继续重试注册。"""
     with _HG_DEVICE_LOCK:
         did, iid = _HG_DEVICE["device_id"], _HG_DEVICE["install_id"]
-        if did and iid:
+        if did and iid and _HG_DEVICE["registered"]:
             return did, iid
-    pair = _hg_register_device() or _hg_random_pair()
+    pair = _hg_register_device_retry()
+    if pair:
+        with _HG_DEVICE_LOCK:
+            _HG_DEVICE["device_id"], _HG_DEVICE["install_id"] = pair
+            _HG_DEVICE["registered"] = True
+            return pair
     with _HG_DEVICE_LOCK:
         if not (_HG_DEVICE["device_id"] and _HG_DEVICE["install_id"]):
-            _HG_DEVICE["device_id"], _HG_DEVICE["install_id"] = pair
+            _HG_DEVICE["device_id"], _HG_DEVICE["install_id"] = _hg_random_pair()
         return _HG_DEVICE["device_id"], _HG_DEVICE["install_id"]
 
 
 def _hg_rotate_device():
-    """空模型后换新设备：优先重新注册拿新配额，失败回退新随机对。"""
-    pair = _hg_register_device() or _hg_random_pair()
+    """空模型后换新设备：优先重新注册（带重试）拿新配额，失败回退新随机对且不标记已注册。"""
+    pair = _hg_register_device_retry(attempts=3, delay=0.6)
     with _HG_DEVICE_LOCK:
-        _HG_DEVICE["device_id"], _HG_DEVICE["install_id"] = pair
-    return pair
+        if pair:
+            _HG_DEVICE["device_id"], _HG_DEVICE["install_id"] = pair
+            _HG_DEVICE["registered"] = True
+            return pair
+        _HG_DEVICE["device_id"], _HG_DEVICE["install_id"] = _hg_random_pair()
+        _HG_DEVICE["registered"] = False
+        return _HG_DEVICE["device_id"], _HG_DEVICE["install_id"]
 
 
 _HG_EMPTY_MODEL_MARKERS = (
