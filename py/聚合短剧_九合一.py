@@ -908,6 +908,29 @@ def _hg_cache_put(vid: str, quality: str, data: bytes) -> None:
             pass
 
 
+_HG_TRACE_MAX_BYTES = 200 * 1024
+
+
+def _hg_trace(msg: str) -> None:
+    """分段耗时/关键事件落盘（自限约 200KB），现地排查起播慢与端口复用用。"""
+    try:
+        path = os.path.join(_hg_cache_dir(), "hg_trace.log")
+        line = "%s %s\n" % (time.strftime("%m-%d %H:%M:%S"), str(msg))
+        try:
+            if os.path.getsize(path) > _HG_TRACE_MAX_BYTES:
+                with open(path, "rb") as fh:
+                    fh.seek(_HG_TRACE_MAX_BYTES // 4)
+                    tail = fh.read()
+                with open(path, "wb") as fh:
+                    fh.write(tail)
+        except OSError:
+            pass
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:
+        pass
+
+
 def _aes_is_fast() -> bool:
     return AES_BACKEND in ("cryptography", "pycryptodome")
 
@@ -1338,7 +1361,8 @@ _STREAM_CHUNK = 1 << 20
 _STREAM_HEAD_PROBE = 1 << 16
 _STREAM_TTL_SECONDS = 900
 _STREAM_MAX_SESSIONS = 4
-_STREAM_STATE: dict[str, Any] = {"port": 0, "server": None, "sessions": {}}
+_STREAM_INFLIGHT_WAIT = 60
+_STREAM_STATE: dict[str, Any] = {"port": 0, "server": None, "sessions": {}, "inflight": {}}
 _STREAM_LOCK = threading.RLock()
 
 
@@ -1577,6 +1601,13 @@ class _StreamSession:
 
 def _stream_session(video_id: str, config: Mapping[str, Any], quality: str = "1080") -> "_StreamSession":
     quality = quality if quality in _QUALITY_LINE_NAME_TO_Q else "1080"
+    # 壳 URL 参数/实例随机对可能带空 did/iid：先用内存或盘上的熟对补齐，
+    # 否则空对打 video_model 必空模型，白白多吃一次轮换注册（冷启动最大的一段）。
+    cfg = dict(config) if isinstance(config, Mapping) else {}
+    if not (str(cfg.get("device_id") or "").strip() and str(cfg.get("install_id") or "").strip()):
+        pair = _working_device_pair()
+        if pair:
+            cfg["device_id"], cfg["install_id"] = pair
     cache_key = "%s|%s" % (video_id, quality)
     with _STREAM_LOCK:
         sessions = _STREAM_STATE["sessions"]
@@ -1585,26 +1616,60 @@ def _stream_session(video_id: str, config: Mapping[str, Any], quality: str = "10
         session = sessions.get(cache_key)
     if session is not None:
         return session
-    model = _video_model_rotating(video_id, config)
-    _, item = _select_quality(_video_list_from_model(model), quality)
-    url = _media_url(item)
-    spade = _spade_value(item)
-    if not url or not spade:
-        raise HongguoPluginError("播放模型缺少地址或密钥材料")
-    key_seed = _key_seed_from_model(model)
-    if key_seed:
-        try:
-            url = _decrypt_spade_url(url, key_seed)
-        except HongguoPluginError:
-            pass
-    total, moov_start, moov = _fetch_moov(url)
-    session = _StreamSession(url, derive_content_key(spade), total, moov_start, moov)
+    # 预热线程与播放器可能同时请求同一集：用 in-flight 事件去重，
+    # 避免重复拉 video_model 与 moov（冷启动 3~18s，重复会叠加首字节延迟）。
     with _STREAM_LOCK:
-        sessions = _STREAM_STATE["sessions"]
-        while len(sessions) >= _STREAM_MAX_SESSIONS:
-            sessions.pop(next(iter(sessions)), None)
-        sessions[cache_key] = session
-    return session
+        inflight = _STREAM_STATE.setdefault("inflight", {})
+        event = inflight.get(cache_key)
+        leader = event is None
+        if leader:
+            event = threading.Event()
+            inflight[cache_key] = event
+    if not leader:
+        event.wait(_STREAM_INFLIGHT_WAIT)
+        with _STREAM_LOCK:
+            session = _STREAM_STATE["sessions"].get(cache_key)
+        if session is not None:
+            return session
+    last_err = None
+    build_t0 = time.time()
+    try:
+        # 上游偶发抖动（同一集首次 502、重试即通）——冷启动这里做短重试。
+        for attempt in range(3):
+            try:
+                model = _video_model_rotating(video_id, cfg)
+                _, item = _select_quality(_video_list_from_model(model), quality)
+                url = _media_url(item)
+                spade = _spade_value(item)
+                if not url or not spade:
+                    raise HongguoPluginError("播放模型缺少地址或密钥材料")
+                key_seed = _key_seed_from_model(model)
+                if key_seed:
+                    try:
+                        url = _decrypt_spade_url(url, key_seed)
+                    except HongguoPluginError:
+                        pass
+                total, moov_start, moov = _fetch_moov(url)
+                session = _StreamSession(url, derive_content_key(spade), total, moov_start, moov)
+                with _STREAM_LOCK:
+                    sessions = _STREAM_STATE["sessions"]
+                    while len(sessions) >= _STREAM_MAX_SESSIONS:
+                        sessions.pop(next(iter(sessions)), None)
+                    sessions[cache_key] = session
+                _hg_trace(
+                    "会话构建完成 vid=%s q=%s attempt=%d %dms"
+                    % (video_id, quality, attempt + 1, int((time.time() - build_t0) * 1000))
+                )
+                return session
+            except Exception as err:
+                last_err = err
+                time.sleep(0.4 * (attempt + 1))
+        raise last_err if last_err is not None else HongguoPluginError("媒体会话创建失败")
+    finally:
+        if leader:
+            with _STREAM_LOCK:
+                _STREAM_STATE.get("inflight", {}).pop(cache_key, None)
+            event.set()
 
 
 _RANGE_UNSATISFIABLE = "unsatisfiable"
@@ -1635,9 +1700,113 @@ def _parse_range(value: str, total: int) -> Any:
     return start, end
 
 
+_TEE_STATE: dict[str, dict[str, Any]] = {}
+_TEE_LOCK = threading.Lock()
+_TEE_IDLE_SECONDS = 600
+
+
+def _tee_sweep_locked() -> None:
+    now = time.time()
+    for key in [k for k, s in _TEE_STATE.items() if now - float(s.get("time") or 0) > _TEE_IDLE_SECONDS]:
+        state = _TEE_STATE.pop(key, None)
+        if not state:
+            continue
+        try:
+            state["fh"].close()
+        except Exception:
+            pass
+        try:
+            os.remove(state["path"])
+        except OSError:
+            pass
+
+
+def _tee_begin(vid: str, quality: str, start: int, total: int):
+    """从 0 开始的完整流才记录；断点续传能接上就挂回半成品，接不上不录（绝不写坏）。"""
+    key = "%s|%s" % (vid, quality)
+    with _TEE_LOCK:
+        _tee_sweep_locked()
+        state = _TEE_STATE.get(key)
+        if state is not None:
+            if state["next"] == start and state.get("total") == total:
+                state["time"] = time.time()
+                return state
+            if start != 0:
+                return None
+            try:
+                state["fh"].close()
+            except Exception:
+                pass
+            try:
+                os.remove(state["path"])
+            except OSError:
+                pass
+            _TEE_STATE.pop(key, None)
+        if start != 0:
+            return None
+        try:
+            final = _hg_cache_path(vid, quality)
+            path = final + ".part"
+            fh = open(path, "wb")
+        except Exception:
+            return None
+        state = {"fh": fh, "path": path, "final": final, "next": 0, "total": total, "time": time.time(), "key": key}
+        _TEE_STATE[key] = state
+        return state
+
+
+def _tee_complete_locked(state: dict[str, Any]) -> None:
+    key = state["key"]
+    try:
+        state["fh"].flush()
+        state["fh"].close()
+    except Exception:
+        pass
+    _TEE_STATE.pop(key, None)
+    try:
+        os.replace(state["path"], state["final"])
+        _hg_trace("边播边落盘完成 %s" % os.path.basename(state["final"]))
+    except Exception as err:
+        _hg_trace("落盘改名失败 %s: %s" % (os.path.basename(state["path"]), err))
+        try:
+            os.remove(state["path"])
+        except OSError:
+            pass
+
+
+def _tee_write(state: dict[str, Any] | None, cursor: int, block: bytes) -> bool:
+    """按绝对偏移连续才写；断流/被接管/写盘失败返回 False（本连接停录，播放不受影响）。"""
+    if state is None:
+        return False
+    with _TEE_LOCK:
+        if _TEE_STATE.get(state["key"]) is not state or state["next"] != cursor:
+            return False
+        try:
+            state["fh"].write(block)
+            state["next"] = cursor + len(block)
+            state["time"] = time.time()
+        except Exception:
+            _TEE_STATE.pop(state["key"], None)
+            try:
+                state["fh"].close()
+            except Exception:
+                pass
+            try:
+                os.remove(state["path"])
+            except OSError:
+                pass
+            return False
+        if state["next"] >= state["total"]:
+            _tee_complete_locked(state)
+        return True
+
+
 class _StreamHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "hg-stream"
+    # 播放器断/暂停后不再读，wfile.write 会永久卡住线程；超时后线程自动收场，
+    # 播放器恢复时按 Range 重连即可。
+    timeout = 120
 
     def log_message(self, *args: Any) -> None:
         return None
@@ -1672,6 +1841,56 @@ class _StreamHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - 标准库回调命名
         self._serve(body=True)
 
+    def _emit_media_headers(self, code: int, start: int, end: int, total: int, ranged: bool) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(end - start + 1))
+        if ranged:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, total))
+        self.end_headers()
+
+    def _serve_from_cache(self, cpath: str, body: bool, vid: str, quality: str) -> None:
+        """完整缓存直读出流：不建会话、不碰上游，重进/切回秒开。"""
+        total = os.path.getsize(cpath)
+        try:
+            os.utime(cpath, None)
+        except OSError:
+            pass
+        requested = _parse_range(self.headers.get("Range") or "", total)
+        if requested is _RANGE_UNSATISFIABLE:
+            self.send_response(416)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Range", "bytes */%d" % total)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            return
+        start, end = requested if requested else (0, total - 1)
+        self._emit_media_headers(206 if requested else 200, start, end, total, bool(requested))
+        if not body:
+            return
+        t0 = time.time()
+        first = True
+        try:
+            with open(cpath, "rb") as fh:
+                fh.seek(start)
+                remaining = end - start + 1
+                while remaining > 0:
+                    block = fh.read(min(_STREAM_CHUNK, remaining))
+                    if not block:
+                        break
+                    self.wfile.write(block)
+                    if first:
+                        _hg_trace("首字节(本机缓存) vid=%s q=%s %dms" % (vid, quality, int((time.time() - t0) * 1000)))
+                        first = False
+                    remaining -= len(block)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except Exception as err:
+            _hg_trace("播放中断(本机缓存) vid=%s q=%s %s" % (vid, quality, str(err)[:80]))
+            self.close_connection = True
+
     def _serve(self, body: bool) -> None:
         route = urlparse(self.path).path
         if not route.endswith(".mp4"):
@@ -1681,18 +1900,30 @@ class _StreamHandler(BaseHTTPRequestHandler):
         if not params["vid"]:
             self._fail(400, b"missing vid")
             return
+        params["quality"] = params["quality"] if params["quality"] in _QUALITY_LINE_NAME_TO_Q else "1080"
+        # 完整缓存（边播落盘/壳代理产物）→ 直接从盘出流，免建会话免上游
         try:
-            did, iid = _hg_ensure_device()
+            cpath = _hg_cache_path(params["vid"], params["quality"])
+            if os.path.isfile(cpath) and os.path.getsize(cpath) > 65536:
+                self._serve_from_cache(cpath, body, params["vid"], params["quality"])
+                return
+        except Exception:
+            pass
+        t0 = time.time()
+        try:
             session = _stream_session(
                 params["vid"],
-                {"device_id": did, "install_id": iid},
+                {
+                    "device_id": params["device_id"],
+                    "install_id": params["install_id"],
+                },
                 params["quality"],
             )
-        except Exception:
+        except Exception as err:
+            _hg_trace("起播会话失败 vid=%s q=%s %s" % (params["vid"], params["quality"], str(err)[:80]))
             self._fail(502, b"media session failed")
             return
-        raw_range = self.headers.get("Range") or ""
-        requested = _parse_range(raw_range, session.total)
+        requested = _parse_range(self.headers.get("Range") or "", session.total)
         if requested is _RANGE_UNSATISFIABLE:
             self.send_response(416)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -1702,24 +1933,26 @@ class _StreamHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         start, end = requested if requested else (0, session.total - 1)
-        self.send_response(206 if requested else 200)
-        self.send_header("Content-Type", "video/mp4")
-        self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Content-Length", str(end - start + 1))
-        if requested:
-            self.send_header(
-                "Content-Range",
-                "bytes %d-%d/%d" % (start, end, session.total),
-            )
-        self.end_headers()
+        self._emit_media_headers(206 if requested else 200, start, end, session.total, bool(requested))
         if not body:
             return
+        # 边播边把解密后的明文录进缓存：完整看一集 → 下次直接走盘
+        tee = _tee_begin(params["vid"], params["quality"], start, session.total)
+        cursor = start
+        first = True
         try:
             for block in session.iter_range(start, end):
                 self.wfile.write(block)
+                if tee is not None and not _tee_write(tee, cursor, block):
+                    tee = None
+                cursor += len(block)
+                if first:
+                    _hg_trace("首字节(网络会话) vid=%s q=%s %dms" % (params["vid"], params["quality"], int((time.time() - t0) * 1000)))
+                    first = False
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
-        except Exception:
+        except Exception as err:
+            _hg_trace("播放中断(网络会话) vid=%s q=%s at=%d %s" % (params["vid"], params["quality"], cursor, str(err)[:80]))
             self.close_connection = True
 
 
@@ -3837,6 +4070,69 @@ def _hg_random_pair():
     return (str(random.randint(10**17, 10**18 - 1)), str(random.randint(10**17, 10**18 - 1)))
 
 
+_DEVICE_MEMO_MAX_AGE = 30 * 86400
+
+
+def _device_memo_path() -> str:
+    return os.path.join(_hg_cache_dir(), "hg_device.json")
+
+
+def _device_memo_load():
+    """盘上已注册设备对（30 天内）：壳重载/重启后不再从裸对重来，首播直接是熟对。"""
+    try:
+        with open(_device_memo_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, Mapping) or not data.get("registered"):
+            return None
+        device_id = str(data.get("device_id") or "")
+        install_id = str(data.get("install_id") or "")
+        if not (device_id.isdigit() and install_id.isdigit()):
+            return None
+        if time.time() - float(data.get("time") or 0) > _DEVICE_MEMO_MAX_AGE:
+            return None
+        return device_id, install_id
+    except Exception:
+        return None
+
+
+def _device_memo_save(device_id: str, install_id: str) -> None:
+    # 只有注册成功的对才落盘：裸对存盘等于把空模型风险带到下一次启动。
+    try:
+        path = _device_memo_path()
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(
+                {"device_id": device_id, "install_id": install_id, "registered": True, "time": time.time()},
+                fh,
+            )
+        os.replace(tmp, path)
+    except Exception as err:
+        _hg_trace("设备信息落盘失败 %s" % str(err)[:80])
+
+
+def _device_memo_discard() -> None:
+    try:
+        os.remove(_device_memo_path())
+    except OSError:
+        pass
+
+
+def _working_device_pair():
+    """当前可用的注册设备对：内存已注册 → 盘上 memo；都没有返回 None。"""
+    with _HG_DEVICE_LOCK:
+        device_id, install_id = _HG_DEVICE["device_id"], _HG_DEVICE["install_id"]
+        if device_id and install_id and _HG_DEVICE["registered"]:
+            return device_id, install_id
+    memo = _device_memo_load()
+    if memo:
+        with _HG_DEVICE_LOCK:
+            if not _HG_DEVICE["registered"]:
+                _HG_DEVICE["device_id"], _HG_DEVICE["install_id"] = memo
+                _HG_DEVICE["registered"] = True
+        return memo
+    return None
+
+
 def _hg_register_device():
     """device_register（omn registerDevicePair 同款）：成功返回 (did, iid)，失败 None。"""
     hex16 = lambda: uuid.uuid4().hex[:16]
@@ -3893,21 +4189,29 @@ def _hg_register_device_retry(attempts: int = _HG_REGISTER_ATTEMPTS, delay: floa
             return pair
         if attempt + 1 < attempts:
             time.sleep(delay)
+    _hg_trace("设备注册失败（已重试 %d 次）" % max(1, attempts))
     return None
 
 
 def _hg_ensure_device():
-    """进程内权威设备对：只复用注册成功的设备；随机兜底对不标记已注册，下次继续重试注册。"""
+    """权威设备对：内存已注册 → 盘上 memo → 重试注册；随机兜底对不标记已注册。"""
     with _HG_DEVICE_LOCK:
         did, iid = _HG_DEVICE["device_id"], _HG_DEVICE["install_id"]
         if did and iid and _HG_DEVICE["registered"]:
             return did, iid
+    memo = _device_memo_load()
+    if memo:
+        with _HG_DEVICE_LOCK:
+            _HG_DEVICE["device_id"], _HG_DEVICE["install_id"] = memo
+            _HG_DEVICE["registered"] = True
+        return memo
     pair = _hg_register_device_retry()
     if pair:
         with _HG_DEVICE_LOCK:
             _HG_DEVICE["device_id"], _HG_DEVICE["install_id"] = pair
             _HG_DEVICE["registered"] = True
-            return pair
+        _device_memo_save(*pair)
+        return pair
     with _HG_DEVICE_LOCK:
         if not (_HG_DEVICE["device_id"] and _HG_DEVICE["install_id"]):
             _HG_DEVICE["device_id"], _HG_DEVICE["install_id"] = _hg_random_pair()
@@ -3915,16 +4219,22 @@ def _hg_ensure_device():
 
 
 def _hg_rotate_device():
-    """空模型后换新设备：优先重新注册（带重试）拿新配额，失败回退新随机对且不标记已注册。"""
+    """空模型后换新设备：先作废盘上 memo（坏对不许下次启动再捞回），注册带重试。"""
+    _device_memo_discard()
     pair = _hg_register_device_retry(attempts=3, delay=0.6)
     with _HG_DEVICE_LOCK:
         if pair:
             _HG_DEVICE["device_id"], _HG_DEVICE["install_id"] = pair
             _HG_DEVICE["registered"] = True
-            return pair
-        _HG_DEVICE["device_id"], _HG_DEVICE["install_id"] = _hg_random_pair()
-        _HG_DEVICE["registered"] = False
-        return _HG_DEVICE["device_id"], _HG_DEVICE["install_id"]
+        else:
+            _HG_DEVICE["device_id"], _HG_DEVICE["install_id"] = _hg_random_pair()
+            _HG_DEVICE["registered"] = False
+            pair = (_HG_DEVICE["device_id"], _HG_DEVICE["install_id"])
+        registered = _HG_DEVICE["registered"]
+    if registered:
+        _device_memo_save(*pair)
+        _hg_trace("设备轮换注册成功 did=%s" % pair[0][:6])
+    return pair
 
 
 _HG_EMPTY_MODEL_MARKERS = (
@@ -4600,14 +4910,61 @@ class _HongguoSpider(_BaseSpider):
                 "url": SITE + "/",
                 "header": {"User-Agent": UA},
             }
-        # OK影视 / 多数壳：必须走 getProxyUrl（通常已带 do=py），不要覆盖 do
+        # 取流优先级：本机 Range 流服务 > 壳代理。
+        # 壳代理（fongmi / OK影视 的 /proxy?do=py）实测会忽略 Range：对 bytes=0-1023
+        # 也回 200 + 整片 + chunked，既无 Content-Range 也无 Accept-Ranges，且必须
+        # 等整片下载 + CENC 解密完成后才吐首字节（单集 12~17MB，实测 8.7s / 16.3s，
+        # 超过播放器默认 8s 读超时）。首集常因缓存或重试侥幸起播，切到第二集时播放器
+        # 按新 URL 重新请求即超时失败，表现为“第 1 集能放、第 2 集不能放”。
+        # 本机流服务支持 206 / Content-Range / Accept-Ranges，首字节约 1s，切集稳定。
+        # 会话构建（取 video_model + 拉 moov）冷启动约 3~18s，若等播放器连上来才建
+        # 会话，响应头会被拖到读超时；这里先异步预热，播放器连接时直接命中会话。
+        pair = _working_device_pair()
+        did, iid = pair if pair else ("", "")
+
+        def _warm_session():
+            try:
+                if not (did and iid):
+                    warm_did, warm_iid = _hg_ensure_device()
+                else:
+                    warm_did, warm_iid = did, iid
+                _stream_session(vid, {"device_id": warm_did, "install_id": warm_iid}, q)
+            except Exception:
+                pass
+        try:
+            threading.Thread(target=_warm_session, daemon=True).start()
+        except Exception:
+            pass
+        try:
+            port = _start_stream_server()
+        except Exception:
+            port = 0
+        if port:
+            query = urlencode(
+                {
+                    "vid": vid,
+                    "q": q,
+                    "did": did,
+                    "iid": iid,
+                }
+            )
+            return {
+                "parse": 0,
+                "jx": 0,
+                "playUrl": "",
+                "url": "http://127.0.0.1:%d/hg.mp4?%s" % (port, query),
+                "header": {"User-Agent": UA},
+            }
+        # 回退：壳代理（保留壳自带的 do=py，不要覆盖 do）
+        _hg_trace("流服务不可用→壳代理回退 vid=%s q=%s" % (vid, q))
+        if not (did and iid):
+            did, iid = _hg_ensure_device()
         proxy = ""
         try:
             if hasattr(self, "getProxyUrl"):
                 proxy = (self.getProxyUrl() or "").strip()
         except Exception:
             proxy = ""
-        did, iid = _hg_ensure_device()
         if proxy:
             sep = "&" if "?" in proxy else "?"
             # 保留壳自带的 do=py，只追加业务参数与清晰度线路
@@ -4629,27 +4986,6 @@ class _HongguoSpider(_BaseSpider):
                     "User-Agent": MEDIA_UA,
                     "Referer": "https://novel.snssdk.com/",
                 },
-            }
-        # 备用：本机 Range 流（FongMi 更友好）
-        try:
-            port = _start_stream_server()
-        except Exception:
-            port = 0
-        if port:
-            query = urlencode(
-                {
-                    "vid": vid,
-                    "q": q,
-                    "did": did,
-                    "iid": iid,
-                }
-            )
-            return {
-                "parse": 0,
-                "jx": 0,
-                "playUrl": "",
-                "url": "http://127.0.0.1:%d/hg.mp4?%s" % (port, query),
-                "header": {"User-Agent": UA},
             }
         return {
             "parse": 1,
