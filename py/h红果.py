@@ -1,8 +1,14 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-VERSION = "1.6.7"
+VERSION = "1.6.8"
 VERSION_NOTE = (
+    "1.6.8 修 32 位 OK影视弹幕开启后播放中闪退/盒子重启(真机复现数次)："
+    "① 弹幕条数封顶 _DM_MAX_ITEMS=500(取数早停+出流再截断，maxlimit 改真实条数——"
+    "原 20窗×90 全量可到 ~1800 条/数百 KB XML，DanmakuFlameMaster 32 位解析即顶满)；"
+    "② 9978/action 双投默认关 _DM_PUSH_LOCAL=False(playerContent 已挂 list 再推一次=双载)；"
+    "③ _DM_CACHE 有界 32 集(先挤最旧，防长看只涨不跌)；"
+    "④ 弹幕预热与会话预热错峰 +2.5s(起播瞬间不再三线并发挤 32 位水位)。"
     "1.6.7 移植弹幕模块(自红果短剧弹幕版.py 单向移植，两份评估互证后实施)："
     "commentapi 取数(ladon/argus/SM3/Simon 纯 Python 签名、30s 窗口×20并发、片尾早停、TTL 1800s)、"
     "playerContent 挂 danmaku 字段(wait=0 只起后台取数线程不阻塞出流)、流服务加 /hg_dm 路由"
@@ -5145,7 +5151,9 @@ _DM_MAX_WINDOWS = 20        # 最多取 20 个窗口（约 10 分钟，覆盖短
 _DM_TTL = 1800              # 弹幕缓存有效期（秒）
 _DM_WAIT = 18               # 弹幕路由最多等取数完成多少秒
 _DM_IN_PLAYER = "list"      # playerContent 里 danmaku 字段形态: list / url / off
-_DM_PUSH_LOCAL = True       # 额外用壳的 127.0.0.1:9978/action 推一次（老壳兜底）
+_DM_PUSH_LOCAL = False      # 9978/action 兜底推送默认关(1.6.8: list+双投=双载，32位壳闪退)
+_DM_MAX_ITEMS = 500         # 出给播放器的弹幕条数硬顶(32位 DanmakuFlameMaster 内存)
+_DM_CACHE_MAX = 32          # _DM_CACHE 最多缓存集数(挤最旧)
 _DM_SID_MAP: dict[str, str] = {}
 _DM_CACHE: dict[str, dict[str, Any]] = {}
 _DM_EVENTS: dict[str, threading.Event] = {}
@@ -5629,6 +5637,9 @@ def _dm_fetch(vid: str, series_id: str, device_id: str, install_id: str = "") ->
                 if page:
                     batch_empty = False
                     for item in page:
+                        if len(items) >= _DM_MAX_ITEMS:
+                            stop = True
+                            break
                         key = (item["text"], item["ms"] // 500)
                         if key in seen:
                             continue
@@ -5644,6 +5655,8 @@ def _dm_fetch(vid: str, series_id: str, device_id: str, install_id: str = "") ->
             empty_batches = empty_batches + 1 if batch_empty else 0
             if empty_batches >= 2:
                 break
+            if len(items) >= _DM_MAX_ITEMS:
+                break
     finally:
         if pool is not None:
             try:
@@ -5651,7 +5664,7 @@ def _dm_fetch(vid: str, series_id: str, device_id: str, install_id: str = "") ->
             except Exception:
                 pass
     items.sort(key=lambda x: x["ms"])
-    return items
+    return items[:_DM_MAX_ITEMS]
 
 
 def _dm_rows(items: list) -> list:
@@ -5680,6 +5693,15 @@ def _dm_state(vid: str) -> dict:
 def _dm_set_state(vid: str, items: list, error: str = "") -> None:
     with _DM_LOCKS:
         _DM_CACHE[vid] = {"t": time.time(), "items": items, "error": error}
+        if len(_DM_CACHE) > _DM_CACHE_MAX:
+            for old_vid in sorted(
+                _DM_CACHE,
+                key=lambda k: float((_DM_CACHE.get(k) or {}).get("t") or 0),
+            ):
+                if old_vid == vid or len(_DM_CACHE) <= _DM_CACHE_MAX:
+                    continue
+                _DM_CACHE.pop(old_vid, None)
+                _DM_EVENTS.pop(old_vid, None)
         event = _DM_EVENTS.get(vid)
     if event is not None:
         event.set()
@@ -5776,14 +5798,15 @@ def _dm_xml_escape(text: str) -> str:
 
 
 def _dm_to_xml(chat_id: str, items: list) -> bytes:
-    """B 站 XML 弹幕格式，DanmakuFlameMaster / 各壳原生支持。"""
+    """B 站 XML 弹幕格式，DanmakuFlameMaster / 各壳原生支持。出流硬顶 _DM_MAX_ITEMS。"""
+    rows = _dm_rows(items)[:_DM_MAX_ITEMS]
     body = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         "<i><chatserver>hongguo</chatserver><chatid>%s</chatid><mission>0</mission>"
-        "<maxlimit>99999</maxlimit><state>0</state><real_name>0</real_name><source>k-v</source>"
-        % _dm_xml_escape(chat_id),
+        "<maxlimit>%d</maxlimit><state>0</state><real_name>0</real_name><source>k-v</source>"
+        % (_dm_xml_escape(chat_id), len(rows)),
     ]
-    for row in _dm_rows(items):
+    for row in rows:
         body.append('<d p="%.2f,1,25,%d,0,0,0,0">%s</d>'
                     % (float(row["time"]), int(row["color"]), _dm_xml_escape(row["text"])))
     body.append("</i>")
@@ -5791,7 +5814,7 @@ def _dm_to_xml(chat_id: str, items: list) -> bytes:
 
 
 def _dm_to_json(items: list) -> bytes:
-    return json.dumps(_dm_rows(items), ensure_ascii=False).encode("utf-8")
+    return json.dumps(_dm_rows(items)[:_DM_MAX_ITEMS], ensure_ascii=False).encode("utf-8")
 
 
 def _dm_push_local(url: str, vid: str) -> None:
@@ -5887,9 +5910,20 @@ class Spider(_BaseSpider):
             "iid": self.install_id or "",
         })
         url = "http://127.0.0.1:%d/hg_dm?%s" % (port, query)
-        # 播放器起播后才会来取弹幕，这里先把取数线程跑起来（不阻塞出流）
+        # 1.6.8: 与会话预热错峰——起播瞬间 _warm_session 已在跑，再叠 4 路弹幕取数
+        # 会把 32 位进程水位顶到 LMK；延后 2.5s，播放器真来取时 /hg_dm 仍会等(wait=18)。
+        _dm_vid, _dm_sid = vid, sid
+        _dm_did, _dm_iid = self.device_id or "", self.install_id or ""
+
+        def _warm_dm(delay: float = 2.5) -> None:
+            time.sleep(delay)
+            try:
+                _dm_get(_dm_vid, _dm_sid, _dm_did, _dm_iid, wait=0)
+            except Exception:
+                pass
+
         try:
-            _dm_get(vid, sid, self.device_id or "", self.install_id or "", wait=0)
+            threading.Thread(target=_warm_dm, daemon=True).start()
         except Exception:
             pass
         _dm_push_local(url, vid)
