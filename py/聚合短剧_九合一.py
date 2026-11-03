@@ -20,6 +20,10 @@
 #     同款已在实机验证），不再依赖壳 /proxy?do=py 的 9978 顺位口与
 #     getProxyUrl 注入；非 HLS 地址(mp4)也入代理防直连转圈；代理参数兼容
 #     JSON 字符串形态
+#  7. 五五一/野果首页无图：两家封面接入自建回环服务（同第 6 条，handler 按
+#     eng 分发，eng=yeguo/wuyi）；野果 9978 兜底改自建服务；五一原图是
+#     01/upload 系 AES-128-CBC 密文（与野果同族同 MEDIA 键），_srv_pic 非图
+#     即解密+PKCS7 去填充后才回壳——此前直连回的是壳解不了的密文字节
 # =====================================================================
 #  聚合短剧 · 九合一
 #     (红果 + 黄豆 + 黄果 + 野果 + 禁果 + 红果黄剧 + 聚合短剧[短] + 2048短剧 + 狂飙短剧)
@@ -6867,7 +6871,6 @@ class _HguoProxyHandler(BaseHTTPRequestHandler):
 
     def _serve(self, head_only=False):
         try:
-            eng = _HGUO_SRV_STATE.get("eng")
             query = parse_qs(urlparse(self.path).query)
 
             def gv(k):
@@ -6876,23 +6879,31 @@ class _HguoProxyHandler(BaseHTTPRequestHandler):
 
             typ = gv("type")
             url = gv("url") or gv("pic")
-            if eng is None or not url:
-                self.send_response(404)
-                self.send_header("Content-Length", "2")
-                self.end_headers()
-                if not head_only:
-                    self.wfile.write(b"nf")
-                return
-            if typ == "m3u8":
-                res = eng._proxy_m3u8(url)
-            elif typ == "ts":
-                res = eng._proxy_ts(url)
-            elif typ == "key":
-                res = eng._proxy_key(url)
-            elif typ == "mp4":
-                res = eng._proxy_mp4(url, self.headers.get("Range") or "")
+            engk = gv("eng") or "hguo"
+            st = _HGUO_SRV_STATE
+            if not url:
+                res = [404, "text/plain", "nf"]
+            elif engk == "yeguo":
+                # 野果封面带 AES 自解: 走其 localProxy(入参再编码一次, 由它自己 unquote 回原址)
+                yg = st.get("yeguo")
+                res = yg.localProxy({"url": quote(url, safe="")}) if yg else [404, "text/plain", "nf"]
+            elif engk == "hguo":
+                eng = st.get("eng")
+                if eng is None:
+                    res = [404, "text/plain", "nf"]
+                elif typ == "m3u8":
+                    res = eng._proxy_m3u8(url)
+                elif typ == "ts":
+                    res = eng._proxy_ts(url)
+                elif typ == "key":
+                    res = eng._proxy_key(url)
+                elif typ == "mp4":
+                    res = eng._proxy_mp4(url, self.headers.get("Range") or "")
+                else:
+                    res = eng._proxy_pic(url)
             else:
-                res = eng._proxy_pic(url)
+                # 五一等无自有解密逻辑的线路: 通用取图(只带 UA 不带跨站 Referer)
+                res = _srv_pic(url)
             if not isinstance(res, (list, tuple)) or len(res) < 2:
                 res = [502, "text/plain", "err"]
             code = int(res[0]) if str(res[0]).isdigit() else 502
@@ -6951,6 +6962,53 @@ def _hguo_srv_base() -> str:
         except Exception as e:
             st["err"] = str(e) or "bind-fail"
             return ""
+
+
+def _srv_is_img(b):
+    if not isinstance(b, (bytes, bytearray)) or len(b) < 4:
+        return False
+    b = bytes(b)
+    return (b[:3] == b"\xff\xd8\xff" or b[:4] == b"\x89PNG" or b[:3] == b"GIF"
+            or (len(b) > 12 and b[8:12] == b"WEBP"))
+
+
+def _srv_pic(url):
+    """通用封面抓取(五一等无自有取图逻辑的线路): 只带 UA 不带跨站 Referer, 魔数定 mime。
+    01/upload 系 CDN 原图为 AES-128-CBC 密文(binary/octet-stream), 与野果同族同键,
+    非图时按 MEDIA 键解密+PKCS7 去填充(同 _YeguoSpider._aes_raw 语义)。"""
+    try:
+        r = requests.get(url, headers={"User-Agent": _HGUO_UA, "Accept": "image/*,*/*;q=0.8"},
+                         timeout=15, verify=False)
+        if r.status_code not in (200, 206):
+            return [404, "text/plain", "err:%d" % r.status_code]
+        ct = r.content or b""
+        if ct and not _srv_is_img(ct):
+            try:
+                n = len(ct) - (len(ct) % 16)
+                if n > 0:
+                    dec = _aes_cbc_decrypt(_YG_MEDIA_KEY, _YG_MEDIA_IV, bytes(ct[:n]))
+                    if dec:
+                        pad = dec[-1]
+                        if 1 <= pad <= 16 and pad <= len(dec):
+                            dec = dec[:-pad]
+                    if _srv_is_img(dec):
+                        ct = dec
+            except Exception:
+                pass
+        if not ct:
+            return [404, "text/plain", "empty"]
+        b = bytes(ct)
+        if b[:3] == b"\xff\xd8\xff":
+            return [200, "image/jpeg", b]
+        if b[:4] == b"\x89PNG":
+            return [200, "image/png", b]
+        if b[:3] == b"GIF":
+            return [200, "image/gif", b]
+        if b[8:12] == b"WEBP":
+            return [200, "image/webp", b]
+        return [200, "image/jpeg", b]
+    except Exception:
+        return [404, "text/plain", "err"]
 
 
 # ---- 黄果剧场 · 参照 hhgdj.py(1.5.1) 移植 huangguoai.fit ----
@@ -7828,8 +7886,16 @@ class _AggSpider(_BaseSpider):
         return "聚合短剧"
 
     def _proxy51(self, url):
-        if self.proxy_img_51 and url:
-            return self.proxy_img_51 + _ag_enc_uri(url)
+        if not url:
+            return url
+        base = self.proxy_img_51
+        if not base:
+            # 实机直连图源取不到: 优先走自建回环服务, 起不来则回退直连(原行为)
+            b = _hguo_srv_base()
+            if b:
+                base = b + "?do=py&eng=wuyi&url="
+        if base:
+            return base + _ag_enc_uri(url)
         return url
 
     # ---------- 预处理 / 鉴权 ----------
@@ -9073,6 +9139,10 @@ class _YeguoSpider(_BaseSpider):
         return "http://127.0.0.1:9978/proxy?do=py"
 
     def _proxy_url(self):
+        _HGUO_SRV_STATE["yeguo"] = self
+        b = _hguo_srv_base()
+        if b:
+            return b
         try:
             fn = getattr(self, "getProxyUrl", None)
             if callable(fn):
