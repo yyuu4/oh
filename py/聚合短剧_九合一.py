@@ -16,6 +16,10 @@
 #  5. 黄果引擎整体移植：死站 huangguoai.com → 活站 huangguoai.fit
 #     （参照 hhgdj.py），新增 9 个分类 + 8 组筛选（HGUO::root 统一下发、
 #     按分类清洗参数），保留 DoH / 熔断 / 本机代理(eng=hguo) 契约
+#  6. 黄果实机首页无图、播放转圈：代理改自建回环服务（端口 OS 分配，红果
+#     同款已在实机验证），不再依赖壳 /proxy?do=py 的 9978 顺位口与
+#     getProxyUrl 注入；非 HLS 地址(mp4)也入代理防直连转圈；代理参数兼容
+#     JSON 字符串形态
 # =====================================================================
 #  聚合短剧 · 九合一
 #     (红果 + 黄豆 + 黄果 + 野果 + 禁果 + 红果黄剧 + 聚合短剧[短] + 2048短剧 + 狂飙短剧)
@@ -6828,11 +6832,125 @@ def _hguo_install_doh():
 
 
 def _hguo_pv(param, key):
-    """取本机代理参数；兼容壳把 query 解析成 {k: [v]} 的情况。"""
-    v = (param or {}).get(key)
+    """取本机代理参数；兼容壳把 query 解析成 {k: [v]}、或直接传 JSON 字符串两种形态。"""
+    if isinstance(param, str):
+        try:
+            param = json.loads(param) if param.lstrip().startswith("{") else {}
+        except Exception:
+            param = {}
+    if not isinstance(param, dict):
+        param = {}
+    v = param.get(key)
     if isinstance(v, (list, tuple)):
         v = v[0] if v else ""
     return str(v or "")
+
+
+# ---- 黄果自建本机代理（修实机：首页无图、播放转圈）----
+#   根因画像：进程内取数（列表/详情）全好、经壳 /proxy?do=py 回环全挂——单
+#   文件 spider 不保证被注入 getProxyUrl，且壳端口 9978-9998 顺位抢占，硬编
+#   码 9978 纯靠运气。红果自建回环流服务在实机已被验证可用，故黄果同款：
+#   py 内自起回环 HTTP 服务、端口由 OS 分配，图/流(m3u8/ts/key/mp4)全走本
+#   服务，不再赌壳代理契约；壳注入/9978 仅作服务起不来时的回退。
+_HGUO_SRV_STATE: dict[str, Any] = {"port": 0, "server": None, "eng": None, "err": ""}
+_HGUO_SRV_LOCK = threading.RLock() if threading is not None else None
+
+
+class _HguoProxyHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "hg-hguo-proxy"
+    # 播放器断/暂停后不再读，wfile.write 会卡住线程；超时线程自动收场
+    timeout = 60
+
+    def log_message(self, *args):
+        return None
+
+    def _serve(self, head_only=False):
+        try:
+            eng = _HGUO_SRV_STATE.get("eng")
+            query = parse_qs(urlparse(self.path).query)
+
+            def gv(k):
+                v = query.get(k) or []
+                return unquote(v[0]) if v else ""
+
+            typ = gv("type")
+            url = gv("url") or gv("pic")
+            if eng is None or not url:
+                self.send_response(404)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                if not head_only:
+                    self.wfile.write(b"nf")
+                return
+            if typ == "m3u8":
+                res = eng._proxy_m3u8(url)
+            elif typ == "ts":
+                res = eng._proxy_ts(url)
+            elif typ == "key":
+                res = eng._proxy_key(url)
+            elif typ == "mp4":
+                res = eng._proxy_mp4(url, self.headers.get("Range") or "")
+            else:
+                res = eng._proxy_pic(url)
+            if not isinstance(res, (list, tuple)) or len(res) < 2:
+                res = [502, "text/plain", "err"]
+            code = int(res[0]) if str(res[0]).isdigit() else 502
+            ct = str(res[1] or "application/octet-stream")
+            body = res[2] if len(res) > 2 else b""
+            extra = res[3] if len(res) > 3 and isinstance(res[3], dict) else {}
+            if isinstance(body, str):
+                body = body.encode("utf-8", "replace")
+            if body is None:
+                body = b""
+            self.send_response(code)
+            self.send_header("Content-Type", ct)
+            for k, v in extra.items():
+                self.send_header(str(k), str(v))
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if not head_only and body:
+                self.wfile.write(body)
+        except Exception:
+            try:
+                self.send_response(500)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            except Exception:
+                pass
+
+    def do_GET(self):
+        self._serve()
+
+    def do_HEAD(self):
+        self._serve(head_only=True)
+
+
+def _hguo_srv_base() -> str:
+    """确保黄果自建回环代理已启动，返回 http://127.0.0.1:PORT 基址；不可用返回 ""。"""
+    if _HGUO_SRV_LOCK is None or ThreadingHTTPServer is None or BaseHTTPRequestHandler is object:
+        return ""
+    st = _HGUO_SRV_STATE
+    if st["port"]:
+        return "http://127.0.0.1:%d" % int(st["port"])
+    if st["err"]:
+        return ""
+    with _HGUO_SRV_LOCK:
+        if st["port"]:
+            return "http://127.0.0.1:%d" % int(st["port"])
+        if st["err"]:
+            return ""
+        try:
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), _HguoProxyHandler)
+            srv.daemon_threads = True
+            port = int(srv.server_address[1])
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            st["server"] = srv
+            st["port"] = port
+            return "http://127.0.0.1:%d" % port
+        except Exception as e:
+            st["err"] = str(e) or "bind-fail"
+            return ""
 
 
 # ---- 黄果剧场 · 参照 hhgdj.py(1.5.1) 移植 huangguoai.fit ----
@@ -7498,7 +7616,11 @@ class _HuangguoSpider(_BaseSpider):
             pass
 
     def _proxy_url(self):
-        """取壳注入的本机代理地址；没注入时退回 9978 默认口。"""
+        """优先黄果自建回环服务(OS 分配端口)；退回壳注入 getProxyUrl；再退 9978。"""
+        _HGUO_SRV_STATE["eng"] = self
+        b = _hguo_srv_base()
+        if b:
+            return b
         try:
             fn = getattr(self, "getProxyUrl", None)
             if callable(fn):
@@ -7575,7 +7697,8 @@ class _HuangguoSpider(_BaseSpider):
             return url
         if "m3u8" in url.lower():
             return self.proxy_m3u8_url(url)
-        return url
+        # 非 HLS（图集 mp4 等）也走本机代理：实机直连 .fit 常撞 DNS 污染转圈
+        return self._proxy_base("mp4", url)
 
     def _proxy_m3u8(self, url):
         try:
@@ -7654,6 +7777,25 @@ class _HuangguoSpider(_BaseSpider):
         except Exception:
             return [404, "text/plain", "err"]
 
+    def _proxy_mp4(self, url, rng=""):
+        """直通代理 mp4（图集视频等非 HLS 地址），透传 Range 回 206。"""
+        try:
+            hdr = dict(self.header) if self.header else {}
+            if rng:
+                hdr["Range"] = rng
+            r = requests.get(url, headers=hdr, timeout=30, verify=False, stream=True)
+            if r.status_code not in (200, 206):
+                return [502, "text/plain", "err:%d" % r.status_code]
+            ct = (r.headers.get("Content-Type") or "video/mp4").split(";")[0].strip() or "video/mp4"
+            data = r.content
+            out = [r.status_code, ct, data, {"Accept-Ranges": "bytes"}]
+            cr = r.headers.get("Content-Range")
+            if r.status_code == 206 and cr:
+                out[3]["Content-Range"] = cr
+            return out
+        except Exception:
+            return [502, "text/plain", "err"]
+
     def localProxy(self, param):
         if not param:
             return [404, "text/plain", "nf"]
@@ -7668,6 +7810,8 @@ class _HuangguoSpider(_BaseSpider):
             return self._proxy_ts(url)
         if typ == "key":
             return self._proxy_key(url)
+        if typ == "mp4":
+            return self._proxy_mp4(url, _hguo_pv(param, "range"))
         return self._proxy_pic(url)
 
 # =====================================================================
