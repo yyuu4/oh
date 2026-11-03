@@ -53,6 +53,47 @@ except Exception:
 from typing import Any
 from urllib.parse import parse_qs, quote, quote_plus, unquote, urlencode, urlparse, urlsplit
 
+# ---- 单主机熔断（防卡死）----
+# 同一域名一旦出现连接级失败（超时/拒绝/SSL），60 秒内后续请求直接
+# 快速失败，避免调用方的重试循环把每次 15s 超时叠成分钟级卡死
+#（黄果站点不可达时 getHtml 6 次重试 = 90s 即此形态）。
+# 成功一次即清零；熔断期满自动放行一次真实探测（half-open），失败再熔断。
+_CB_FAILS = {}          # host -> 最近一次连接级失败时间戳
+_CB_TTL = 60.0          # 熔断窗口（秒）
+
+
+def _cb_host(url):
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def _cb_blocked(url):
+    h = _cb_host(url)
+    if not h:
+        return False
+    t = _CB_FAILS.get(h)
+    if t is None:
+        return False
+    if time.time() - t < _CB_TTL:
+        return True
+    _CB_FAILS.pop(h, None)   # 窗口已过：放行真实探测
+    return False
+
+
+def _cb_fail(url):
+    h = _cb_host(url)
+    if h:
+        _CB_FAILS[h] = time.time()
+
+
+def _cb_ok(url):
+    h = _cb_host(url)
+    if h:
+        _CB_FAILS.pop(h, None)
+
+
 # requests 在部分 TVBox/Chaquopy Python 环境未内置；缺失时用标准库 urllib 实现
 # 一个等价 shim（覆盖本文件用到的全部 API：Session/get/post/head、resp.text/
 # content/status_code/headers.get/encoding/json/raise_for_status/url、
@@ -139,6 +180,8 @@ except Exception:
 
     def _request(method, url, headers=None, data=None, timeout=15,
                  verify=True, allow_redirects=True, params=None, **_kw):
+        if _cb_blocked(url):
+            raise _ReqException("circuit open: " + _cb_host(url))
         m = (method or "GET").upper()
         if params:
             try:
@@ -179,6 +222,7 @@ except Exception:
             hdrs = resp.headers
             body = _decompress(body, hdrs)
             status = getattr(resp, "status", None) or resp.getcode()
+            _cb_ok(url)
             return _Resp(resp.geturl(), status, hdrs, body)
         except _HTTPError as he:
             # 4xx/5xx：requests 不在此抛错，构造响应交由 raise_for_status 处理
@@ -188,8 +232,10 @@ except Exception:
                 body = b""
             hdrs = getattr(he, "headers", {}) or {}
             body = _decompress(body, hdrs)
+            _cb_ok(url)   # 服务器有响应 = 主机可达，连通性熔断清零
             return _Resp(url, getattr(he, "code", 0), hdrs, body)
         except (_URLError, Exception) as e:
+            _cb_fail(url)   # 连接级失败（超时/拒绝/SSL）→ 记入熔断
             raise _ReqException(str(e))
 
     class _Session(object):
@@ -6852,16 +6898,21 @@ class _HuangguoSpider(_BaseSpider):
         if not self._host_pinned:
             self._host_pinned = True
             self._pin_host(self.host)
+        if _cb_blocked(url):
+            return ""          # 该主机刚失败过：直接快速失败，绝不重试等超时
         for attempt in range(3):
             for kw in ({"verify": False}, {}):
+                if _cb_blocked(url):
+                    return ""
                 try:
                     r = requests.get(url, headers=self.header, timeout=15, **kw)
                     if r.status_code == 200:
+                        _cb_ok(url)
                         return r.text
                 except (TypeError, ValueError):
                     continue
                 except Exception:
-                    pass
+                    _cb_fail(url)   # 连接级失败 → 打开熔断，后续重试瞬时跳过
         return ""
 
     def fix_url(self, url):
@@ -10826,8 +10877,13 @@ class _MadouSpider(_BaseSpider):
 #    入参编码: input=quoted({"json": {...}}) —— tRPC superjson 惯例
 #    分类(下沉为 cate 筛选): 首页推荐 / 短剧 / 成人短剧 / 正规短剧
 #    成人 / 正规分流按 drama.tags 判定(adult- 前缀 / 含「不伦」「偷情」)
-#    播放: 有分集 id 直接拼 raw.shorttv.online 直链 mp4；否则抓 /zh/watch 页面
-#          解析地址，再退到 cdn 多条镜像逐个探活，最后用列表里的 trailerUrl 兜底
+#    播放: 先按分集 id 探 raw.shorttv.online 直链 mp4(老形态,一次探活定音)；
+#          404 就抓 /zh/watch 页面取真实资源——新形态剧集走 rccdn 网关(hlsUrl 是
+#          /__rc/media/..., 无会话直连 403)，真地址在 playbackSession.exchange_token
+#          的 assets 里，直挂 https://rccdn.cc/<key> 可取；老形态页面给
+#          /api/media/.../master.m3u8。再退 cdn 镜像逐个探活，最后 trailerUrl 兜底。
+#          分集 accessState=LOCKED 是源站付费集(不下发任何地址)，选集里标「需解锁」，
+#          playerContent 直接 0 延迟返回空地址，不让播放器长时间转圈。
 #    封面: 站点直链 + _minimize.webp 缩略，lsj 目录纠正到 raw 域名
 #    换域名救急: 壳里传 {"kbApiBase": "https://..."}（用专属 key，不与其它
 #                引擎共用的 apiBase 打架）
@@ -11002,11 +11058,17 @@ class _KuangbiaoSpider(_BaseSpider):
             total = max(1, min(_kb_int(m.group(1), 12) if m else 12, 80))
             eps = self._episodes(vid)
             if eps:
-                play = "#".join([
-                    "第%d集$%s/%d/%s" % (
-                        i, vid, i,
-                        (eps[i - 1].get("id") if i - 1 < len(eps) and isinstance(eps[i - 1], dict) else ""))
-                    for i in range(1, total + 1)])
+                # 以接口分集数为准，remarks 里的数字只作兜底，免得出现点不开的“幽灵集”
+                total = max(1, min(len(eps), 80))
+                names = []
+                for i in range(1, total + 1):
+                    e = eps[i - 1] if i - 1 < len(eps) and isinstance(eps[i - 1], dict) else {}
+                    name = "第%d集" % i
+                    # 付费锁定集源站不下发地址，选集里先标出来，点开立刻失败不空转
+                    if str(e.get("accessState") or "") == "LOCKED":
+                        name += "（需解锁）"
+                    names.append("%s$%s/%d/%s" % (name, vid, i, e.get("id") or ""))
+                play = "#".join(names)
             else:
                 play = "第1集$%s/1/%s" % (vid, it.get("firstEpisodeId", ""))
             out.append({"vod_id": vid, "vod_name": it.get("vod_name", vid),
@@ -11046,18 +11108,36 @@ class _KuangbiaoSpider(_BaseSpider):
         vid, ep, eid = (str(id).split("/") + ["1", ""])[:3]
         url = ""
         html = ""
+        n = _kb_int(ep, 1)
+        eps = self.eps.get(vid)
+        if not eps:
+            eps = self._episodes(vid) or []
+        if 0 < n <= len(eps) and isinstance(eps[n - 1], dict):
+            eid = eid or str(eps[n - 1].get("id") or "")
+            # 源站付费锁定的分集：watch 页 hlsUrl=null、不下发任何地址，
+            # 别再去猜直链(会 404 转圈)，直接快速失败让播放器立刻报错。
+            if str(eps[n - 1].get("accessState") or "") == "LOCKED":
+                return {"parse": 0, "url": "", "header": json.dumps({
+                    "User-Agent": self.headers["User-Agent"],
+                    "Referer": self.host + "/zh/", "Origin": self.host})}
+        # 快速路径：直链存在就直接给（老形态剧集，一个请求定音）
         if eid:
-            url = _KB_RAW_HOST + "/uploads/direct/" + eid + "/video.mp4"
+            u = _KB_RAW_HOST + "/uploads/direct/" + eid + "/video.mp4"
+            if self._alive(u):
+                url = u
+        # 直链 404（新形态剧集走 rccdn 网关，/uploads/direct 不存在）：读播放页取真实资源
         if not url:
             try:
                 watch = self.host + "/zh/watch/" + vid + "/" + ep
                 html = self.session.get(watch, headers={
                     "User-Agent": self.headers["User-Agent"], "Referer": watch}, timeout=12).text
             except Exception:
-                pass
+                html = ""
+            url = self._page_play_url(html)
+        if not url:
             url = self._media(html)
         if not url:
-            eid = self._eid(html)
+            eid = self._eid(html) or eid
             arr = []
             if eid:
                 arr = [_KB_RAW_HOST + "/uploads/direct/" + eid + "/video.mp4",
@@ -11075,6 +11155,35 @@ class _KuangbiaoSpider(_BaseSpider):
         return {"parse": 0 if url else 1, "url": self._unesc(url),
                 "header": json.dumps({"User-Agent": self.headers["User-Agent"],
                                       "Referer": self.host + "/zh/", "Origin": self.host})}
+
+    def _page_play_url(self, html):
+        """播放页真实媒体：新形态走 playbackSession.exchange_token 的 assets
+        （/__rc/media 网关无会话直连 403，assets key 直挂 rccdn.cc 可取），
+        老形态取 hlsUrl（/api/media/centaurus/hls/...m3u8）。"""
+        if not html:
+            return ""
+        h = self._unesc(html).replace('\\"', '"')
+        m = re.search(r'exchange_token":"([A-Za-z0-9_.-]{20,})', h)
+        if m:
+            try:
+                payload = m.group(1).split(".")[0]
+                payload += "=" * (-len(payload) % 4)
+                data = json.loads(base64.urlsafe_b64decode(payload))
+                for asset in (data.get("assets") or []):
+                    key = str((asset or {}).get("key") or "")
+                    ctype = str((asset or {}).get("content_type") or "")
+                    if key and "video" in ctype:
+                        return "https://rccdn.cc/" + key
+            except Exception:
+                pass
+        m = re.search(r'hlsUrl":"([^"]+)"', h)
+        if m:
+            u = m.group(1)
+            if u.startswith("/"):
+                u = self.host + u
+            if ".m3u8" in u and "/__rc/media/" not in u:
+                return u
+        return ""
 
     # ---------------------------------------------------------- 内部工具
     def _enc(self, o):
