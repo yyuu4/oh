@@ -1,8 +1,14 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-VERSION = "1.6.9"
+VERSION = "1.6.10"
 VERSION_NOTE = (
+    "1.6.10 对照实验收口：64位 OK影视(手机/模拟器)弹幕+播放全正常，32位盒子起播几秒闪退"
+    "→ 定性为 32 位起播窗口并发取数撞车，非弹幕格式/投递问题。播放路径归零："
+    "① /hg_dm 只读缓存(_dm_state)，冷缓存回空 XML 不阻塞、不起取数线程；"
+    "② playerContent 不再预热取数(只挂 URL)——取数唯一入口留 detailContent"
+    "(进详情页时还没起播，2路取数与视频缓冲不再同窗口)；"
+    "③ 播完这集若冷，下集进 detail 或重进详情仍会补热。"
     "1.6.9 修 1.6.8 遗留：起播瞬间仍重启——+2.5s 错峰把弹幕取数精确推进视频缓冲窗口，"
     "且播放器自打 /hg_dm 冷缓存仍立刻 4 路并发取数，与起跑线撞车。三刀："
     "① 弹幕预热前移 detailContent(同会话预热时机，进详情页即取，点播时缓存已热)；"
@@ -2077,7 +2083,9 @@ class _StreamHandler(BaseHTTPRequestHandler):
             _DM_HIT[vid] = time.time()
         except Exception:
             pass
-        state = _dm_get(vid, sid, did, iid, wait=_DM_WAIT)
+        # 1.6.10: 播放中来取只读缓存——绝不在视频缓冲窗口起取数线程/阻塞等待
+        # (32位盒子起播几秒闪退根因)。取数入口只留 detailContent 预热。
+        state = _dm_state(vid)
         items = state.get("items") or []
         if parsed.path.rstrip("/").endswith("debug"):
             payload = {
@@ -5916,12 +5924,7 @@ class Spider(_BaseSpider):
             "iid": self.install_id or "",
         })
         url = "http://127.0.0.1:%d/hg_dm?%s" % (port, query)
-        # 1.6.9: 立即预热(不睡)——抢在壳发 /hg.mp4 之前起跑；detail 页通常已预热过，
-        # 此处 _dm_get 命中 TTL 直接返回零开销。冷时单飞起 2 路取数(wait=0 不阻塞)。
-        try:
-            _dm_get(vid, sid, self.device_id or "", self.install_id or "", wait=0)
-        except Exception:
-            pass
+        # 1.6.10: 只挂 URL 不取数——起播窗口零额外线程；detail 页已预热过则 /hg_dm 直接命中。
         _dm_push_local(url, vid)
         label = "红果弹幕"
         if _DM_IN_PLAYER == "url":
@@ -6155,8 +6158,8 @@ class Spider(_BaseSpider):
                 ).start()
             except Exception:
                 pass
-            # 1.6.9: 弹幕同机预热——进详情页即取，点播时缓存已热，
-            # /hg_dm 不再在起播瞬间冷取(与会话预热并行，此时还没起播，可承受)。
+            # 1.6.10: 弹幕取数唯一入口——进详情页即取(此时未起播，可承受)，
+            # 点播时缓存已热，/hg_dm 与 playerContent 均不再起取数。
             try:
                 _dm_get(first_vid, sid, self.device_id or "", self.install_id or "", wait=0)
             except Exception:
