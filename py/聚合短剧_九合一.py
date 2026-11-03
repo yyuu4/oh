@@ -1,5 +1,22 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
+#  更新简介（按修复先后排列，最新一条在最后）
+#  1. 红果(HG)补设备注册 + 空模型旋转重试（设备对只落盘成功注册的对）；
+#     聚合(AG)好看线路 url 由 list 改为字符串
+#  2. 红果(HG)不能播放：播放链路对齐 h红果.py——本机 Range 流(206)优先、
+#     壳代理仅作回退（原为壳代理优先，且壳代理对 Range 请求也回 200 +
+#     整片，无 Content-Range，导致起播慢、暂停/拖动异常）
+#  3. 狂飙(KB)部分短剧播放不了、转圈：先探老直链 mp4，404 则抓播放页解
+#     playbackSession.exchange_token 取 rccdn.cc 真实媒体（新增
+#     _page_play_url()），再退 cdn 镜像、trailer 兜底；付费锁定集由
+#     playerContent 0 延迟返回空地址，不再长时间转圈
+#  4. 防卡死：新增单主机熔断（同域连接级失败后 60s 内直接快速失败，
+#     成功一次即清零），接入通用 _request 与黄果 getHtml——黄果单次
+#     请求 6×15s=90s 的卡死降为秒级快速失败
+#  5. 黄果引擎整体移植：死站 huangguoai.com → 活站 huangguoai.fit
+#     （参照 hhgdj.py），新增 9 个分类 + 8 组筛选（HGUO::root 统一下发、
+#     按分类清洗参数），保留 DoH / 熔断 / 本机代理(eng=hguo) 契约
+# =====================================================================
 #  聚合短剧 · 九合一
 #     (红果 + 黄豆 + 黄果 + 野果 + 禁果 + 红果黄剧 + 聚合短剧[短] + 2048短剧 + 狂飙短剧)
 #  由 __.py(红果) / ____.py(黄豆) / 黄果短剧修复DNS.py(黄果) / 野果.py(野果)
@@ -6661,8 +6678,9 @@ def _ag_51_parse_search(html, proxy_fn):
 
 
 # =====================================================================
-#  ENGINE HGUO · 黄果短剧 (原 黄果短剧修复DNS.py 单文件 Spider 融合)
-#    type_id / vod_id 前缀: HGUO::      播放线路名: 黄果短剧
+#  ENGINE HGUO · 黄果剧场 (参照 hhgdj.py 1.5.1 移植 huangguoai.fit)
+#    type_id / vod_id 前缀: HGUO::      播放线路名: 黄果剧场
+#    9 个分类 + 8 组筛选（统一入口 HGUO::root 扁平下发，_hguo_filter_ext 按分类清洗）
 #    本机代理: 封面图 / m3u8 / ts / key 一律带 &eng=hguo，与红果代理互不干扰
 #    DNS: 内置 DoH(腾讯/阿里/Google/Cloudflare 轮询)，绕开 DNS 污染与劫持
 # =====================================================================
@@ -6817,82 +6835,617 @@ def _hguo_pv(param, key):
     return str(v or "")
 
 
+# ---- 黄果剧场 · 参照 hhgdj.py(1.5.1) 移植 huangguoai.fit ----
+#    9 个分类 + 8 组筛选（分类/排序/尺度分级/情节标签/人设标签/类型/性别/时间范围）；
+#    卡片流 HTML 解析、series/photo/role/video 四类详情、HLS 变体优选后走本机代理。
+#    整体替换原 huangguoai.com 卡片流引擎（源站已不可达，原 90s 卡死源头）。
+from html import unescape as _hguo_unescape
+
+_HGUO_BASE = "https://huangguoai.fit"
+_HGUO_PAGE_SIZE = 20
+_HGUO_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+_HGUO_CATEGORIES = [
+    {"type_id": "latest", "type_name": "最新发布"},
+    {"type_id": "all", "type_name": "全部视频"},
+    {"type_id": "1", "type_name": "MV/音乐剧"},
+    {"type_id": "2", "type_name": "短片"},
+    {"type_id": "3", "type_name": "连续剧"},
+    {"type_id": "4", "type_name": "片段"},
+    {"type_id": "photos", "type_name": "图集"},
+    {"type_id": "roles", "type_name": "角色"},
+    {"type_id": "ranking", "type_name": "排行榜"},
+]
+# 筛选组：统一入口 HGUO::root 下 8 组扁平展示。
+# 各分类不认的键由 _hguo_filter_ext 清洗；人设标签 UI 键用 rtags，进 URL 时映射成站点的 tags。
+_HGUO_OPT_SORT = {"key": "sort", "name": "排序", "init": "newest", "value": [
+    {"n": "最新发布", "v": "newest"},
+    {"n": "最多播放", "v": "views"},
+    {"n": "最多收藏", "v": "favorites"},
+    {"n": "最多作品", "v": "works"},
+]}
+_HGUO_OPT_RATING = {"key": "rating", "name": "尺度分级", "init": "", "value": [
+    {"n": "全部", "v": ""},
+    {"n": "安全", "v": "1"},
+    {"n": "裸露", "v": "2"},
+    {"n": "限制级", "v": "3"},
+]}
+_HGUO_OPT_TAGS = {"key": "tags", "name": "情节标签", "init": "", "value": [
+    {"n": "全部", "v": ""},
+    {"n": "都市", "v": "1"},
+    {"n": "人妻", "v": "2"},
+    {"n": "同人", "v": "4"},
+    {"n": "校园", "v": "5"},
+    {"n": "职场", "v": "6"},
+    {"n": "古风", "v": "7"},
+    {"n": "乱伦", "v": "8"},
+    {"n": "NTR", "v": "9"},
+    {"n": "玄幻", "v": "40"},
+    {"n": "欧美", "v": "57"},
+    {"n": "露出", "v": "42"},
+    {"n": "二次元", "v": "59"},
+    {"n": "女同", "v": "55"},
+    {"n": "男同", "v": "56"},
+    {"n": "穿越", "v": "39"},
+    {"n": "衍生", "v": "3"},
+]}
+_HGUO_OPT_RTAGS = {"key": "rtags", "name": "人设标签", "init": "", "value": [
+    {"n": "全部", "v": ""},
+    {"n": "知性", "v": "53"},
+    {"n": "御姐", "v": "43"},
+    {"n": "人妻", "v": "2"},
+    {"n": "冷艳", "v": "51"},
+    {"n": "清纯", "v": "49"},
+    {"n": "甜美", "v": "50"},
+    {"n": "活力", "v": "44"},
+    {"n": "傲娇", "v": "52"},
+    {"n": "大小姐", "v": "54"},
+    {"n": "学生", "v": "46"},
+    {"n": "年轻", "v": "48"},
+    {"n": "OL", "v": "47"},
+    {"n": "熟女", "v": "45"},
+    {"n": "网红", "v": "41"},
+]}
+_HGUO_OPT_TYPE = {"key": "type", "name": "类型", "init": "", "value": [
+    {"n": "全部", "v": ""},
+    {"n": "真人", "v": "1"},
+    {"n": "二次元", "v": "2"},
+]}
+_HGUO_OPT_GENDER = {"key": "gender", "name": "性别", "init": "", "value": [
+    {"n": "全部", "v": ""},
+    {"n": "男", "v": "1"},
+    {"n": "女", "v": "2"},
+]}
+_HGUO_OPT_RANK_TIME = {"key": "p", "name": "时间范围", "init": "24h", "value": [
+    {"n": "6小时", "v": "6h"},
+    {"n": "24小时", "v": "24h"},
+    {"n": "7天", "v": "7d"},
+]}
+_HGUO_FILTER_KEYS = ("sort", "rating", "tags", "type", "gender", "p")
+
+_hguo_card_re = re.compile(r'<article class="(?:video-card|search-content-card|photo-card)[\s\S]*?</article>')
+_hguo_role_card_re = re.compile(r'<a[^>]*href="(/role/[a-z0-9-]+)"[^>]*class="[^"]*role-card[^"]*"[^>]*>')
+_hguo_title_re = re.compile(r'<p class="[^"]*font-(?:card-title|display)[^"]*"[^>]*>([^<]*)</p>')
+_hguo_pic_re = re.compile(r'<img[^>]*src="([^"]*)"')
+_hguo_alt_re = re.compile(r'<img[^>]*alt="([^"]+)"')
+_hguo_pill_re = re.compile(r'cover-pill-text[^>]*>([^<]*)<')
+_hguo_remark_re = re.compile(r'bg-black/(?:50|55)[^>]*>([^<]*)<')
+_hguo_meta_p_re = re.compile(r'<p class="[^"]*font-mono-meta[^"]*"[^>]*>([^<]*)</p>')
+_hguo_href_re = re.compile(r'<a[^>]+href="([^"]*)"')
+_hguo_h1_re = re.compile(r'<h1[^>]*>([^<]*)</h1>')
+_hguo_desc_re = re.compile(r'<meta name="description" content="([^"]*)"')
+_hguo_ogimg_re = re.compile(r'<meta property="og:image" content="([^"]*)"')
+_hguo_poster_re = re.compile(r'data-poster="([^"]*)"')
+_hguo_hls_re = re.compile(r'data-hls="([^"]*)"')
+_hguo_total_re = re.compile(r'全(\d+)\s*集')
+_hguo_ep_chip_re = re.compile(r'<a[^>]*href="/video/([a-z0-9-]+)"[^>]*class="[^"]*series-ep-chip[^"]*"[^>]*title="第(\d+)集[^"]*"')
+_hguo_photo_video_re = re.compile(r'data-video="([^"]+)"')
+_hguo_badge_re = re.compile(r'<span class="badge">([^<]*)</span>')
+_hguo_counter_re = re.compile(r'viewer-counter[^>]*>\s*\d+\s*/\s*(\d+)')
+_hguo_vcard_start_re = re.compile(r'<a[^>]*class="vcard"')
+_hguo_vwork_href_re = re.compile(r'href="(/(?:video|photo|series)/[a-z0-9-]+)"')
+_hguo_vwork_title_re = re.compile(r'<div class="vcard-title">([^<]*)</div>')
+_hguo_bgimg_re = re.compile(r'background-image:url\(([^)]+)\)')
+
+
+def _hguo_filter_ext(cat, ext):
+    """按分类清洗筛选参数：只留该分类认的键与合法取值，人设标签 rtags → 站点 URL 键 tags。"""
+    if not isinstance(ext, dict):
+        return {}
+
+    def pick(k):
+        v = ext.get(k)
+        if v is None or v == "":
+            v = ext.get(k + "#")
+        if isinstance(v, (list, tuple)):
+            v = v[0] if v else ""
+        return v
+
+    out = {}
+    if cat == "ranking":
+        v = pick("p")
+        if v:
+            out["p"] = v
+        return out
+    v = pick("sort")
+    if v:
+        if cat == "roles":
+            if str(v) in ("newest", "views", "works"):
+                out["sort"] = v
+        elif str(v) in ("newest", "views", "favorites"):
+            out["sort"] = v
+    if cat == "roles":
+        v = pick("rtags")
+        if v:
+            out["tags"] = v
+        for k in ("type", "gender"):
+            v = pick(k)
+            if v:
+                out[k] = v
+    else:
+        for k in ("rating", "tags"):
+            v = pick(k)
+            if v:
+                out[k] = v
+    return out
+
+
+def _hguo_build_url(cat, pg, keyword="", ext=None):
+    if cat == "latest":
+        url = "%s/videos" % _HGUO_BASE
+    elif cat == "photos":
+        url = "%s/photos" % _HGUO_BASE
+    elif cat == "roles":
+        url = "%s/roles" % _HGUO_BASE
+    elif cat == "ranking":
+        url = "%s/ranking" % _HGUO_BASE
+    else:
+        url = "%s/videos?category=%s" % (_HGUO_BASE, quote(str(cat)))
+    if keyword:
+        url += ("&" if "?" in url else "?") + "q=" + quote(keyword)
+    if ext:
+        for k in _HGUO_FILTER_KEYS:
+            v = ext.get(k) or ext.get(k + "#")
+            if isinstance(v, (list, tuple)):
+                v = ",".join(str(x) for x in v if x)
+            if v:
+                url += ("&" if "?" in url else "?") + "%s=%s" % (k, quote(str(v), safe=","))
+    page = max(1, int(pg) if str(pg).isdigit() else 1)
+    if page > 1:
+        url += ("&" if "?" in url else "?") + "page=%d" % page
+    return url
+
+
+def _hguo_search_url(keyword, pg):
+    url = "%s/search?q=%s" % (_HGUO_BASE, quote(str(keyword or "")))
+    page = max(1, int(pg) if str(pg).isdigit() else 1)
+    if page > 1:
+        url += "&page=%d" % page
+    return url
+
+
 class _HuangguoSpider(_BaseSpider):
-    """黄果短剧 (huangguoai.com)：卡片流解析 + 专辑/榜单/吃瓜 + m3u8 本机代理。"""
+    """黄果剧场 (huangguoai.fit)：hhgdj.py 同源移植 + 本机代理 / DoH / 单主机熔断。"""
+
+    _hls_cache = {}         # code -> master m3u8（同 hhgdj）
+    _detail_cache = {}      # ident -> detail result
+    _variant_cache = {}     # master url -> 优选后的变体 url
 
     def __init__(self):
-        self.name = "黄果短剧"
-        self.host = "https://huangguoai.com"
+        self.name = "黄果剧场"
+        self.host = _HGUO_BASE
         self.header = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "Referer": self.host,
+            "User-Agent": _HGUO_UA,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "zh-CN,zh;q=0.9"
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Referer": _HGUO_BASE + "/",
         }
-        self.cat_map = [
-            {"type_id": "ai-duanju", "type_name": "AI成人短剧", "path": "/ai-duanju/", "api": "ai-duanju",
-             "tabs": [{"v": "latest", "n": "最新更新", "q": "sort=latest"},
-                      {"v": "hot", "n": "当前热播", "q": ""},
-                      {"v": "original", "n": "独家原创", "q": "is_original=1"},
-                      {"v": "random", "n": "随机推荐", "q": "sort=random&size=20"}]},
-            {"type_id": "ai-manju", "type_name": "AI成人漫剧", "path": "/ai-manju/", "api": "ai-manju",
-             "tabs": [{"v": "latest", "n": "最新更新", "q": "sort=latest"},
-                      {"v": "hot", "n": "当前热播", "q": ""},
-                      {"v": "original", "n": "独家原创", "q": "is_original=1"},
-                      {"v": "random", "n": "随机推荐", "q": "sort=random&size=20"}]},
-            {"type_id": "ai-huanlian", "type_name": "AI换脸", "path": "/ai-huanlian/", "api": "ai-huanlian",
-             "tabs": [{"v": "latest", "n": "最新更新", "q": "sort=latest"},
-                      {"v": "hot", "n": "当前热播", "q": ""},
-                      {"v": "original", "n": "独家原创", "q": "is_original=1"},
-                      {"v": "random", "n": "随机推荐", "q": "sort=random&size=20"}]},
-            {"type_id": "ai-mogai", "type_name": "AI魔改", "path": "/ai-mogai/", "api": "ai-mogai",
-             "tabs": [{"v": "latest", "n": "最新更新", "q": "sort=latest"},
-                      {"v": "hot", "n": "当前热播", "q": ""},
-                      {"v": "original", "n": "独家原创", "q": "is_original=1"},
-                      {"v": "random", "n": "随机推荐", "q": "sort=random&size=20"}]},
-            {"type_id": "topic", "type_name": "专题", "path": "/topics/", "kind": "topic"},
-            {"type_id": "rank", "type_name": "排行榜", "path": "/ranks/hot/", "kind": "rank",
-             "tabs": [{"v": "hot", "n": "热播榜", "path": "/ranks/hot/"},
-                      {"v": "potential", "n": "潜力榜", "path": "/ranks/potential/"},
-                      {"v": "recommend", "n": "推荐榜", "path": "/ranks/recommend/"}]},
-            {"type_id": "chigua", "type_name": "黄果吃瓜", "path": "/chigua/", "kind": "chigua",
-             "tabs": [{"v": "latest", "n": "最新吃瓜", "path": "/chigua/"},
-                      {"v": "remen", "n": "热门吃瓜", "path": "/chigua/remen/"},
-                      {"v": "yuanchuang", "n": "AI原创", "path": "/chigua/yuanchuang/"}]}
-        ]
-        self.key = bytes(int(c) for c in "102_53_100_57_54_53_100_102_55_53_51_51_54_50_55_48".split("_"))
-        self.iv = bytes(int(c) for c in "57_55_98_54_48_51_57_52_97_98_99_50_102_98_101_49".split("_"))
-        self.filter_map = {"": {}}
         self._host_pinned = False
         _hguo_install_doh()
 
     def getName(self):
         return self.name
 
-    # 壳不选分类时（只点标签、没动筛选）默认走「首页推荐」，保证一进去就有内容
-    _HGUO_HOME_KEYS = ("", "home", "root", "首页推荐", "推荐", "首页")
-
-    def filter_meta(self):
-        """给统一入口用的筛选：分类 + 子分类（跨分类按显示名去重）。
-        第一项固定「首页推荐」= 站点首页卡片流，也是壳不传筛选时的默认。"""
-        cate_vals = [{"n": "首页推荐", "v": "home"}]
-        cate_vals += [{"n": c["type_name"], "v": c["type_id"]} for c in self.cat_map]
-        seen = set()
-        sub_vals = []
-        for c in self.cat_map:
-            for t in (c.get("tabs") or []):
-                nm = t.get("n")
-                if nm and nm not in seen:
-                    seen.add(nm)
-                    sub_vals.append({"n": nm, "v": t.get("v")})
-        groups = [{"key": "cate", "name": "分类", "value": cate_vals}]
-        if sub_vals:
-            groups.append({"key": "sub", "name": "子分类", "value": sub_vals})
-        return groups
-
     def init(self, extend=""):
         pass
 
+    def destroy(self):
+        self._hls_cache = {}
+        self._detail_cache = {}
+        self._variant_cache = {}
+
+    # ---------- 首页 / 筛选 ----------
+    def filter_meta(self):
+        """统一入口 HGUO::root 的 8 组扁平筛选（键与 _hguo_filter_ext 约定一致）。"""
+        return [
+            {"key": "cate", "name": "分类",
+             "value": [{"n": c["type_name"], "v": c["type_id"]} for c in _HGUO_CATEGORIES]},
+            dict(_HGUO_OPT_SORT),
+            dict(_HGUO_OPT_RATING),
+            dict(_HGUO_OPT_TAGS),
+            dict(_HGUO_OPT_RTAGS),
+            dict(_HGUO_OPT_TYPE),
+            dict(_HGUO_OPT_GENDER),
+            dict(_HGUO_OPT_RANK_TIME),
+        ]
+
+    def homeContent(self, filter):
+        result = {"class": [{"type_id": c["type_id"], "type_name": c["type_name"]}
+                            for c in _HGUO_CATEGORIES]}
+        if filter:
+            video_groups = [_HGUO_OPT_SORT, _HGUO_OPT_RATING, _HGUO_OPT_TAGS]
+            result["filters"] = {
+                "latest": [_HGUO_OPT_SORT],
+                "all": video_groups, "1": video_groups, "2": video_groups,
+                "3": video_groups, "4": video_groups,
+                "photos": [_HGUO_OPT_SORT, _HGUO_OPT_RATING, _HGUO_OPT_TAGS],
+                "roles": [_HGUO_OPT_SORT, _HGUO_OPT_TYPE, _HGUO_OPT_GENDER, _HGUO_OPT_RTAGS],
+                "ranking": [_HGUO_OPT_RANK_TIME],
+            }
+        try:
+            result["list"] = self.homeVideoContent().get("list", [])
+        except Exception:
+            pass
+        return result
+
+    def homeVideoContent(self):
+        try:
+            return self._list("latest", 1)
+        except Exception as e:
+            return {"list": [], "page": 1, "pagecount": 1, "limit": _HGUO_PAGE_SIZE,
+                    "total": 0, "msg": "首页推荐加载失败：" + self._err(e)}
+
+    # ---------- 列表 / 搜索 ----------
+    def categoryContent(self, tid, pg, filter, extend):
+        del filter
+        page = max(1, int(pg) if str(pg).isdigit() else 1)
+        cat = str(tid or "").strip()
+        if cat not in {c["type_id"] for c in _HGUO_CATEGORIES}:
+            cat = "latest"      # 空值 / 未知值一律回最新发布，防白板
+        ext = _hguo_filter_ext(cat, extend)
+        try:
+            return self._list(cat, page, "", ext)
+        except Exception as e:
+            return {"list": [], "page": page, "pagecount": 1, "limit": _HGUO_PAGE_SIZE,
+                    "total": 0, "msg": "分类加载失败：" + self._err(e)}
+
+    def _list(self, cat, pg, keyword="", ext=None):
+        url = _hguo_build_url(cat, pg, keyword, ext)
+        html = self.getHtml(url)
+        page = max(1, int(pg) if str(pg).isdigit() else 1)
+        if not html:
+            return {"list": [], "page": page, "pagecount": 1, "limit": _HGUO_PAGE_SIZE,
+                    "total": 0, "msg": "列表加载失败（站点无响应）"}
+        if cat == "roles":
+            cards = []
+            for m in _hguo_role_card_re.finditer(html):
+                code = m.group(1).rstrip("/").split("/")[-1]
+                start = m.start()
+                end = html.find("</a>", start)
+                if end < 0:
+                    continue
+                inner = html[start:end]
+                title = " ".join(self._clean(inner, _hguo_title_re).split())
+                if not title:
+                    title = self._clean(inner, _hguo_alt_re)
+                bg = self._first(_hguo_bgimg_re, inner)
+                pic = self.proc_pic(bg.split(",")[0].strip()) if bg else ""
+                cards.append({
+                    "vod_id": "role/%s" % code,
+                    "vod_name": title,
+                    "vod_pic": pic,
+                    "vod_remarks": self._remark(inner),
+                    "vod_type": "角色",
+                    "style": {"type": "rect", "ratio": 1.0},
+                })
+        else:
+            cards = [c for c in (self._parse_card(b) for b in _hguo_card_re.findall(html)) if c]
+        return {
+            "list": cards,
+            "page": page,
+            "pagecount": 9999,
+            "limit": _HGUO_PAGE_SIZE,
+            "total": len(cards) * 9999 if len(cards) else 0,
+        }
+
+    def _parse_card(self, block):
+        href_m = _hguo_href_re.search(block)
+        if not href_m:
+            return None
+        href = href_m.group(1)
+        if href.startswith("/series/"):
+            kind = "series"
+        elif href.startswith("/photo/"):
+            kind = "photo"
+        elif href.startswith("/role/"):
+            kind = "role"
+        else:
+            kind = "video"
+        code = href.rstrip("/").split("/")[-1]
+        title = " ".join(self._clean(block, _hguo_title_re).split())
+        if not title:
+            title = self._clean(block, _hguo_alt_re)
+        pic = self.proc_pic(self._clean(block, _hguo_pic_re))
+        type_map = {"series": "连续剧", "photo": "图集", "role": "角色", "video": "视频"}
+        return {
+            "vod_id": "%s/%s" % (kind, code),
+            "vod_name": title,
+            "vod_pic": pic,
+            "vod_remarks": self._remark(block),
+            "vod_type": type_map.get(kind, "视频"),
+            "style": {"type": "rect", "ratio": 0.75},
+        }
+
+    def searchContent(self, key, quick=False, pg="1"):
+        del quick
+        page = max(1, int(pg) if str(pg).isdigit() else 1)
+        try:
+            return self._search(str(key or ""), page)
+        except Exception as e:
+            return {"list": [], "page": page, "pagecount": 1, "limit": _HGUO_PAGE_SIZE,
+                    "total": 0, "msg": "搜索失败：" + self._err(e)}
+
+    def _search(self, keyword, pg):
+        html = self.getHtml(_hguo_search_url(keyword, pg))
+        page = max(1, int(pg) if str(pg).isdigit() else 1)
+        if not html:
+            return {"list": [], "page": page, "pagecount": 1, "limit": _HGUO_PAGE_SIZE,
+                    "total": 0, "msg": "搜索失败（站点无响应）"}
+        cards = [c for c in (self._parse_card(b) for b in _hguo_card_re.findall(html)) if c]
+        return {"list": cards, "page": page, "pagecount": 9999,
+                "limit": _HGUO_PAGE_SIZE, "total": len(cards)}
+
+    # ---------- 详情 ----------
+    def detailContent(self, ids):
+        ident = ids[0] if isinstance(ids, (list, tuple)) else ids
+        ident = str(ident or "")
+        if ident in self._detail_cache:
+            return self._detail_cache[ident]
+        try:
+            item = self._parse_detail(ident)
+            if not item.get("vod_play_url"):
+                result = {"list": [item], "msg": self._empty_msg(ident)}
+            else:
+                result = {"list": [item]}
+            self._detail_cache[ident] = result
+            return result
+        except Exception as e:
+            return {"list": [], "msg": "详情加载失败：" + self._err(e)}
+
+    @staticmethod
+    def _err(e):
+        name = type(e).__name__
+        code = getattr(e, "code", None)
+        if isinstance(code, int):
+            return "%s(%d)" % (name, code)
+        text = str(e).strip()
+        if text and text != name:
+            return "%s：%s" % (name, text[:80])
+        return name
+
+    @staticmethod
+    def _empty_msg(ident):
+        if str(ident).startswith("photo/"):
+            return "静态图集暂无可播放视频（OK影视不支持图片浏览）"
+        return "未能解析到播放地址"
+
+    def _parse_detail(self, ident):
+        parts = str(ident).split("/")
+        kind = parts[0]
+        code = parts[1] if len(parts) >= 2 else ident
+        item = {
+            "vod_id": ident,
+            "vod_name": "",
+            "vod_pic": "",
+            "vod_play_from": "黄果剧场",
+            "vod_play_url": "",
+        }
+        if kind == "series":
+            text = self.getHtml("%s/series/%s" % (_HGUO_BASE, code))
+            if not text:
+                raise RuntimeError("series page empty")
+            item["vod_name"] = self._first(_hguo_h1_re, text) or ""
+            item["vod_pic"] = self.proc_pic(
+                self._first(_hguo_ogimg_re, text) or self._first(_hguo_poster_re, text))
+            item["vod_content"] = self._first(_hguo_desc_re, text) or ""
+            total_m = _hguo_total_re.search(text)
+            eps = []
+            for m in _hguo_ep_chip_re.finditer(text):
+                eps.append((int(m.group(2)), m.group(1)))
+            eps.sort()
+            urls = ["第%d集$work:video/%s" % (ep_num, ep_code) for ep_num, ep_code in eps]
+            if not urls:
+                urls = ["正片$work:series/%s" % code]
+            if total_m:
+                item["vod_remark"] = "全%s集" % total_m.group(1)
+            if not item.get("vod_remark"):
+                item["vod_remark"] = self._series_remark(text)
+            item["vod_play_url"] = "#".join(urls)
+        elif kind == "photo":
+            self._fill_photo(item, code)
+        elif kind == "role":
+            self._fill_role(item, code)
+        else:
+            text = self.getHtml("%s/video/%s" % (_HGUO_BASE, code))
+            if not text:
+                raise RuntimeError("video page empty")
+            item["vod_name"] = self._first(_hguo_h1_re, text) or "正片"
+            item["vod_pic"] = self.proc_pic(
+                self._first(_hguo_poster_re, text) or self._first(_hguo_ogimg_re, text))
+            item["vod_content"] = self._first(_hguo_desc_re, text) or ""
+            master = self.fix_url(self._first(_hguo_hls_re, text))
+            if not master:
+                master = self._resolve_hls(code)
+            elif master not in self._hls_cache:
+                self._hls_cache[code] = master
+            item["vod_play_url"] = "正片$%s" % (master or "")
+        return item
+
+    def _series_remark(self, text):
+        m = _hguo_h1_re.search(text)
+        tail = text[m.end():m.end() + 500] if m else ""
+        meta = self._first(_hguo_meta_p_re, tail)
+        return " ".join(meta.split()) if meta else ""
+
+    def _fill_photo(self, item, code):
+        text = self.getHtml("%s/photo/%s" % (_HGUO_BASE, code))
+        if not text:
+            raise RuntimeError("photo page empty")
+        item["vod_name"] = self._first(_hguo_h1_re, text) or code
+        item["vod_pic"] = self.proc_pic(
+            self._first(_hguo_ogimg_re, text) or self._first(_hguo_poster_re, text))
+        item["vod_content"] = self._first(_hguo_desc_re, text) or ""
+        urls = []
+        for i, v in enumerate(_hguo_photo_video_re.findall(text), 1):
+            u = self.fix_url(_hguo_unescape(v).strip())
+            if u:
+                urls.append("第%d张$%s" % (i, u))
+        badges = _hguo_badge_re.findall(text)
+        remark = " ".join(_hguo_unescape(badges[-1]).split()) if badges else ""
+        if not remark:
+            counter = _hguo_counter_re.search(text)
+            if counter:
+                remark = "%s 张" % counter.group(1)
+        if remark:
+            item["vod_remark"] = remark
+        elif urls:
+            item["vod_remark"] = "共%d段" % len(urls)
+        item["vod_play_url"] = "#".join(urls)
+
+    def _fill_role(self, item, code):
+        text = self.getHtml("%s/role/%s" % (_HGUO_BASE, code))
+        if not text:
+            raise RuntimeError("role page empty")
+        item["vod_name"] = self._first(_hguo_h1_re, text) or code
+        item["vod_pic"] = self.proc_pic(
+            self._first(_hguo_ogimg_re, text) or self._first(_hguo_poster_re, text))
+        item["vod_content"] = self._first(_hguo_desc_re, text) or ""
+        starts = [m.start() for m in _hguo_vcard_start_re.finditer(text)]
+        urls = []
+        for i, start in enumerate(starts):
+            end = starts[i + 1] if i + 1 < len(starts) else len(text)
+            block = text[start:end]
+            href_m = _hguo_vwork_href_re.search(block)
+            if not href_m:
+                continue
+            rel = href_m.group(1).lstrip("/")
+            title = " ".join(self._clean(block, _hguo_vwork_title_re).split())
+            title = title.replace("$", " ").replace("#", " ").strip()
+            urls.append("%s$work:%s" % (title or "作品%d" % (i + 1), rel))
+        if urls:
+            item["vod_remark"] = "共%d部作品" % len(urls)
+        item["vod_play_url"] = "#".join(urls)
+
+    def _resolve_hls(self, code):
+        if code in self._hls_cache:
+            return self._hls_cache[code]
+        text = self.getHtml("%s/video/%s" % (_HGUO_BASE, code))
+        result = self.fix_url(self._first(_hguo_hls_re, text or ""))
+        if result:
+            self._hls_cache[code] = result
+        return result
+
+    def _resolve_photo_video(self, code):
+        key = "photo:%s" % code
+        if key in self._hls_cache:
+            return self._hls_cache[key]
+        text = self.getHtml("%s/photo/%s" % (_HGUO_BASE, code))
+        result = self.fix_url(self._first(_hguo_photo_video_re, text or ""))
+        self._hls_cache[key] = result
+        return result
+
+    def _resolve_series(self, code):
+        text = self.getHtml("%s/series/%s" % (_HGUO_BASE, code)) or ""
+        m = _hguo_ep_chip_re.search(text)
+        return self._resolve_hls(m.group(1)) if m else self._resolve_hls(code)
+
+    def _resolve_work(self, ident):
+        parts = str(ident).split("/")
+        kind = parts[0] if parts else ""
+        code = parts[1] if len(parts) >= 2 else ""
+        if not code:
+            return ""
+        if kind == "photo":
+            return self._resolve_photo_video(code)
+        if kind == "series":
+            return self._resolve_series(code)
+        return self._resolve_hls(code)
+
+    def _pick_variant(self, master_url):
+        """master m3u8 → 优选最高清晰度变体（同 hhgdj _pick_variant；失败原样返回）。"""
+        if not str(master_url or "").split("?")[0].lower().endswith(".m3u8"):
+            return master_url
+        if master_url in self._variant_cache:
+            return self._variant_cache[master_url]
+        txt = self.getHtml(master_url)
+        if not txt or "#EXT-X-STREAM-INF" not in txt:
+            self._variant_cache[master_url] = master_url
+            return master_url
+        base_dir = master_url.rsplit("/", 1)[0] + "/"
+        lines = txt.splitlines()
+        variants = []
+        for i, line in enumerate(lines):
+            if "#EXT-X-STREAM-INF" in line:
+                uri = ""
+                for j in range(i + 1, len(lines)):
+                    if lines[j].strip():
+                        uri = lines[j].strip()
+                        break
+                if not uri:
+                    continue
+                rm = re.search(r"RESOLUTION=(\d+)x(\d+)", line)
+                res = int(rm.group(2)) if rm else 0
+                bw = re.search(r"BANDWIDTH=(\d+)", line)
+                bwv = int(bw.group(1)) if bw else 0
+                variants.append((res, bwv, uri))
+        if not variants:
+            self._variant_cache[master_url] = master_url
+            return master_url
+        variants.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        uri = variants[0][2]
+        if uri.startswith("http://") or uri.startswith("https://"):
+            result = uri
+        elif uri.startswith("/"):
+            result = _HGUO_BASE + uri
+        else:
+            result = base_dir + uri
+        self._variant_cache[master_url] = result
+        return result
+
+    # ---------- 播放 ----------
+    def playerContent(self, flag, id, vipFlags=None):
+        try:
+            cur = str(id or "").split("#")[0]
+            sep = cur.rfind("$")
+            hls = cur[sep + 1:] if sep >= 0 else cur
+            if hls.startswith("work:"):
+                ident = hls[5:]
+                hls = self._resolve_work(ident)
+                if not hls:
+                    msg = ("静态图集无可播放视频" if ident.startswith("photo/")
+                           else "该作品暂无可播放地址")
+                    return {"parse": 0, "jx": 0, "url": "", "msg": msg, "header": ""}
+            url = self.fix_url(hls)
+            if not url.startswith(("http://", "https://")):
+                return {"parse": 0, "jx": 0, "url": "", "msg": "空播放地址", "header": ""}
+            playable = self._pick_variant(url)
+            return {
+                "parse": 0,
+                "jx": 0,
+                "playUrl": "",
+                "url": self.proxy_play(playable),
+                "header": json.dumps({"User-Agent": _HGUO_UA,
+                                      "Referer": _HGUO_BASE + "/"}),
+            }
+        except Exception as e:
+            return {"parse": 0, "jx": 0, "url": "", "msg": "播放失败：" + self._err(e),
+                    "header": ""}
+
+    # ---------- 抓取 / 工具（保留原引擎的熔断、DoH 预热、本机代理契约） ----------
     def getHtml(self, url):
         # 首次真正抓取时后台预热目标域名（不阻塞），避免 __init__ 里同步等网络
         if not self._host_pinned:
@@ -6970,568 +7523,37 @@ class _HuangguoSpider(_BaseSpider):
         except Exception:
             return "http://127.0.0.1:9978/proxy?do=py" + _HGUO_PROXY_MARK + "&url=" + quote(pic)
 
-    def extract_cards(self, html, link_prefix="detail|video"):
-        # 站点 2026-09 改版：详情链接从 /detail/{id}/ 换成 /video/{id}/，
-        # 默认两个前缀都认，避免再因改版整站空数据
-        result = []
-        seen = set()
-        matches = list(re.finditer(r'data-track-id="(\d+)"', html))
-        for i, m in enumerate(matches):
-            try:
-                start = m.start()
-                end = matches[i + 1].start() if i + 1 < len(matches) else min(start + 3000, len(html))
-                chunk = html[start:end]
-                vod_id = m.group(1)
-                if vod_id in seen:
-                    continue
-                link = re.search(r'href="(/(?:%s)/%s/?)"' % (link_prefix, re.escape(vod_id)), chunk)
-                if not link:
-                    # 站点再改版时的兜底：链接里带 id 就算数，不锁死前缀
-                    link = re.search(r'href="([^"]*%s[^"]*)"' % re.escape(vod_id), chunk)
-                if not link:
-                    continue
-                seen.add(vod_id)
-                title = re.search(r'data-track-title="([^"]*)"', chunk)
-                vod_name = title.group(1) if title else ""
-                if not vod_name:
-                    t = re.search(r'alt="([^"]*)"', chunk)
-                    vod_name = t.group(1) if t else ""
-                if not vod_name:
-                    h = re.search(r'<h2[^>]*>.*?<a[^>]*>([^<]+)</a>', chunk, re.S)
-                    vod_name = h.group(1).strip() if h else ""
-                pic = re.search(r'data-src="(https?://[^"]*)"', chunk)
-                if not pic:
-                    pic = re.search(r'<img[^>]*data-src="([^"]+)"', chunk)
-                vod_pic = self.proc_pic(pic.group(1) if pic else "")
-                # 集数现在挂在 data-ep-base 属性上（"更新至6集"），旧的文本取法抓不到
-                ep = re.search(r'hg-drama-card__episode"[^>]*data-ep-base="([^"]*)"', chunk)
-                if not ep:
-                    ep = re.search(r'data-ep-base="([^"]*)"', chunk)
-                if not ep:
-                    ep = re.search(r'hg-drama-card__episode[^>]*>([^<]*)', chunk)
-                vod_remarks = ep.group(1).strip() if ep else ""
-                if not vod_remarks:
-                    score = re.search(r'hg-drama-card__score[^>]*>([^<]*)', chunk)
-                    vod_remarks = score.group(1).strip() if score else ""
-                if vod_name and vod_id:
-                    result.append({
-                        "vod_id": vod_id,
-                        "vod_name": vod_name,
-                        "vod_pic": vod_pic,
-                        "vod_remarks": vod_remarks
-                    })
-            except Exception:
-                continue
-        return result
+    @staticmethod
+    def _absolute(url):
+        v = str(url or "").strip()
+        if not v:
+            return ""
+        if v.startswith("http://") or v.startswith("https://"):
+            return v
+        if v.startswith("/"):
+            return _HGUO_BASE + v
+        return v
 
-    def extract_rank(self, html):
-        result = []
-        seen = set()
-        for m in re.finditer(r'<div class="hg-rank-item"[^>]*data-track-id="(\d+)"', html):
-            try:
-                start = m.start()
-                vod_id = m.group(1)
-                if vod_id in seen:
-                    continue
-                chunk = html[start:start + 2500]
-                seen.add(vod_id)
-                link = re.search(r'href="(/(?:detail|video)/%s/?)"' % re.escape(vod_id), chunk)
-                if not link:
-                    link = re.search(r'href="([^"]*%s[^"]*)"' % re.escape(vod_id), chunk)
-                if not link:
-                    continue
-                title = re.search(r'data-track-title="([^"]*)"', chunk)
-                vod_name = title.group(1) if title else ""
-                pic = re.search(r'data-src="(https?://[^"]*)"', chunk)
-                vod_pic = self.proc_pic(pic.group(1) if pic else "")
-                heat = re.search(r'hg-rank-item__heat-value[^>]*>([^<]*)', chunk)
-                vod_remarks = heat.group(1).strip() if heat else ""
-                if vod_name:
-                    result.append({
-                        "vod_id": vod_id,
-                        "vod_name": vod_name,
-                        "vod_pic": vod_pic,
-                        "vod_remarks": vod_remarks
-                    })
-            except Exception:
-                continue
-        return result
+    @staticmethod
+    def _first(regex, text):
+        m = regex.search(text or "")
+        if not m:
+            return ""
+        return _hguo_unescape(m.group(1)).strip()
 
-    def extract_topics(self, html):
-        result = []
-        for m in re.finditer(r'<a class="hg-topic-card" href="(/topics/[^"]*/)"', html):
-            try:
-                start = m.start()
-                chunk = html[start:start + 900]
-                title = re.search(r'hg-topic-card__title[^>]*>([^<]*)', chunk)
-                vod_name = title.group(1).strip() if title else ""
-                meta = re.search(r'hg-topic-card__meta[^>]*>\s*<span>([^<]*)</span>', chunk)
-                vod_remarks = meta.group(1).strip() if meta else ""
-                pic = re.search(r'data-src="(https?://[^"]*)"', chunk)
-                vod_pic = self.proc_pic(pic.group(1) if pic else "")
-                if vod_name:
-                    result.append({
-                        "vod_id": m.group(1),
-                        "vod_name": vod_name,
-                        "vod_pic": vod_pic,
-                        "vod_remarks": vod_remarks
-                    })
-            except Exception:
-                continue
-        return result
+    @classmethod
+    def _clean(cls, text, regex):
+        return (cls._first(regex, text) or "").strip()
 
-    def extract_posts(self, html):
-        result = []
-        seen = set()
-        for m in re.finditer(r'<a class="hg-post-card" href="(/archives/(\d+)/)"', html):
-            try:
-                start = m.start()
-                pid = m.group(2)
-                if pid in seen:
-                    continue
-                seen.add(pid)
-                chunk = html[start:start + 1500]
-                title = re.search(r'<h3>([^<]*)</h3>', chunk)
-                vod_name = title.group(1).strip() if title else ""
-                pic = re.search(r'data-src="(https?://[^"]*)"', chunk)
-                vod_pic = self.proc_pic(pic.group(1) if pic else "")
-                meta = re.search(r'hg-post-card__cat[^>]*>([^<]*)', chunk)
-                vod_remarks = meta.group(1).strip() if meta else ""
-                if vod_name:
-                    result.append({
-                        "vod_id": m.group(1),
-                        "vod_name": vod_name,
-                        "vod_pic": vod_pic,
-                        "vod_remarks": vod_remarks
-                    })
-            except Exception:
-                continue
-        return result
-
-    def parse_api_list(self, items):
-        result = []
-        for it in items:
-            try:
-                vid = str(it.get("id") or "")
-                if not vid:
-                    continue
-                name = (it.get("title") or "").strip()
-                if not name:
-                    continue
-                score = it.get("score") or 0
-                remark = ""
-                if it.get("is_finished"):
-                    remark = "全%d集" % (it.get("total_episodes") or 0)
-                else:
-                    ec = it.get("episode_count") or 0
-                    if ec:
-                        remark = "更新至%d集" % ec
-                if score:
-                    remark = ("%s %.1f分" % (remark, score)).strip()
-                if it.get("is_original"):
-                    remark = ("黄果原创 " + remark).strip()
-                result.append({
-                    "vod_id": vid,
-                    "vod_name": name,
-                    "vod_pic": self.proc_pic(it.get("cover") or ""),
-                    "vod_remarks": remark
-                })
-            except Exception:
-                continue
-        return result
-
-    def homeContent(self, filter):
-        result = {"class": [], "filters": {}}
-        for cat in self.cat_map:
-            result["class"].append({"type_id": cat["type_id"], "type_name": cat["type_name"]})
-            tabs = cat.get("tabs")
-            if tabs:
-                result["filters"][cat["type_id"]] = [{"key": "sub", "name": "子分类", "value": [{"n": t["n"], "v": t["v"]} for t in tabs]}]
-        result["list"] = self.homeVideoContent().get("list", [])
-        return result
-
-    def homeVideoContent(self):
-        result = {"list": []}
-        html = self.getHtml(self.host)
-        if not html:
-            return result
-        cards = self.extract_cards(html)
-        seen = set()
-        unique = []
-        for c in cards:
-            if c["vod_id"] not in seen:
-                seen.add(c["vod_id"])
-                unique.append(c)
-        result["list"] = unique[:20]
-        return result
-
-    def get_tab(self, filter, extend):
-        for d in (filter, extend):
-            if isinstance(d, dict):
-                if d.get("sub"):
-                    return d.get("sub")
-                inner = d.get("filter")
-                if isinstance(inner, dict) and inner.get("sub"):
-                    return inner.get("sub")
+    @classmethod
+    def _remark(cls, text):
+        for rx in (_hguo_pill_re, _hguo_remark_re, _hguo_meta_p_re):
+            value = cls._clean(text, rx)
+            if value:
+                return " ".join(value.split())
         return ""
 
-    def _pick_cat(self, tid):
-        """解析壳传来的分类：空值 / 未知值一律当「首页推荐」(返回 None)。"""
-        t = str(tid or "").strip()
-        if t in self._HGUO_HOME_KEYS:
-            return None
-        return next((c for c in self.cat_map if c["type_id"] == t or c["type_name"] == t), None)
-
-    def page_cards(self, path, limit=None):
-        """抓某个页面并抽出卡片流（去重）。"""
-        p = str(path or "/")
-        url = self.host + p if p.startswith("/") else self.host + "/" + p
-        html = self.getHtml(url)
-        if not html:
-            return []
-        seen = set()
-        out = []
-        for c in self.extract_cards(html):
-            vid = c.get("vod_id")
-            if not vid or vid in seen:
-                continue
-            seen.add(vid)
-            out.append(c)
-        return out[:limit] if limit else out
-
-    def home_feed(self, limit=36):
-        """首页推荐：站点首页卡片流，黄果默认入口靠它撑住。"""
-        result = {"list": [], "page": 1, "pagecount": 1, "limit": limit, "total": 0}
-        cards = self.page_cards("/", limit)
-        result["list"] = cards
-        result["total"] = len(cards)
-        result["limit"] = len(cards) or limit
-        return result
-
-    def categoryContent(self, tid, pg, filter, extend):
-        page = int(pg) if pg else 1
-        if tid and str(tid).startswith("folder_topic_"):
-            return self.topicFolderList(tid, page)
-        cat = self._pick_cat(tid)
-        if not cat:
-            # 壳没带分类（初始进标签就是这种情况）或传了个对不上的值 → 给首页推荐
-            return self.home_feed()
-        result = {"list": [], "page": 1, "pagecount": 1, "limit": 20, "total": 0}
-        kind = cat.get("kind", "")
-        tab = self.get_tab(filter, extend)
-        if kind == "topic":
-            html = self.getHtml(self.host + cat["path"].rstrip("/") + "/")
-            if not html:
-                return result
-            topics = self.extract_topics(re.sub(r'<template[\s\S]*?</template>', '', html))
-            for t in topics:
-                fid = "folder_topic_" + base64.urlsafe_b64encode(t["vod_id"].encode("utf-8")).decode("utf-8")
-                result["list"].append({
-                    "vod_id": fid,
-                    "vod_name": t["vod_name"],
-                    "vod_pic": t["vod_pic"],
-                    "vod_remarks": t["vod_remarks"] or "进入专辑",
-                    "vod_tag": "folder"
-                })
-            result["page"] = page
-            result["limit"] = len(result["list"]) if result["list"] else 20
-            return result
-        if kind == "rank":
-            tabs = cat.get("tabs") or []
-            tc = next((t for t in tabs if t["v"] == tab), tabs[0] if tabs else None)
-            if not tc:
-                return result
-            html = self.getHtml(self.host + tc["path"])
-            if not html:
-                return result
-            result["list"] = self.extract_rank(html)
-            result["page"] = page
-            return result
-        if kind == "chigua":
-            tabs = cat.get("tabs") or []
-            tc = next((t for t in tabs if t["v"] == tab), tabs[0] if tabs else None)
-            if not tc:
-                return result
-            base = tc["path"].rstrip("/")
-            if page <= 1:
-                url = self.host + base + "/"
-            else:
-                url = self.host + base + "/%d/" % page
-            html = self.getHtml(url)
-            if not html:
-                return result
-            result["list"] = self.extract_posts(re.sub(r'<template[\s\S]*?</template>', '', html))
-            total_m = re.search(r'共 (\d+) 条', html)
-            if total_m:
-                result["total"] = int(total_m.group(1))
-            page_m = re.search(r'第 (\d+)/(\d+) 页', html)
-            if page_m:
-                result["page"] = int(page_m.group(1))
-                result["pagecount"] = int(page_m.group(2))
-            result["limit"] = len(result["list"]) if result["list"] else 20
-            return result
-        tabs = cat.get("tabs") or []
-        tc = next((t for t in tabs if t["v"] == tab), tabs[0] if tabs else None)
-        if not tc:
-            return result
-        url = "%s/api/videos/category/%s?page=%d" % (self.host, cat.get("api", cat["type_id"]), page)
-        if tc.get("q"):
-            url += "&" + tc["q"]
-        html = self.getHtml(url)
-        if html:
-            try:
-                data = json.loads(html)
-            except Exception:
-                data = None
-            if data and isinstance(data.get("data"), dict):
-                d = data["data"]
-                result["list"] = self.parse_api_list(d.get("items") or [])
-                pgd = d.get("pagination") or {}
-                result["page"] = pgd.get("page") or page
-                result["pagecount"] = pgd.get("pages") or 1
-                result["total"] = pgd.get("total") or 0
-                result["limit"] = pgd.get("size") or 20
-        if not result["list"] and page <= 1:
-            # 接口改版/被挡时的兜底：直接吃分类页本身的卡片流，别给个空标签
-            fb = self.page_cards(cat.get("path") or "/")
-            if fb:
-                result["list"] = fb
-                result["page"] = 1
-                result["pagecount"] = 1
-                result["total"] = len(fb)
-                result["limit"] = len(fb)
-        return result
-
-    def detailContent(self, ids):
-        result = {"list": []}
-        vid = ids[0] if isinstance(ids, list) else ids
-        if isinstance(vid, str) and vid.startswith("folder_topic_"):
-            return self.topicFolderDetail(vid)
-        if isinstance(vid, str) and (vid.startswith("/topics/") or vid.startswith("/archives/")):
-            if vid.startswith("/topics/"):
-                return self.topicDetail(vid)
-            return self.postDetail(vid)
-        m = re.search(r'(\d+)', vid)
-        if not m:
-            return result
-        vid = m.group(1)
-        # 站点改版后详情页在 /video/{id}/；老路径留着兜底
-        html = self.getHtml("%s/video/%s/" % (self.host, vid))
-        if not html:
-            html = self.getHtml("%s/detail/%s/" % (self.host, vid))
-        if not html:
-            return result
-        vod = {"vod_id": vid}
-        title = re.search(r'<title>([^|<]*)', html)
-        if title:
-            vod["vod_name"] = re.sub(r'\s*-\s*(短剧视频在线观看|黄果短剧|短剧).*$', '', title.group(1).strip()).strip() or vid
-        else:
-            vod["vod_name"] = vid
-        pic = re.search(r'(?:data-src|src)="(https?://pic[^"]*)"', html)
-        if pic:
-            vod["vod_pic"] = self.proc_pic(pic.group(1))
-        else:
-            vod["vod_pic"] = ""
-        eps = re.findall(r'<a[^>]*href="(/video/%s(?:/ep-\d+)?/)"[^>]*data-ep-id="(\d+)"[^>]*>(.*?)</a>' % re.escape(vid), html, re.S)
-        if eps:
-            ep_map = {}
-            for href, eid, name in eps:
-                ep_map[int(eid)] = (href, re.sub(r'<[^>]+>', '', name).strip())
-            play_urls = []
-            for eid in sorted(ep_map.keys()):
-                href, name = ep_map[eid]
-                label = name if name else "第%02d集" % eid
-                play_urls.append("%s$%s" % (label, self.fix_url(href)))
-            vod["vod_play_from"] = "黄果短剧"
-            vod["vod_play_url"] = "#".join(play_urls)
-        else:
-            data = None
-            dm = re.search(r'<script id="videoInitialData" type="application/json">(.*?)</script>', html, re.S)
-            if dm:
-                try:
-                    data = json.loads(dm.group(1).replace("\\u0026", "&"))
-                except Exception:
-                    data = None
-            if data and data.get("epPlaySrcs"):
-                vod["vod_pic"] = self.proc_pic(data.get("coverSrc")) or vod["vod_pic"]
-                eps = data.get("epPlaySrcs") or {}
-                play_urls = []
-                for ep_id in sorted(eps.keys(), key=lambda x: int(x)):
-                    play_urls.append("第%02d集$%s" % (int(ep_id), self.proxy_play(eps[ep_id])))
-                vod["vod_play_from"] = "黄果短剧"
-                vod["vod_play_url"] = "#".join(play_urls)
-            else:
-                vod["vod_play_from"] = "黄果短剧"
-                vod["vod_play_url"] = "第01集$/video/%s/" % vid
-        result["list"] = [vod]
-        return result
-
-    def topicFolderList(self, tid, page):
-        result = {"list": [], "page": page, "pagecount": 1, "limit": 20, "total": 0}
-        try:
-            path = base64.urlsafe_b64decode(tid[len("folder_topic_"):].encode("utf-8")).decode("utf-8")
-        except Exception:
-            return result
-        html = self.getHtml(self.fix_url(path))
-        if not html:
-            return result
-        cards = self.extract_cards(re.sub(r'<template[\s\S]*?</template>', '', html))
-        seen = set()
-        unique = []
-        for c in cards:
-            if c["vod_id"] not in seen:
-                seen.add(c["vod_id"])
-                unique.append(c)
-        result["list"] = unique
-        result["limit"] = len(unique) if unique else 20
-        return result
-
-    def topicFolderDetail(self, tid):
-        result = {"list": []}
-        try:
-            path = base64.urlsafe_b64decode(tid[len("folder_topic_"):].encode("utf-8")).decode("utf-8")
-        except Exception:
-            return result
-        html = self.getHtml(self.fix_url(path))
-        if not html:
-            return result
-        cards = self.extract_cards(re.sub(r'<template[\s\S]*?</template>', '', html))
-        seen = set()
-        unique = []
-        for c in cards:
-            if c["vod_id"] not in seen:
-                seen.add(c["vod_id"])
-                unique.append(c)
-        if not unique:
-            return result
-        title = re.search(r'<title>([^<]*)', html)
-        name = title.group(1).strip() if title else "专辑"
-        name = re.sub(r'\s*[·\-]\s*黄果短剧.*$', '', name).strip() or "专辑"
-        vod = {
-            "vod_id": tid,
-            "vod_name": name,
-            "vod_pic": unique[0]["vod_pic"],
-            "vod_remarks": "专辑目录",
-            "vod_content": "目录入口，点击播放进入视频列表",
-            "vod_play_from": "目录",
-            "vod_play_url": "打开$" + tid
-        }
-        result["list"] = [vod]
-        return result
-
-    def topicDetail(self, vid):
-        result = {"list": []}
-        html = self.getHtml(self.fix_url(vid))
-        if not html:
-            return result
-        cards = self.extract_cards(re.sub(r'<template[\s\S]*?</template>', '', html))
-        seen = set()
-        unique = []
-        for c in cards:
-            if c["vod_id"] not in seen:
-                seen.add(c["vod_id"])
-                unique.append(c)
-        result["list"] = unique
-        return result
-
-    def postDetail(self, vid):
-        result = {"list": []}
-        html = self.getHtml(self.fix_url(vid))
-        if not html:
-            return result
-        vod = {"vod_id": vid}
-        title = re.search(r'<h1[^>]*>([^<]*)', html)
-        if title:
-            vod["vod_name"] = title.group(1).strip()
-        else:
-            t = re.search(r'<title>([^<]*)', html)
-            vod["vod_name"] = t.group(1).strip() if t else vid
-        pic = re.search(r'data-src="(https?://pic[^\"]*)"', html)
-        if pic:
-            vod["vod_pic"] = self.proc_pic(pic.group(1))
-        else:
-            vod["vod_pic"] = ""
-        players = re.findall(r'class="post-video-player"[^>]*data-src="([^"]*)"', html)
-        if players:
-            play_urls = []
-            for idx, src in enumerate(players, 1):
-                play_urls.append("第%02d集$%s" % (idx, self.proxy_play(src.replace("\\u0026", "&"))))
-            vod["vod_play_from"] = "黄果短剧"
-            vod["vod_play_url"] = "#".join(play_urls)
-        else:
-            m3u8s = re.findall(r'(https?://[^\s"<>\\]*\.m3u8[^\s"<>\\]*)', html)
-            if m3u8s:
-                seen = []
-                for u in m3u8s:
-                    u = u.replace("\\u0026", "&")
-                    if u not in seen:
-                        seen.append(u)
-                vod["vod_play_from"] = "黄果短剧"
-                vod["vod_play_url"] = "#".join("第%02d集$%s" % (i + 1, self.proxy_play(u)) for i, u in enumerate(seen))
-            else:
-                vod["vod_play_from"] = "黄果短剧"
-                vod["vod_play_url"] = "第01集$" + vid
-        result["list"] = [vod]
-        return result
-
-    def searchContent(self, key, quick, pg):
-        result = {"list": [], "page": 1, "pagecount": 1, "limit": 20, "total": 0}
-        page = int(pg) if pg else 1
-        url = "%s/search/?keyword=%s" % (self.host, quote(key))
-        if page > 1:
-            url += "&page=%d" % page
-        html = self.getHtml(url)
-        if not html:
-            return result
-        result["list"] = self.extract_cards(re.sub(r'<template[\s\S]*?</template>', '', html))
-        total = re.search(r'data-track-search-total="(\d+)"', html)
-        if total:
-            result["total"] = int(total.group(1))
-        result["page"] = page
-        return result
-
-    def playerContent(self, flag, id, vipFlags):
-        result = {"parse": 0, "playUrl": "", "url": "", "header": ""}
-        if isinstance(id, str) and id.startswith("folder_topic_"):
-            return {"parse": 1, "url": id, "header": {}}
-        play_url = self.fix_url(id) if id else ""
-        if play_url.startswith("/proxy?") or play_url.startswith("/local/") or play_url.startswith("http://127.0.0.1"):
-            result["url"] = play_url
-            result["header"] = json.dumps({"User-Agent": self.header["User-Agent"], "Referer": self.host})
-            return result
-        if 'm3u8' in play_url or '.mp4' in play_url:
-            result["url"] = self.proxy_play(play_url)
-            result["header"] = json.dumps({"User-Agent": self.header["User-Agent"], "Referer": self.host})
-            return result
-        if re.fullmatch(r'\d+', play_url):
-            d = self.detailContent([play_url])
-            if d["list"]:
-                first = d["list"][0].get("vod_play_url", "").split("#")[0]
-                if "$" in first:
-                    play_url = self.fix_url(first.split("$", 1)[1])
-        if play_url.startswith("/proxy?") or play_url.startswith("/local/") or play_url.startswith("http://127.0.0.1"):
-            result["url"] = play_url
-            result["header"] = json.dumps({"User-Agent": self.header["User-Agent"], "Referer": self.host})
-            return result
-        html = self.getHtml(play_url)
-        if not html:
-            return result
-        m3u8 = ""
-        m = re.search(r'"videoSrc"\s*:\s*"([^"]*)"', html)
-        if m:
-            m3u8 = m.group(1).replace("\\u0026", "&")
-        if not m3u8:
-            m = re.search(r'<video[^>]*>\s*<source[^>]*src="([^"]*)"', html)
-            if m:
-                m3u8 = m.group(1)
-        if not m3u8:
-            m = re.search(r'(https?://[^\s"<>\\]*\.m3u8[^\s"<>\\]*)', html)
-            if m:
-                m3u8 = m.group(1).replace("\\u0026", "&")
-        result["url"] = self.proxy_m3u8_url(m3u8) if m3u8 else ""
-        result["header"] = json.dumps({"User-Agent": self.header["User-Agent"], "Referer": self.host})
-        return result
-
+    # ---------- 本机代理（m3u8 / ts / key / 封面） ----------
     def proxy_m3u8_url(self, url):
         return self._proxy_base("m3u8", url)
 
@@ -7617,7 +7639,7 @@ class _HuangguoSpider(_BaseSpider):
     def _proxy_pic(self, url):
         try:
             r = requests.get(url, headers=self.header, timeout=15, verify=False)
-            ct = r.content
+            ct = r.content or b""
             if ct[:3] == b"\xff\xd8\xff":
                 return [200, "image/jpeg", ct]
             if ct[:8] == b"\x89PNG\r\n\x1a\n":
@@ -7626,20 +7648,8 @@ class _HuangguoSpider(_BaseSpider):
                 return [200, "image/webp", ct]
             if ct[:3] == b"GIF":
                 return [200, "image/gif", ct]
-            if ct and len(ct) % 16 == 0:
-                try:
-                    dec = _aes_cbc_decrypt(self.key, self.iv, ct)
-                except Exception:
-                    dec = b""
-                if dec[:3] == b"\xff\xd8\xff":
-                    return [200, "image/jpeg", dec]
-                if dec[:8] == b"\x89PNG\r\n\x1a\n":
-                    return [200, "image/png", dec]
-                if dec[:4] == b"RIFF" and dec[8:12] == b"WEBP":
-                    return [200, "image/webp", dec]
-                if dec[:3] == b"GIF":
-                    return [200, "image/gif", dec]
-                return [200, "image/jpeg", dec or ct]
+            if not ct:
+                return [404, "text/plain", "empty"]
             return [200, "image/jpeg", ct]
         except Exception:
             return [404, "text/plain", "err"]
@@ -11552,7 +11562,7 @@ class Spider(_BaseSpider):
         filters[hd_root] = [{"key": "cate", "name": "分类", "value": [
             {"n": "全部短剧", "v": "all"}, {"n": "原豆推荐", "v": "yuandou"}]}]
 
-        # 黄果：单一顶级「🟠黄果短剧」，7 个分类下沉为 cate 筛选，子分类为 sub
+        # 黄果：单一顶级「🟠黄果短剧」，9 个分类 + 排序/尺度/标签等 8 组筛选下沉（filter_meta 扁平下发）
         hguo_root = "HGUO%sroot" % _ENGINE_SEP
         try:
             class_list.append({"type_id": hguo_root, "type_name": "🟠黄果短剧"})
