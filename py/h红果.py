@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-VERSION = "1.6.8"
+VERSION = "1.6.9"
 VERSION_NOTE = (
+    "1.6.9 修 1.6.8 遗留：起播瞬间仍重启——+2.5s 错峰把弹幕取数精确推进视频缓冲窗口，"
+    "且播放器自打 /hg_dm 冷缓存仍立刻 4 路并发取数，与起跑线撞车。三刀："
+    "① 弹幕预热前移 detailContent(同会话预热时机，进详情页即取，点播时缓存已热)；"
+    "② playerContent 恢复立即预热(去掉 2.5s 睡眠，抢在播放器发视频请求前起跑)；"
+    "③ 取数并发 4→2(_DM_FETCH_WORKERS)。"
     "1.6.8 修 32 位 OK影视弹幕开启后播放中闪退/盒子重启(真机复现数次)："
     "① 弹幕条数封顶 _DM_MAX_ITEMS=500(取数早停+出流再截断，maxlimit 改真实条数——"
     "原 20窗×90 全量可到 ~1800 条/数百 KB XML，DanmakuFlameMaster 32 位解析即顶满)；"
@@ -5154,6 +5159,7 @@ _DM_IN_PLAYER = "list"      # playerContent 里 danmaku 字段形态: list / url
 _DM_PUSH_LOCAL = False      # 9978/action 兜底推送默认关(1.6.8: list+双投=双载，32位壳闪退)
 _DM_MAX_ITEMS = 500         # 出给播放器的弹幕条数硬顶(32位 DanmakuFlameMaster 内存)
 _DM_CACHE_MAX = 32          # _DM_CACHE 最多缓存集数(挤最旧)
+_DM_FETCH_WORKERS = 2       # 取数并发(1.6.9: 4路在32位起播瞬间顶水位，降为2)
 _DM_SID_MAP: dict[str, str] = {}
 _DM_CACHE: dict[str, dict[str, Any]] = {}
 _DM_EVENTS: dict[str, threading.Event] = {}
@@ -5604,7 +5610,7 @@ def _dm_fetch(vid: str, series_id: str, device_id: str, install_id: str = "") ->
     empty_batches = 0
     stop = False
     try:
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=_DM_FETCH_WORKERS)
     except Exception:
         pool = None
     try:
@@ -5910,20 +5916,10 @@ class Spider(_BaseSpider):
             "iid": self.install_id or "",
         })
         url = "http://127.0.0.1:%d/hg_dm?%s" % (port, query)
-        # 1.6.8: 与会话预热错峰——起播瞬间 _warm_session 已在跑，再叠 4 路弹幕取数
-        # 会把 32 位进程水位顶到 LMK；延后 2.5s，播放器真来取时 /hg_dm 仍会等(wait=18)。
-        _dm_vid, _dm_sid = vid, sid
-        _dm_did, _dm_iid = self.device_id or "", self.install_id or ""
-
-        def _warm_dm(delay: float = 2.5) -> None:
-            time.sleep(delay)
-            try:
-                _dm_get(_dm_vid, _dm_sid, _dm_did, _dm_iid, wait=0)
-            except Exception:
-                pass
-
+        # 1.6.9: 立即预热(不睡)——抢在壳发 /hg.mp4 之前起跑；detail 页通常已预热过，
+        # 此处 _dm_get 命中 TTL 直接返回零开销。冷时单飞起 2 路取数(wait=0 不阻塞)。
         try:
-            threading.Thread(target=_warm_dm, daemon=True).start()
+            _dm_get(vid, sid, self.device_id or "", self.install_id or "", wait=0)
         except Exception:
             pass
         _dm_push_local(url, vid)
@@ -6157,6 +6153,12 @@ class Spider(_BaseSpider):
                     args=(first_vid, self.device_id, self.install_id),
                     daemon=True,
                 ).start()
+            except Exception:
+                pass
+            # 1.6.9: 弹幕同机预热——进详情页即取，点播时缓存已热，
+            # /hg_dm 不再在起播瞬间冷取(与会话预热并行，此时还没起播，可承受)。
+            try:
+                _dm_get(first_vid, sid, self.device_id or "", self.install_id or "", wait=0)
             except Exception:
                 pass
         return {"list": [{"vod_id": sid, "vod_name": str(s.get("series_name") or ""), "vod_pic": _first(s.get("series_cover"), s.get("cover"), s.get("series_cover_url"), s.get("pic"), ""), "vod_year": "", "vod_area": "", "vod_director": "", "vod_actor": ",".join(actors), "vod_content": str(s.get("series_intro") or ""), "vod_remarks": str(s.get("episode_right_text") or ""), "vod_play_from": "$$$".join(play_from), "vod_play_url": "$$$".join(play_url)}]}
