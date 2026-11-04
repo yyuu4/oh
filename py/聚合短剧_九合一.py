@@ -24,6 +24,12 @@
 #     eng 分发，eng=yeguo/wuyi）；野果 9978 兜底改自建服务；五一原图是
 #     01/upload 系 AES-128-CBC 密文（与野果同族同 MEDIA 键），_srv_pic 非图
 #     即解密+PKCS7 去填充后才回壳——此前直连回的是壳解不了的密文字节
+#  8. 四源连修：牛牛 ad_unlock 补 shortplay_id+index+lock_index（缺任一即
+#     params error，biz 锁集解锁后 HTTP200）；黄豆锁集(VIP/金币)由 status=n
+#     秒回 toast://服务端错误，不再落 _hls 404 死链；野果 play 接口认
+#     episode_id(分集自身 id)而非 sort 序号，detail 播放位改传分集 id——
+#     此前后续集全部映射回第一集；五五封面(category/detail/search)接入
+#     回环代理 eng=wuwu（实机直连 p.lztutu.com 取不到）
 # =====================================================================
 #  聚合短剧 · 九合一
 #     (红果 + 黄豆 + 黄果 + 野果 + 禁果 + 红果黄剧 + 聚合短剧[短] + 2048短剧 + 狂飙短剧)
@@ -483,6 +489,10 @@ class _HuangdouSpider(_BaseSpider):
         vid, seq = self._split(id)
         obj = self._api("/drama/play", {"id": vid, "seq": str(seq)}, True)
         data = obj.get("data", {}) if isinstance(obj, dict) else {}
+        # 锁集(VIP/金币)服务端 status=n；此前兜底 _hls 得 404 死链，改为秒回 toast
+        if isinstance(obj, dict) and obj.get("status") == "n":
+            err = str(obj.get("error") or "本集需解锁").strip() or "本集需解锁"
+            return {"parse": 0, "playUrl": "", "url": "toast://" + err, "jx": 0, "header": {"User-Agent": self.headers["User-Agent"], "Referer": self.host + "/home", "Origin": self.host}}
         url = data.get("m3u8") or data.get("url") or self._hls(vid, seq)
         return {"parse": 0, "playUrl": "", "url": url, "jx": 0, "header": {"User-Agent": self.headers["User-Agent"], "Referer": self.host + "/home", "Origin": self.host}}
 
@@ -7898,6 +7908,15 @@ class _AggSpider(_BaseSpider):
             return base + _ag_enc_uri(url)
         return url
 
+    def _proxy_wuwu(self, url):
+        """五五封面: 实机直连 p.lztutu.com 取不到, 走自建回环(eng=wuwu → _srv_pic)。"""
+        if not url:
+            return url
+        b = _hguo_srv_base()
+        if b:
+            return b + "?do=py&eng=wuwu&url=" + _ag_enc_uri(url)
+        return url
+
     # ---------- 预处理 / 鉴权 ----------
     def prepare(self):
         cfg = self.cfg
@@ -8157,7 +8176,7 @@ class _AggSpider(_BaseSpider):
                     url += "?page=%s" % page
                 html = _ag_request(url, headers=AGG_HEADERS["default"])
                 for v in _ag_parse_wuwu_list(html, plat["host"]):
-                    d.append({"title": v["name"], "img": v["pic"],
+                    d.append({"title": v["name"], "img": self._proxy_wuwu(v["pic"]),
                               "desc": "五五短剧 | %s" % v["rem"], "url": "五五@%s" % v["id"]})
                 return d
         except Exception:
@@ -8498,9 +8517,10 @@ class _AggSpider(_BaseSpider):
                                         else plat["host"] + e["href"]) for e in eps]))
                 vn = (re.sub(r'<[^>]+>', '', nm.group(1)).strip() if nm else
                       (re.split(r'[-_|]', tm.group(1))[0].strip() if tm else "五五短剧"))
+                _w_pic = ((im.group(1) if im.group(1).startswith("http")
+                           else plat["host"] + im.group(1)) if im else "")
                 return {"vod_id": or_id, "vod_name": vn,
-                        "vod_pic": (im.group(1) if im.group(1).startswith("http")
-                                    else plat["host"] + im.group(1)) if im else "",
+                        "vod_pic": self._proxy_wuwu(_w_pic),
                         "vod_content": re.sub(r'<[^>]+>', '', cm.group(1)).strip() if cm else "",
                         "vod_play_from": "$$$".join(sources) or "五五短剧",
                         "vod_play_url": "$$$".join(urls) or "暂无播放地址$0"}
@@ -8678,7 +8698,7 @@ class _AggSpider(_BaseSpider):
                         su += "?page=%s" % page
                     html = _ag_request(su, headers=AGG_HEADERS["default"])
                     for v in _ag_parse_wuwu_list(html, plat["host"]):
-                        results.append({"title": v["name"], "img": v["pic"],
+                        results.append({"title": v["name"], "img": self._proxy_wuwu(v["pic"]),
                                         "desc": "五五短剧 | %s" % v["rem"], "url": "五五@%s" % v["id"]})
                 elif pid == "星星":
                     continue  # 原 JS 搜索未实现星星
@@ -8735,6 +8755,7 @@ class _AggSpider(_BaseSpider):
                     return {"parse": 0, "url": (r.get("data") or {}).get("url") or "toast://无法播放"}
                 elif len(p) == 3:
                     if p[1] != "free":
+                        # ad_unlock 必须带 shortplay_id + index + lock_index，缺任一即 params error
                         unlock = ("ac=mobile&os=Android&vod_version=1.10.21.6-tob&os_version=12"
                                   "&lock_ad=3&lock_free=3&type=1&clientVersion=v5.2.5"
                                   "&uuid=6IDYUSASPQY5BBVACWQW3LLTPV4V7DE26UOCX5TZTVUGX4VUJNXQ01"
@@ -8742,7 +8763,9 @@ class _AggSpider(_BaseSpider):
                                   "&os_api=31&install_id=1496879012031075&device_brand=Redmi"
                                   "&sdk_version=1.1.3.0&package_name=com.niuniu.ztdh.app"
                                   "&siteid=5627189&dev_log_aid=667431&oaid=abec0dfff623201b"
-                                  "&timestamp=1752498493")
+                                  "&timestamp=1752498493"
+                                  "&shortplay_id=" + p[2] +
+                                  "&index=1&lock_index=1&count=1")
                         _AG_NN_Service.post1(cfg,
                                              "https://csj-sp.csjdeveloper.com/csj_sp/api/v1/pay/ad_unlock?siteid=5627189",
                                              unlock, p[0])
@@ -9265,11 +9288,13 @@ class _YeguoSpider(_BaseSpider):
             for i, ep in enumerate(eps):
                 if isinstance(ep, dict):
                     n = ep.get("sort") or ep.get("episode") or (i + 1)
+                    # play 只认分集自己的 id(episode_id)，sort 序号会全部映射回第一集
+                    eid = ep.get("id") or n
                     name = self._san(ep.get("title") or ("第%s集" % n))
                 else:
-                    n = i + 1
-                    name = "第%d集" % n
-                parts.append("%s$%s_%s" % (name, vid, n))
+                    eid = i + 1
+                    name = "第%d集" % eid
+                parts.append("%s$%s_%s" % (name, vid, eid))
         else:
             parts.append("第1集$%s_1" % vid)
         vod = {
@@ -9305,7 +9330,8 @@ class _YeguoSpider(_BaseSpider):
         url = ""
         try:
             # 播放地址是带签名的直链，每次点播都要现签一次，不吃缓存的过期地址
-            d = self._api("/api/playlet/play", {"video_id": self._num(vid), "ep": self._num(ep)})
+            # 接口认 episode_id(分集自身 id)，ep/sort 参数被忽略导致后续集全回第一集
+            d = self._api("/api/playlet/play", {"video_id": self._num(vid), "episode_id": self._num(ep)})
             info = self._unwrap(d)
             if isinstance(info, dict) and info.get("video_url") is None and isinstance(info.get("data"), dict):
                 info = info["data"]
