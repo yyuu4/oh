@@ -1,8 +1,15 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-VERSION = "1.6.6"
+VERSION = "1.7.0"
 VERSION_NOTE = (
+    "1.7.0 加弹幕（刀法移植自红果短剧弹幕版.py，签名/取数逐字节一致）："
+    "playerContent 挂本机弹幕源 /hg_dm（B站XML，DanmakuFlameMaster/各壳原生认），"
+    "取数走红果评论接口30s窗口4路并发、纯Python SM3/SIMON/Argus/Ladon 签名（零第三方依赖，"
+    "无cryptography的32位壳也能跑）；detailContent 落 vid→series_id 映射（内存+盘，4000条封顶）；"
+    "弹幕取数全在 daemon 后台线程(wait=0)，播放器取弹幕与视频流是两条独立HTTP连接，互不阻塞——"
+    "播放/切换流畅度不动；防32位闪退五重加固：弹幕缓存16集封顶挤老、命中/推送记录512条封顶、"
+    "destroy 全清、挂点全 try/except 吞错（弹幕任何失败不影响出流）、路由异常留 _hg_trace。"
     "1.6.6 第五轮复检(换角度：格式串/裸except/finally/入口入参/并发/分页语义)三修："
     "① detailContent 传空列表原地 IndexError(壳传 [] 即炸) → 空列表回 str(ids) 走空详情；"
     "② _search_by_keywords 用站点 totalCount 放大 pagecount(关键词轮换恒取各词首页，"
@@ -1988,6 +1995,62 @@ class _StreamHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - 标准库回调命名
         self._serve(body=True)
 
+    def _serve_danmaku(self, body: bool) -> None:
+        """本机弹幕路由：/hg_dm?vid=..&sid=..&fmt=xml|json，/hg_dm_debug 自检。
+        与视频流是两条独立连接：这里最多等 _DM_WAIT 秒，绝不占用出流线程。"""
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        vid = (query.get("vid") or query.get("id") or [""])[0]
+        sid = (query.get("sid") or [""])[0]
+        fmt = ((query.get("fmt") or ["xml"])[0] or "xml").lower()
+        did = (query.get("did") or [""])[0]
+        iid = (query.get("iid") or [""])[0]
+        if not str(vid).isdigit():
+            self._fail(400, b"missing vid")
+            return
+        if not sid:
+            sid = _dm_series_of(vid)
+        try:
+            _dm_hit_touch(vid)
+        except Exception:
+            pass
+        try:
+            state = _dm_get(vid, sid, did, iid, wait=_DM_WAIT)
+        except Exception as err:
+            # 弹幕取数任何异常都不能让路由崩（32 位壳对未捕获异常零容忍）
+            try:
+                _hg_trace("弹幕路由失败 vid=%s %s" % (vid, str(err)[:80]))
+            except Exception:
+                pass
+            state = {"items": [], "error": str(err)[:120]}
+        items = state.get("items") or []
+        if parsed.path.rstrip("/").endswith("debug"):
+            payload = {
+                "vid": vid, "sid": sid, "count": len(items),
+                "error": state.get("error") or "", "ts": state.get("t") or 0,
+                "head": items[:3],
+            }
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            ctype = "application/json; charset=utf-8"
+        elif fmt == "json":
+            data = _dm_to_json(items)
+            ctype = "application/json; charset=utf-8"
+        else:
+            data = _dm_to_xml(vid, items)
+            ctype = "application/xml; charset=utf-8"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if not body:
+            return
+        try:
+            self.wfile.write(data)
+        except OSError:
+            pass
+
     def _emit_media_headers(self, code: int, start: int, end: int, total: int, ranged: bool) -> None:
         self.send_response(code)
         self.send_header("Content-Type", "video/mp4")
@@ -2044,6 +2107,9 @@ class _StreamHandler(BaseHTTPRequestHandler):
 
     def _serve(self, body: bool) -> None:
         route = urlparse(self.path).path
+        if route.startswith("/hg_dm"):
+            self._serve_danmaku(body)
+            return
         if not route.endswith(".mp4"):
             self._fail(404, b"not found")
             return
@@ -5078,6 +5144,731 @@ def _warm_detail_first(video_id: str, device_id: str, install_id: str) -> None:
         pass
 
 
+# 弹幕子系统（红果 App 评论 / 弹幕接口）
+#
+# 接口：POST https://api5-normal-lq.fqnovel.com/novel/commentapi/comment/list/{vid}/v1/
+#       body: business_param.book_id = 剧集 series_id, start_offset_time = 窗口起点(ms)
+#       返回 data.data_list[].comment.expand.offset_time（毫秒）与 .content.text
+#       按 30s 一个窗口顺序取，直到该窗口为空且 extra.next_query_danmaku_list_time > 0
+#       （说明已到片尾）。
+#
+# 签名：该接口不吃视频接口那套六神（gorgon/medusa），要的是 x-ladon + x-argus
+#       + x-ss-stub。ladon 是 34 轮 Feistel；argus 是 protobuf(25 字段) →
+#       Simon-64 分组 → 551 变体（魔数/异或/倒序）→ AES-128-CBC。
+#       下面的实现与 Hiker 版 JS 逐字节一致（同输入同随机数下 x-ladon / x-argus
+#       完全相等），因此同一份签名在 TVBox 的 Chaquopy 里也能直接用。
+# =============================================================================
+_DM_ENABLED = True          # 总开关：关掉则 playerContent 不再挂弹幕
+_DM_HOST = "api5-normal-lq.fqnovel.com"
+_DM_WINDOW_MS = 30000       # 每个取数窗口（毫秒）
+_DM_MAX_WINDOWS = 20        # 最多取 20 个窗口（约 10 分钟，覆盖短剧整集）
+_DM_TTL = 1800              # 弹幕缓存有效期（秒）
+_DM_WAIT = 18               # 弹幕路由最多等取数完成多少秒
+_DM_IN_PLAYER = "list"      # playerContent 里 danmaku 字段形态: list / url / off
+_DM_PUSH_LOCAL = True       # 额外用壳的 127.0.0.1:9978/action 推一次（老壳兜底）
+_DM_SID_MAP: dict[str, str] = {}
+_DM_CACHE: dict[str, dict[str, Any]] = {}
+_DM_EVENTS: dict[str, threading.Event] = {}
+_DM_LOCKS = threading.Lock()
+_DM_PUSHED: set[str] = set()
+_DM_HIT: dict[str, float] = {}
+_DM_LAST_ERR = ""
+
+_DM_AES_KEY = bytes.fromhex("d31e3718288a1027baab59f146a09a9c")
+_DM_AES_IV = bytes.fromhex("ea180a0336ed352fcd24e4d50018ae54")
+_DM_SIMON_KEY = bytes.fromhex("fc78e0a9657a0c748ce51559903ccf03510e51d3cff232d71343e88a321c5304")
+_DM_M551 = bytes.fromhex("f2f7fcfff2f7fcff")
+_DM_TAIL551 = bytes.fromhex("eafb2cfe8568519154")
+_DM_PREFIX551 = bytes.fromhex("f281")
+
+_DM_U32 = 0xFFFFFFFF
+
+
+# ---------------------------- SM3 ----------------------------
+_DM_SM3_IV = (0x7380166F, 0x4914B2B9, 0x172442D7, 0xDA8A0600,
+              0xA96F30BC, 0x163138AA, 0xE38DEE4D, 0xB0FB0E4E)
+
+
+def _dm_rotl32(a: int, k: int) -> int:
+    k &= 31
+    if not k:
+        return a & _DM_U32
+    return ((a << k) | (a >> (32 - k))) & _DM_U32
+
+
+def _dm_sm3_cf(v: list, bl: bytes, off: int) -> list:
+    w = [((bl[off + i * 4] << 24) | (bl[off + i * 4 + 1] << 16) |
+          (bl[off + i * 4 + 2] << 8) | bl[off + i * 4 + 3]) & _DM_U32 for i in range(16)]
+    for j in range(16, 68):
+        xj = (w[j - 16] ^ w[j - 9] ^ _dm_rotl32(w[j - 3], 15)) & _DM_U32
+        w.append((xj ^ _dm_rotl32(xj, 15) ^ _dm_rotl32(xj, 23) ^
+                  _dm_rotl32(w[j - 13], 7) ^ w[j - 6]) & _DM_U32)
+    w1 = [(w[j] ^ w[j + 4]) & _DM_U32 for j in range(64)]
+    a, b, c, d, e, f, g, h = v
+    for j in range(64):
+        t = 0x79CC4519 if j < 16 else 0x7A879D8A
+        ss1 = _dm_rotl32((_dm_rotl32(a, 12) + e + _dm_rotl32(t, j % 32)) & _DM_U32, 7)
+        ss2 = ss1 ^ _dm_rotl32(a, 12)
+        if j < 16:
+            ff = a ^ b ^ c
+            gg = e ^ f ^ g
+        else:
+            ff = (a & b) | (a & c) | (b & c)
+            gg = (e & f) | (~e & g)
+        tt1 = (ff + d + ss2 + w1[j]) & _DM_U32
+        tt2 = (gg + h + ss1 + w[j]) & _DM_U32
+        d, c, b, a = c, _dm_rotl32(b, 9), a, tt1
+        h, g, f, e = g, _dm_rotl32(f, 19), e, (tt2 ^ _dm_rotl32(tt2, 9) ^ _dm_rotl32(tt2, 17)) & _DM_U32
+    return [(a ^ v[0]) & _DM_U32, (b ^ v[1]) & _DM_U32, (c ^ v[2]) & _DM_U32, (d ^ v[3]) & _DM_U32,
+            (e ^ v[4]) & _DM_U32, (f ^ v[5]) & _DM_U32, (g ^ v[6]) & _DM_U32, (h ^ v[7]) & _DM_U32]
+
+
+def _dm_sm3(data: bytes) -> bytes:
+    orig = len(data)
+    msg = bytearray(data)
+    msg.append(0x80)
+    reserve = (orig % 64) + 1
+    end = 56
+    if end < reserve:
+        end += 64
+    msg.extend(b"\0" * (end - reserve))
+    msg.extend(struct.pack(">Q", orig * 8))
+    v = list(_DM_SM3_IV)
+    for i in range(len(msg) // 64):
+        v = _dm_sm3_cf(v, msg, i * 64)
+    return b"".join(struct.pack(">I", x) for x in v)
+
+
+def _dm_sm3_prefix6(data: bytes) -> bytes:
+    return _dm_sm3(data)[:6]
+
+
+# -------------------- 64 位字运算（(hi, lo) 双 32 位） --------------------
+def _dm_u64le(b: bytes, off: int) -> tuple:
+    lo = (b[off] | b[off + 1] << 8 | b[off + 2] << 16 | b[off + 3] << 24) & _DM_U32
+    hi = (b[off + 4] | b[off + 5] << 8 | b[off + 6] << 16 | b[off + 7] << 24) & _DM_U32
+    return (hi, lo)
+
+
+def _dm_u64le_write(v: tuple, out: bytearray) -> None:
+    for j in range(8):
+        out.append(((v[1] >> (8 * j)) if j < 4 else (v[0] >> (8 * (j - 4)))) & 0xFF)
+
+
+def _dm_x64(a: tuple, b: tuple) -> tuple:
+    return (a[0] ^ b[0], a[1] ^ b[1])
+
+
+def _dm_add64(a: tuple, b: tuple) -> tuple:
+    lo = a[1] + b[1]
+    hi = a[0] + b[0] + (1 if lo > _DM_U32 else 0)
+    return (hi & _DM_U32, lo & _DM_U32)
+
+
+def _dm_not64(a: tuple) -> tuple:
+    return ((~a[0]) & _DM_U32, (~a[1]) & _DM_U32)
+
+
+def _dm_rotl64(a: tuple, n: int) -> tuple:
+    n = ((n % 64) + 64) % 64
+    if n == 0:
+        return (a[0], a[1])
+    if n == 32:
+        return (a[1], a[0])
+    if n < 32:
+        hi = ((a[0] << n) | (a[1] >> (32 - n))) & _DM_U32
+        lo = ((a[1] << n) | (a[0] >> (32 - n))) & _DM_U32
+    else:
+        m = n - 32
+        hi = ((a[1] << m) | (a[0] >> (32 - m))) & _DM_U32
+        lo = ((a[0] << m) | (a[1] >> (32 - m))) & _DM_U32
+    return (hi, lo)
+
+
+def _dm_rotr64(a: tuple, n: int) -> tuple:
+    return _dm_rotl64(a, (64 - (n % 64)) % 64)
+
+
+_DM_SZ_HI = 0x3DC94C3A
+_DM_SZ_LO = 0x046D678B
+
+
+def _dm_simon_zbit(k: int) -> int:
+    return (_DM_SZ_LO >> k) & 1 if k < 32 else (_DM_SZ_HI >> (k - 32)) & 1
+
+
+def _dm_simon_expand(k: list) -> list:
+    key = list(k)
+    for i in range(4, 72):
+        tmp = _dm_rotr64(key[i - 1], 3)
+        tmp = _dm_x64(tmp, key[i - 3])
+        tmp = _dm_x64(tmp, _dm_rotr64(tmp, 1))
+        key.append(_dm_x64(_dm_x64(_dm_not64(key[i - 4]), tmp),
+                           (0, (_dm_simon_zbit((i - 4) % 62) ^ 3) & _DM_U32)))
+    return key
+
+
+def _dm_simon_encrypt(pt: tuple, key: list) -> tuple:
+    x, x1 = pt[0], pt[1]
+    for i in range(72):
+        t = x1
+        r1 = _dm_rotl64(x1, 1)
+        r8 = _dm_rotl64(x1, 8)
+        f = (r1[0] & r8[0], r1[1] & r8[1])
+        x1 = _dm_x64(_dm_x64(x, f), _dm_x64(_dm_rotl64(x1, 2), key[i]))
+        x = t
+    return (x, x1)
+
+
+# ---------------------------- AES-CBC（无填充） ----------------------------
+def _dm_aes_cbc_encrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
+    if not data:
+        return b""
+    if AES_BACKEND == "cryptography":
+        enc = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
+        return enc.update(data) + enc.finalize()
+    if AES_BACKEND == "pycryptodome":
+        return CryptoAES.new(key, CryptoAES.MODE_CBC, iv).encrypt(data)
+    if len(data) % 16:
+        data = data[:len(data) - (len(data) % 16)]
+    aes = _PureAES128(key)
+    prev = iv[:16].ljust(16, b"\0")
+    out = bytearray()
+    for i in range(0, len(data), 16):
+        block = bytes(a ^ b for a, b in zip(data[i:i + 16], prev))
+        enc = aes.encrypt_block(block)
+        out.extend(enc)
+        prev = enc
+    return bytes(out)
+
+
+def _dm_pkcs7(data: bytes) -> bytes:
+    n = 16 - (len(data) % 16)
+    return data + bytes([n]) * n
+
+
+# ---------------------------- protobuf 写入 ----------------------------
+class _DmPbuf:
+    """最小的 protobuf 编码器：字段顺序即写入顺序（与 JS 版 Pbuf 一致）。"""
+
+    def __init__(self) -> None:
+        self._fields: list = []
+        self._blobs: list = []
+
+    def v(self, idx: int, val: int) -> "_DmPbuf":
+        self._fields.append((idx, 0, int(val), 0))
+        return self
+
+    def _blob(self, idx: int, data: bytes) -> "_DmPbuf":
+        self._blobs.append(data)
+        self._fields.append((idx, 2, 0, len(self._blobs) - 1))
+        return self
+
+    def s(self, idx: int, text: Any) -> "_DmPbuf":
+        return self._blob(idx, str(text).encode("utf-8"))
+
+    def raw(self, idx: int, data: bytes) -> "_DmPbuf":
+        return self._blob(idx, data)
+
+    def pb(self, idx: int, sub: "_DmPbuf") -> "_DmPbuf":
+        return self._blob(idx, sub.to_buf())
+
+    def to_buf(self) -> bytes:
+        out = bytearray()
+        for idx, kind, val, ref in self._fields:
+            _dm_varint(out, idx * 8 + (kind & 7))
+            if kind == 0:
+                _dm_varint(out, val)
+            else:
+                blob = self._blobs[ref]
+                _dm_varint(out, len(blob))
+                out.extend(blob)
+        return bytes(out)
+
+
+def _dm_varint(out: bytearray, value: int) -> None:
+    value &= 0xFFFFFFFFFFFFFFFF
+    while value >= 128:
+        out.append((value % 128) | 128)
+        value //= 128
+    out.append(value % 128)
+
+
+# ---------------------------- argus / ladon ----------------------------
+def _dm_simon_padded(pb: bytes) -> bytes:
+    key = _dm_simon_expand([_dm_u64le(_DM_SIMON_KEY, 0), _dm_u64le(_DM_SIMON_KEY, 8),
+                            _dm_u64le(_DM_SIMON_KEY, 16), _dm_u64le(_DM_SIMON_KEY, 24)])
+    out = bytearray()
+    for i in range(len(pb) // 16):
+        off = i * 16
+        ct = _dm_simon_encrypt((_dm_u64le(pb, off), _dm_u64le(pb, off + 8)), key)
+        _dm_u64le_write(ct[0], out)
+        _dm_u64le_write(ct[1], out)
+    return bytes(out)
+
+
+def _dm_argus_encrypt(bean: "_DmPbuf") -> str:
+    pb = _dm_pkcs7(bean.to_buf())
+    un = _DM_M551 + _dm_simon_padded(pb) + _DM_TAIL551
+    buf = bytearray(un[:8])
+    for i in range(8, len(un)):
+        buf.append((un[i] ^ _DM_M551[i % 8]) & 0xFF)
+    buf.reverse()
+    body = _dm_pkcs7(bytes(buf) + b"ao")
+    return base64.b64encode(_DM_PREFIX551 + _dm_aes_cbc_encrypt(_DM_AES_KEY, _DM_AES_IV, body)).decode()
+
+
+def _dm_query_param(query: str, name: str) -> str:
+    text = str(query or "")
+    if text.startswith("?"):
+        text = text[1:]
+    if "#" in text:
+        text = text.split("#", 1)[0]
+    for part in text.split("&"):
+        if not part:
+            continue
+        key = part.split("=")
+        if key[0] == name:
+            return "=".join(key[1:]) if len(key) > 1 else ""
+    return ""
+
+
+def _dm_argus_sign(query: str, stub_hex: str, ts: int, aid: int, license_id: int,
+                   device_id: str, install_id: str = "", rand_field: int = 0) -> str:
+    if not rand_field:
+        rand_field = random.randint(1, 2147483647)
+    body_hash = _dm_sm3_prefix6(bytes.fromhex(stub_hex)) if stub_hex else _dm_sm3_prefix6(b"\0" * 16)
+    query_hash = _dm_sm3_prefix6(query.encode("utf-8")) if query else _dm_sm3_prefix6(b"\0" * 16)
+    bean = _DmPbuf()
+    bean.v(1, 1077940818).v(2, 2).v(3, rand_field)
+    bean.s(4, aid).s(5, device_id).s(6, license_id)
+    bean.s(7, _dm_query_param(query, "version_name"))
+    bean.s(8, "v04.04.05-ov-android").v(9, 134744640).raw(10, b"\0" * 8).v(11, 0)
+    bean.v(12, ts * 2)
+    bean.raw(13, body_hash).raw(14, query_hash)
+    bean.pb(15, _DmPbuf().v(1, 1).v(2, 1).v(3, 1).v(7, 0xC792ECCC))
+    bean.s(16, install_id).s(20, "none").v(21, 738)
+    bean.pb(23, _DmPbuf().s(1, "NX551J").v(2, 8196).v(4, 0x80E0D800))
+    bean.v(25, 2)
+    return _dm_argus_encrypt(bean)
+
+
+def _dm_ladon_expand(md5hex: str) -> bytearray:
+    ht = bytearray(288)
+    for i in range(min(32, len(md5hex))):
+        ht[i] = ord(md5hex[i])
+
+    def load(off: int) -> tuple:
+        lo = (ht[off] | ht[off + 1] << 8 | ht[off + 2] << 16 | ht[off + 3] << 24) & _DM_U32
+        hi = (ht[off + 4] | ht[off + 5] << 8 | ht[off + 6] << 16 | ht[off + 7] << 24) & _DM_U32
+        return (hi, lo)
+
+    temp = [load(0), load(8), load(16), load(24)]
+    b0, b8 = temp[0], temp[1]
+    temp = [temp[2], temp[3]]
+    for i in range(34):
+        x9 = b0
+        x8 = _dm_rotr64(b8, 8)
+        x8 = _dm_add64(x8, x9)
+        x8 = (x8[0], x8[1] ^ i)
+        temp.append(x8)
+        x8 = _dm_x64(x8, _dm_rotl64(x9, 3))
+        for j in range(8):
+            ht[(i + 1) * 8 + j] = ((x8[1] >> (8 * j)) if j < 4 else (x8[0] >> (8 * (j - 4)))) & 0xFF
+        b0 = x8
+        b8 = temp.pop(0)
+    return ht
+
+
+def _dm_ladon_block(ht: bytearray, src: bytearray, off: int) -> bytes:
+    d0 = ((src[off + 4] | src[off + 5] << 8 | src[off + 6] << 16 | src[off + 7] << 24) & _DM_U32,
+          (src[off] | src[off + 1] << 8 | src[off + 2] << 16 | src[off + 3] << 24) & _DM_U32)
+    d1 = ((src[off + 12] | src[off + 13] << 8 | src[off + 14] << 16 | src[off + 15] << 24) & _DM_U32,
+          (src[off + 8] | src[off + 9] << 8 | src[off + 10] << 16 | src[off + 11] << 24) & _DM_U32)
+    for i in range(34):
+        h0 = (ht[i * 8 + 4] | ht[i * 8 + 5] << 8 | ht[i * 8 + 6] << 16 | ht[i * 8 + 7] << 24) & _DM_U32
+        h1 = (ht[i * 8] | ht[i * 8 + 1] << 8 | ht[i * 8 + 2] << 16 | ht[i * 8 + 3] << 24) & _DM_U32
+        total = _dm_add64(d0, _dm_rotr64(d1, 8))
+        d1 = (h0 ^ total[0], h1 ^ total[1])
+        d0 = _dm_x64(d1, _dm_rotl64(d0, 3))
+    out = bytearray()
+    _dm_u64le_write(d0, out)
+    _dm_u64le_write(d1, out)
+    return bytes(out)
+
+
+def _dm_ladon_encrypt_raw(md5hex: str, data: bytes) -> bytes:
+    ht = _dm_ladon_expand(md5hex)
+    pad = 16 - (len(data) % 16)
+    src = bytearray(data) + bytes([pad]) * pad
+    out = bytearray()
+    for i in range(len(src) // 16):
+        out.extend(_dm_ladon_block(ht, src, i * 16))
+    return bytes(out)
+
+
+def _dm_ladon_encrypt(ts: int, license_id: int, aid: int, rand4: bytes) -> str:
+    data = ("%d-%d-%d" % (ts, license_id, aid)).encode("utf-8")
+    keygen = rand4 + str(aid).encode("utf-8")
+    enc = _dm_ladon_encrypt_raw(hashlib.md5(keygen).hexdigest(), data)
+    return base64.b64encode(rand4 + enc).decode()
+
+
+def _dm_sign_headers(query: str, body: bytes, device_id: str, install_id: str = "",
+                     aid: int = 8662, license_id: int = 1611921764) -> dict:
+    ts = int(time.time())
+    stub = hashlib.md5(body).hexdigest() if body else ""
+    headers = {
+        "x-ss-req-ticket": str(ts * 1000),
+        "x-khronos": str(ts),
+        "x-ladon": _dm_ladon_encrypt(ts, license_id, aid, bytes(random.getrandbits(8) for _ in range(4))),
+        "x-argus": _dm_argus_sign(query, stub, ts, aid, license_id, device_id, ""),
+    }
+    if stub:
+        headers["x-ss-stub"] = stub
+    return headers
+
+
+# ---------------------------- 取数 ----------------------------
+def _dm_query(device_id: str) -> str:
+    """评论接口的固定 query（与红果 App 7.3.9.32 一致）。"""
+    return (
+        "device_id=%s&ac=wifi&channel=xiaomi_8662_64&aid=8662"
+        "&app_name=novelread&version_code=73932&version_name=7.3.9.32"
+        "&device_platform=android&os=android&ssmix=a&device_type=23127PN0CC"
+        "&device_brand=xiaomi&language=zh&os_api=34&os_version=14"
+        "&manifest_version_code=73932&resolution=1200*2670&dpi=520"
+        "&update_version_code=73932&host_abi=arm64-v8a&dragon_device_type=phone"
+        "&pv_player=73932&compliance_status=0&need_personal_recommend=1"
+        "&player_so_load=1&is_android_pad_screen=0"
+    ) % device_id
+
+
+def _dm_page(vid: str, series_id: str, start_ms: int, device_id: str,
+             install_id: str = "") -> tuple[list, dict, dict]:
+    """取一个时间窗的弹幕，返回 (items, common_list_info, extra)。"""
+    payload = {
+        "business_param": {
+            "book_id": str(series_id),
+            "playlet_item_duration": 0,
+            "start_offset_time": int(start_ms),
+        },
+        "comment_source": 601,
+        "comment_type": 20,
+        "count": 90,
+        "group_id": str(vid),
+        "group_type": 30,
+        "server_channel": 1000,
+        "sort": 1,
+    }
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    query = _dm_query(device_id)
+    headers = {
+        "content-type": "application/json; charset=utf-8",
+        "User-Agent": "com.dragon.read",
+        "accept": "application/json",
+    }
+    headers.update(_dm_sign_headers(query, body, device_id, install_id))
+    url = "https://%s/novel/commentapi/comment/list/%s/v1/?%s" % (_DM_HOST, vid, query)
+    sess = requests.Session()
+    sess.trust_env = False
+    response = sess.post(url, data=body, headers=headers, timeout=20)
+    data = _json_response(response)
+    if isinstance(data, Mapping) and data.get("code") not in (0, None):
+        raise HongguoPluginError("弹幕接口 code=%s %s" % (data.get("code"), data.get("message") or ""))
+    payload_data = (data or {}).get("data") if isinstance(data, Mapping) else None
+    payload_data = payload_data if isinstance(payload_data, Mapping) else {}
+    items = []
+    for row in payload_data.get("data_list") or []:
+        if not isinstance(row, Mapping):
+            continue
+        comment = row.get("comment") or {}
+        common = (comment.get("common") or {}) if isinstance(comment, Mapping) else {}
+        text = str(((common.get("content") or {}).get("text")) or "").strip()
+        if not text:
+            continue
+        expand = (comment.get("expand") or {}) if isinstance(comment, Mapping) else {}
+        offset = expand.get("offset_time")
+        if offset is None:
+            offset = expand.get("offset")
+        try:
+            offset_ms = int(offset or 0)
+        except (TypeError, ValueError):
+            offset_ms = 0
+        stat = (comment.get("stat") or {}) if isinstance(comment, Mapping) else {}
+        items.append({
+            "text": text,
+            "ms": max(0, offset_ms),
+            "like": _int(stat.get("digg_count")),
+            "role": _int(expand.get("playlet_role_type")),
+        })
+    info = payload_data.get("common_list_info") or {}
+    extra = payload_data.get("extra") or {}
+    return items, info if isinstance(info, Mapping) else {}, extra if isinstance(extra, Mapping) else {}
+
+
+def _dm_fetch(vid: str, series_id: str, device_id: str, install_id: str = "") -> list:
+    """按 30s 窗口取整集弹幕（4 路并发，边取边判断片尾），返回按时间排序的 [{text, ms}]。"""
+    global _DM_LAST_ERR
+    items: list = []
+    seen: set = set()
+    windows = [i * _DM_WINDOW_MS for i in range(_DM_MAX_WINDOWS)]
+    empty_batches = 0
+    stop = False
+    try:
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+    except Exception:
+        pool = None
+    try:
+        for base in range(0, len(windows), 4):
+            if stop:
+                break
+            batch = windows[base:base + 4]
+            if pool is None:
+                results = []
+                for start in batch:
+                    try:
+                        results.append(_dm_page(vid, series_id, start, device_id, install_id))
+                    except Exception as exc:
+                        if not _DM_LAST_ERR:
+                            _DM_LAST_ERR = str(exc)
+                        results.append(([], {}, {}))
+            else:
+                futures = [pool.submit(_dm_page, vid, series_id, start, device_id, install_id)
+                           for start in batch]
+                results = []
+                for future in futures:
+                    try:
+                        results.append(future.result(timeout=25))
+                    except Exception as exc:
+                        if not _DM_LAST_ERR:
+                            _DM_LAST_ERR = str(exc)
+                        results.append(([], {}, {}))
+            batch_empty = True
+            for page, _info, extra in results:
+                if page:
+                    batch_empty = False
+                    for item in page:
+                        key = (item["text"], item["ms"] // 500)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        items.append(item)
+                try:
+                    next_ms = int(extra.get("next_query_danmaku_list_time") or 0)
+                except (TypeError, ValueError):
+                    next_ms = 0
+                # 空窗 + 片尾时间戳 => 本集已结束，后面窗口不用再问
+                if not page and next_ms > 0:
+                    stop = True
+            empty_batches = empty_batches + 1 if batch_empty else 0
+            if empty_batches >= 2:
+                break
+    finally:
+        if pool is not None:
+            try:
+                pool.shutdown(wait=False)
+            except Exception:
+                pass
+    items.sort(key=lambda x: x["ms"])
+    return items
+
+
+def _dm_rows(items: list) -> list:
+    """原始弹幕（含 ms）转成播放器行：time 秒 + type/color/text。"""
+    out = []
+    for row in items or []:
+        if not isinstance(row, Mapping):
+            continue
+        try:
+            ms = int(row.get("ms") or 0)
+        except (TypeError, ValueError):
+            ms = 0
+        text = str(row.get("text") or "").strip()
+        if not text:
+            continue
+        out.append({"time": round(ms / 10.0) / 100.0, "type": 1,
+                    "color": 16777215, "text": text})
+    return out
+
+
+def _dm_state(vid: str) -> dict:
+    with _DM_LOCKS:
+        return dict(_DM_CACHE.get(vid) or {})
+
+
+def _dm_set_state(vid: str, items: list, error: str = "") -> None:
+    with _DM_LOCKS:
+        _DM_CACHE[vid] = {"t": time.time(), "items": items, "error": error}
+        # 32 位封顶：只留最近 16 集，挤掉最老的（弹幕版无上限，长驻看多集会 OOM）
+        while len(_DM_CACHE) > 16:
+            oldest = min(_DM_CACHE, key=lambda k: float(_DM_CACHE[k].get("t") or 0))
+            if oldest == vid:
+                break
+            _DM_CACHE.pop(oldest, None)
+            # 只挤“已完成”的事件：进行中的事件挤掉会让等待线程白等满 _DM_WAIT
+            ev = _DM_EVENTS.get(oldest)
+            if ev is not None and ev.is_set():
+                _DM_EVENTS.pop(oldest, None)
+        event = _DM_EVENTS.get(vid)
+    if event is not None:
+        event.set()
+
+
+def _dm_get(vid: str, series_id: str = "", device_id: str = "", install_id: str = "",
+            wait: float = 0) -> dict:
+    """拿一集弹幕（带缓存 + 后台去重）。wait 秒内没取完就先返回当前状态。"""
+    vid = str(vid or "")
+    if not vid:
+        return {"items": [], "error": "missing vid"}
+    series_id = str(series_id or "")
+    if not series_id:
+        # 没有 series_id（book_id）时接口只会回 103001，别浪费请求
+        return {"items": [], "error": "no sid"}
+    with _DM_LOCKS:
+        state = dict(_DM_CACHE.get(vid) or {})
+        if state and (time.time() - float(state.get("t") or 0)) < _DM_TTL:
+            return state
+        event = _DM_EVENTS.get(vid)
+        need_spawn = event is None or event.is_set()
+        if need_spawn:
+            event = threading.Event()
+            _DM_EVENTS[vid] = event
+    if need_spawn:
+        def _worker():
+            err = ""
+            try:
+                items = _dm_fetch(vid, series_id, device_id, install_id)
+                if not items:
+                    err = _DM_LAST_ERR or "empty"
+            except Exception as exc:
+                items, err = [], str(exc)
+            _dm_set_state(vid, items, err)
+        threading.Thread(target=_worker, daemon=True).start()
+    if wait > 0:
+        try:
+            event.wait(wait)
+        except Exception:
+            pass
+    return _dm_state(vid)
+
+
+def _dm_remember_series(vid: str, series_id: str) -> None:
+    if not vid or not series_id:
+        return
+    with _DM_LOCKS:
+        if len(_DM_SID_MAP) >= 4000 and str(vid) not in _DM_SID_MAP:
+            # 32 位封顶：与 _dm_series_load 的 4000 上限对齐，挤掉最早写入的
+            for key in list(_DM_SID_MAP)[:200]:
+                _DM_SID_MAP.pop(key, None)
+        _DM_SID_MAP[str(vid)] = str(series_id)
+
+
+def _dm_series_of(vid: str) -> str:
+    return str(_DM_SID_MAP.get(str(vid or "")) or "")
+
+
+_DM_SERIES_FILE = ""
+
+
+def _dm_series_path() -> str:
+    global _DM_SERIES_FILE
+    if not _DM_SERIES_FILE:
+        try:
+            _DM_SERIES_FILE = os.path.join(_hg_cache_dir(), "series_map.json")
+        except Exception:
+            _DM_SERIES_FILE = os.path.join(tempfile.gettempdir(), "hg_series_map.json")
+    return _DM_SERIES_FILE
+
+
+def _dm_series_load() -> None:
+    if _DM_SID_MAP:
+        return
+    try:
+        with open(_dm_series_path(), "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        if isinstance(data, dict):
+            for key, value in list(data.items())[:4000]:
+                if str(key).isdigit() and str(value).isdigit():
+                    _DM_SID_MAP[str(key)] = str(value)
+    except Exception:
+        pass
+
+
+def _dm_series_save() -> None:
+    try:
+        path = _dm_series_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fp:
+            json.dump(_DM_SID_MAP, fp, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _dm_xml_escape(text: str) -> str:
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;").replace("'", "&apos;"))
+
+
+def _dm_to_xml(chat_id: str, items: list) -> bytes:
+    """B 站 XML 弹幕格式，DanmakuFlameMaster / 各壳原生支持。"""
+    body = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        "<i><chatserver>hongguo</chatserver><chatid>%s</chatid><mission>0</mission>"
+        "<maxlimit>99999</maxlimit><state>0</state><real_name>0</real_name><source>k-v</source>"
+        % _dm_xml_escape(chat_id),
+    ]
+    for row in _dm_rows(items):
+        body.append('<d p="%.2f,1,25,%d,0,0,0,0">%s</d>'
+                    % (float(row["time"]), int(row["color"]), _dm_xml_escape(row["text"])))
+    body.append("</i>")
+    return "".join(body).encode("utf-8")
+
+
+def _dm_to_json(items: list) -> bytes:
+    return json.dumps(_dm_rows(items), ensure_ascii=False).encode("utf-8")
+
+
+def _dm_hit_touch(vid: str) -> None:
+    """记录播放器来取过弹幕（带封顶：512 条，防 dict 无界增长）。"""
+    try:
+        with _DM_LOCKS:
+            if len(_DM_HIT) > 512:
+                for key in sorted(_DM_HIT, key=lambda k: _DM_HIT[k])[:256]:
+                    _DM_HIT.pop(key, None)
+            _DM_HIT[str(vid)] = time.time()
+    except Exception:
+        pass
+
+
+def _dm_push_local(url: str, vid: str) -> None:
+    """老壳可能不读 playerContent.danmaku，用壳自己的本地接口再推一次。"""
+    global _DM_PUSHED
+    if not _DM_PUSH_LOCAL or not url:
+        return
+    with _DM_LOCKS:
+        if vid in _DM_PUSHED:
+            return
+        if len(_DM_PUSHED) > 512:  # 32 位封顶
+            _DM_PUSHED.clear()
+        _DM_PUSHED.add(vid)
+
+    def _run():
+        try:
+            time.sleep(2.5)
+            # 播放器已经自己来取过 /hg_dm 了，就不必再推一遍（免得弹幕闪一下）
+            if _DM_HIT.get(vid, 0) > time.time() - 30:
+                return
+            from urllib.parse import quote as _quote
+            target = "http://127.0.0.1:9978/action?do=refresh&type=danmaku&path=" + _quote(url, safe="")
+            session = requests.Session()
+            session.trust_env = False
+            session.get(target, timeout=3)
+        except Exception:
+            pass
+    threading.Thread(target=_run, daemon=True).start()
+
+
 class Spider(_BaseSpider):
     def __init__(self):
         self.device_id = str(random.randint(10**17, 10**18 - 1))
@@ -5120,7 +5911,50 @@ class Spider(_BaseSpider):
             _hg_cache_cleanup(False)
         except Exception:
             pass
+        try:
+            _dm_series_load()
+        except Exception:
+            pass
         return None
+
+    def _danmaku_payload(self, port: int, vid: str) -> dict:
+        """把本机弹幕地址挂进 playerContent，并顺手预热取数。
+        全程 wait=0：预热在后台线程跑，绝不阻塞出流。"""
+        if not _DM_ENABLED or not port:
+            return {}
+        sid = _dm_series_of(vid)
+        if not sid:
+            try:
+                _dm_series_load()
+                sid = _dm_series_of(vid)
+            except Exception:
+                sid = ""
+        if not sid:
+            # 剧集映射还没建立（没走过 detailContent），这集先不挂弹幕
+            return {}
+        query = urlencode({
+            "vid": vid,
+            "sid": sid,
+            "fmt": "xml",
+            "did": self.device_id or "",
+            "iid": self.install_id or "",
+        })
+        url = "http://127.0.0.1:%d/hg_dm?%s" % (port, query)
+        # 播放器起播后才会来取弹幕，这里先把取数线程跑起来（不阻塞出流）
+        try:
+            _dm_get(vid, sid, self.device_id or "", self.install_id or "", wait=0)
+        except Exception:
+            pass
+        try:
+            _dm_push_local(url, vid)
+        except Exception:
+            pass
+        label = "红果弹幕"
+        if _DM_IN_PLAYER == "url":
+            return {"danmaku": url}
+        if _DM_IN_PLAYER == "list":
+            return {"danmaku": [{"name": label, "url": url}]}
+        return {}
 
     def destroy(self):
         try:
@@ -5136,6 +5970,15 @@ class Spider(_BaseSpider):
         except Exception:
             pass
         _SEARCH_NEG.clear()
+        # 弹幕缓存一并释放：长驻进程反复进出详情/播放，32 位内存水位只降不涨
+        try:
+            with _DM_LOCKS:
+                _DM_CACHE.clear()
+                _DM_EVENTS.clear()
+                _DM_HIT.clear()
+                _DM_PUSHED.clear()
+        except Exception:
+            pass
 
     def homeContent(self, filter):
         """分类=官网四套内容类型+官网四榜单(排后)；>20项的筛选拆双组防 OK影视截断。"""
@@ -5319,6 +6162,14 @@ class Spider(_BaseSpider):
         s = p.get("seriesDetail") or {}
         vids = s.get("vid_list") or []
         actors = [str(x.get("nickname")) for x in (s.get("celebrities") or []) if isinstance(x, dict) and x.get("nickname")]
+        # 弹幕：剧集映射（vid→series_id）是取数钥匙，先落内存+落盘再返回详情
+        try:
+            _dm_series_load()
+            for _one in vids:
+                _dm_remember_series(_one, sid)
+            _dm_series_save()
+        except Exception:
+            pass
         play_from = []
         play_url = []
         for q, line_name in _HG_QUALITY_LINES:
@@ -5395,13 +6246,19 @@ class Spider(_BaseSpider):
                     "iid": self.install_id or "",
                 }
             )
-            return {
+            result = {
                 "parse": 0,
                 "jx": 0,
                 "playUrl": "",
                 "url": "http://127.0.0.1:%d/hg.mp4?%s" % (port, query),
                 "header": {"User-Agent": UA},
             }
+            # 弹幕挂载必须全程兜底：任何异常都吞掉，出流结果照常返回（流畅度红线）
+            try:
+                result.update(self._danmaku_payload(port, vid))
+            except Exception:
+                pass
+            return result
         # 回退：壳代理（保留壳自带的 do=py，不要覆盖 do）
         _hg_trace("流服务不可用→壳代理回退 vid=%s q=%s" % (vid, q))
         proxy = ""
