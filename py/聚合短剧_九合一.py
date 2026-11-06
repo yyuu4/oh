@@ -6121,24 +6121,52 @@ AGG_FILTER = {
    "name": "分类",
    "value": [
     {
-     "n": "精选",
-     "v": "53@精选"
+     "n": "全部",
+     "v": "0"
     },
     {
      "n": "古装",
-     "v": "54@古装"
+     "v": "444"
     },
     {
      "n": "重生",
-     "v": "55@重生"
+     "v": "439-465"
     },
     {
      "n": "家庭",
-     "v": "56@家庭"
+     "v": "714-1126"
     },
     {
-     "n": "恋爱",
-     "v": "57@恋爱"
+     "n": "都市",
+     "v": "1129"
+    },
+    {
+     "n": "甜宠",
+     "v": "462"
+    },
+    {
+     "n": "逆袭",
+     "v": "417-464"
+    },
+    {
+     "n": "战神",
+     "v": "1153-1173"
+    },
+    {
+     "n": "赘婿",
+     "v": "1710"
+    },
+    {
+     "n": "穿越",
+     "v": "916"
+    },
+    {
+     "n": "复仇",
+     "v": "416-1708"
+    },
+    {
+     "n": "青春",
+     "v": "1170"
     }
    ]
   }
@@ -6964,7 +6992,7 @@ AGG_FILTER = {
 AGG_PLATFORM = {
     "51": {"host": "https://51hub.com", "list": "/new-theater-category", "detail": "/video/videolist", "search": "/search"},
     "星星": {"host": "http://read.api.duodutek.com", "list": "/novel-api/app/pageModel/getResourceById", "detail": "/novel-api/basedata/book/getChapterList"},
-    "河马": {"host": "https://freevideo.zqqds.cn", "url1": "/free-video-portal/portal"},
+    "河马": {"host": "https://www.kuaikaw.cn", "url1": "/free-video-portal/portal", "browse": "/browse/%s/%s", "drama": "/drama/%s", "search": "/seo/video/6007"},
     "七猫": {"host": "https://api-store.qmplaylet.com", "url1": "/api/v1/playlet/index", "url2": "https://api-read.qmplaylet.com/player/api/v1/playlet/info", "search": "/api/v1/playlet/search"},
     "星芽": {"host": "https://app.whjzjx.cn", "url1": "/cloud/v2/theater/home_page?theater_class_id", "url2": "/v2/theater_parent/detail", "search": "/v3/search", "loginUrl": "https://u.shytkjgs.com/user/v1/account/login"},
     "围观": {"host": "https://api.drama.9ddm.com", "url1": "/drama/home/shortVideoTags?version_code=1500&os_type=1", "url2": "/drama/home/shortVideoDetail?version_code=1000&os_type=1", "search": "/drama/home/search?version_code=1500&os_type=1"},
@@ -7000,7 +7028,7 @@ AGG_HEADERS = {
 
 # filter_def 默认分类
 AGG_FILTER_DEF = {
-    "51": {"area": "0-0-0-0-0-0"}, "星星": {"area": "1287"}, "河马": {"area": "53@精选"},
+    "51": {"area": "0-0-0-0-0-0"}, "星星": {"area": "1287"}, "河马": {"area": "0"},
     "星芽": {"area": "1"}, "西饭": {"area": "68@都市"}, "七猫": {"area": "0"},
     "围观": {"area": ""}, "牛牛": {"area": "全部"}, "山海": {"area": "1"}, "好看": {"area": "1"},
     "百度": {"class": "新剧", "area": "全部"}, "薏米": {"area": "channel_c6f50cd9"},
@@ -7194,6 +7222,8 @@ def _ag_fetch(url, headers=None, method="GET", body=None):
 class _AG_HM_Service:
     KEY = bytes.fromhex("647a6b6a67667978677368796c677a6d")
     IV = bytes.fromhex("6170697570646f776e65646372797074")
+    UA = ("Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36")
 
     @classmethod
     def encrypt(cls, plaintext: str) -> str:
@@ -7204,6 +7234,35 @@ class _AG_HM_Service:
     def decrypt(cls, word: str) -> str:
         raw = bytes.fromhex(word)
         return _ag_aes_cbc_decrypt(raw, cls.KEY, cls.IV).decode("utf-8", "ignore")
+
+    @classmethod
+    def page_props(cls, path: str) -> dict:
+        """抓取 kuaikaw.cn SSR 页面并解析 __NEXT_DATA__ → pageProps。"""
+        html = _ag_request("https://www.kuaikaw.cn" + path, headers={
+            "User-Agent": cls.UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        })
+        m = re.search(r'<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)</script>', html or "")
+        if not m:
+            return {}
+        j = _ag_json(m.group(1))
+        return ((j.get("props") or {}).get("pageProps")) or {}
+
+    @classmethod
+    def search(cls, keyword: str, page: int) -> dict:
+        body = {"sourceType": 1, "keyword": str(keyword or ""), "index": max(1, int(page or 1))}
+        raw = _ag_request("https://www.kuaikaw.cn/seo/video/6007", method="POST", headers={
+            "Content-Type": "application/json",
+            "pname": "www.kuaikaw.cn",
+            "tmpid": "",
+            "User-Agent": cls.UA,
+            "Origin": "https://www.kuaikaw.cn",
+            "Referer": "https://www.kuaikaw.cn/search",
+        }, body=json.dumps(body, ensure_ascii=False))
+        res = _ag_json(raw)
+        if res.get("retCode") == 0:
+            return res.get("data") or {}
+        return {}
 
     @classmethod
     def api(cls, code, body_data):
@@ -7246,7 +7305,9 @@ class _AG_NN_Service:
         try:
             html = _ag_request("https://new.tianjinzhitongdaohe.com/api/v1/app/user/visitorInfo",
                                headers={"deviceid": "aa11fc54-ba9c-3980-add5-447d3fa5b939",
-                                        "User-Agent": "okhttp/4.12.0"})
+                                        "User-Agent": "okhttp/4.12.0",
+                                        "client": "app",
+                                        "devicetype": "Android"})
             cfg["nn_token"] = _ag_json(html)["data"]["token"]
         except Exception:
             pass
@@ -7285,7 +7346,9 @@ class _AG_NN_Service:
             "token": cfg.get("nn_token", ""),
             "deviceid": "aa11fc54-ba9c-3980-add5-447d3fa5b939",
             "content-type": "application/json;charset=UTF-8",
-            "User-Agent": "okhttp/4.12.0"},
+            "User-Agent": "okhttp/4.12.0",
+            "client": "app",
+            "devicetype": "Android"},
             body=json.dumps(body, ensure_ascii=False)))
 
     @classmethod
@@ -8843,18 +8906,16 @@ class _AggSpider(_BaseSpider):
         plat = AGG_PLATFORM.get(cate, {})
         try:
             if cate == "河马":
-                cid, cname = (area or "53@精选").split("@")
-                body = {"recSwitch": True, "storePageId": 10002, "channelGroupId": "10",
-                        "channelId": int(cid), "channelName": cname, "lastColumnStyle": 3,
-                        "fromColumnId": "1", "pageFlag": str(page), "theaterSubscriptSwitch": True}
-                res = _AG_HM_Service.api("1125", body)
-                cols = res.get("columnData") if isinstance(res, dict) else None
-                if cols and cols[0]:
-                    for vod in cols[0].get("videoData", []):
-                        d.append({"title": vod.get("bookName"), "img": vod.get("coverWap"),
-                                  "desc": "河马 | 更新%s集" % vod.get("updateNum"),
-                                  "url": "河马@%s" % vod.get("bookId")})
-                return d
+                # 旧 1125 已死；改走 kuaikaw.cn /browse/{typeThreeId}/{page} SSR
+                tid = str(area or "0").split("@")[0].strip() or "0"
+                pp = _AG_HM_Service.page_props("/browse/%s/%s" % (tid, max(1, int(page or 1))))
+                books = pp.get("bookList") or []
+                pages = pp.get("pages") or 0
+                for vod in books:
+                    d.append({"title": vod.get("bookName"), "img": vod.get("coverWap"),
+                              "desc": "河马 | %s" % (vod.get("statusDesc") or vod.get("updateNum") or ""),
+                              "url": "河马@%s" % vod.get("bookId")})
+                return {"list": d, "pagecount": int(pages) if pages else 0}
             if cate == "百度":
                 t = int(time.time())
                 version = _ag_md5(str(t) + "v2")
@@ -9053,17 +9114,27 @@ class _AggSpider(_BaseSpider):
         VOD = {}
         try:
             if platform == "河马":
+                # 旧 1131/1132 已死；改走 /drama/{bookId} SSR。免费章带直链，付费章无源。
                 book_id = vid
-                res = _AG_HM_Service.api("1131", {"bookId": book_id})
-                if res.get("videoInfo"):
-                    v = res["videoInfo"]
-                    list_res = _AG_HM_Service.api("1132", {"bookId": book_id,
-                                                           "chapterMin": 1, "chapterMax": 10000})
-                    chapters = list_res.get("chapterList") or []
-                    eps = ["%s$%s++%s++%s" % (c.get("chapterName"), c.get("chapterId"),
-                                              c.get("chapterIndex"), book_id) for c in chapters]
+                pp = _AG_HM_Service.page_props("/drama/%s" % book_id)
+                v = pp.get("bookInfoVo") or {}
+                chapters = pp.get("chapterList") or []
+                eps = []
+                for c in chapters:
+                    cv = c.get("chapterVideoVo") or {}
+                    url = (cv.get("m3u8") or cv.get("m3u8720p")
+                           or cv.get("mp4") or cv.get("mp4720p") or "").strip()
+                    name = c.get("chapterName") or ""
+                    if url:
+                        # 免费章：直接塞播放地址，player 见 http 直出
+                        eps.append("%s$%s" % (name, url))
+                    else:
+                        # 付费章：保留旧格式，player 尝试代理/失败
+                        eps.append("%s$%s++%s++%s" % (name, c.get("chapterId"),
+                                                      c.get("chapterIndex"), book_id))
+                if v or eps:
                     return {"vod_name": v.get("bookName"), "vod_pic": v.get("coverWap"),
-                            "vod_id": or_id, "vod_remarks": v.get("finishStatusCn"),
+                            "vod_id": or_id, "vod_remarks": v.get("statusDesc") or "",
                             "vod_content": v.get("introduction") or "",
                             "vod_play_from": "河马短剧", "vod_play_url": "#".join(eps)}
             elif platform == "百度":
@@ -9428,13 +9499,11 @@ class _AggSpider(_BaseSpider):
                         results.append({"title": i.get("name"), "url": "牛牛@%s" % i.get("id"),
                                         "desc": "牛牛 | %s" % i.get("type"), "img": i.get("cover")})
                 elif pid == "河马":
-                    body = {"keyword": key, "page": int(page), "size": 15,
-                            "searchSource": "搜索按钮", "hotWordType": 2, "tagIds": "",
-                            "reservationSwitch": True}
-                    res = _AG_HM_Service.api("1803", body)
-                    for vod in (res.get("searchVos") or []):
+                    # 旧 1803 已死；改走 /seo/video/6007 搜索接口
+                    data = _AG_HM_Service.search(key, page)
+                    for vod in (data.get("bookList") or []):
                         results.append({"title": vod.get("bookName"), "img": vod.get("coverWap"),
-                                        "desc": "河马 | 更新%s集" % vod.get("updateNum"),
+                                        "desc": "河马 | %s" % (vod.get("statusDesc") or ""),
                                         "url": "河马@%s" % vod.get("bookId")})
                 elif pid == "百度":
                     body = json.dumps({"query": key, "page": page, "attribute": ["title"],
@@ -9574,6 +9643,11 @@ class _AggSpider(_BaseSpider):
         inp = play_id
         try:
             if "河马" in flag:
+                # 新格式：detail 免费章塞了直链（http 开头）
+                if inp.startswith("http://") or inp.startswith("https://"):
+                    return {"parse": 0, "url": inp,
+                            "header": {"User-Agent": _AG_HM_Service.UA,
+                                       "Referer": "https://www.kuaikaw.cn/"}}
                 arr = inp.split("++")
                 chapter_id, chapter_index, book_id = arr[0], arr[1], arr[2]
                 body = {"bookId": book_id, "chapterId": chapter_id, "unClockType": "pay",
@@ -12783,8 +12857,15 @@ class Spider(_BaseSpider):
             except (TypeError, ValueError):
                 page = 1
             items = self._ag.category(real, area, page)
+            pagecount = None
+            if isinstance(items, dict):
+                pagecount = items.get("pagecount")
+                items = items.get("list") or []
             lst = _dj_agg_items_to_list(items, "AG")
-            return {"page": page, "pagecount": page if len(lst) < 18 else page + 1,
+            if not pagecount or pagecount <= 0:
+                # 旧启发式：满 18 条才认为有下一页；browse 每页 10 条，依赖上层 pagecount
+                pagecount = page if len(lst) < 18 else page + 1
+            return {"page": page, "pagecount": int(pagecount),
                     "limit": len(lst) or 18, "total": 999999, "list": lst, "parse": 0, "jx": 0}
         return {"list": []}
 
