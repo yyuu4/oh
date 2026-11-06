@@ -8939,7 +8939,8 @@ class _AggSpider(_BaseSpider):
                                                         "typeId": "S1"}, "pageNum": page, "pageSize": 40})
                 for item in ((res.get("data") or {}).get("records") or []):
                     d.append({"title": item.get("name"), "url": "牛牛@%s" % item.get("id"),
-                              "desc": "牛牛 | 共%s集" % item.get("totalEpisode"), "img": item.get("cover")})
+                              "desc": "牛牛 | 共%s集" % item.get("totalEpisode"),
+                              "img": _dj_nn_pic(item.get("cover"))})
                 return d
             if cate == "山海":
                 url = ("%s/shanhai-theater/v2/theater_parent/cloud/v2/theater/home_page"
@@ -9129,9 +9130,8 @@ class _AggSpider(_BaseSpider):
                         # 免费章：直接塞播放地址，player 见 http 直出
                         eps.append("%s$%s" % (name, url))
                     else:
-                        # 付费章：保留旧格式，player 尝试代理/失败
-                        eps.append("%s$%s++%s++%s" % (name, c.get("chapterId"),
-                                                      c.get("chapterIndex"), book_id))
+                        # 付费章：SSR/episode/JS 均无源（锁章），直接 toast
+                        eps.append("%s$toast://付费章无免费源" % name)
                 if v or eps:
                     return {"vod_name": v.get("bookName"), "vod_pic": v.get("coverWap"),
                             "vod_id": or_id, "vod_remarks": v.get("statusDesc") or "",
@@ -9174,7 +9174,7 @@ class _AggSpider(_BaseSpider):
                         eps = ["第%s集$%s+%s+%s" % (it.get("index"), it.get("index"),
                                                    it.get("lock_type"), list_res["thirdPlayId"])
                                for it in erl]
-                return {"vod_name": desc_res.get("name"), "vod_pic": desc_res.get("cover"),
+                return {"vod_name": desc_res.get("name"), "vod_pic": _dj_nn_pic(desc_res.get("cover")),
                         "vod_remarks": "评分:%s" % desc_res.get("score"),
                         "vod_content": desc_res.get("introduce"),
                         "vod_play_from": "牛牛短剧", "vod_play_url": "#".join(eps)}
@@ -9497,7 +9497,8 @@ class _AggSpider(_BaseSpider):
                                               "pageNum": page, "pageSize": 40})
                     for i in ((res.get("data") or {}).get("records") or []):
                         results.append({"title": i.get("name"), "url": "牛牛@%s" % i.get("id"),
-                                        "desc": "牛牛 | %s" % i.get("type"), "img": i.get("cover")})
+                                        "desc": "牛牛 | %s" % i.get("type"),
+                                        "img": _dj_nn_pic(i.get("cover"))})
                 elif pid == "河马":
                     # 旧 1803 已死；改走 /seo/video/6007 搜索接口
                     data = _AG_HM_Service.search(key, page)
@@ -12585,6 +12586,14 @@ def _dj_agg_items_to_list(items, tag="AG"):
             "vod_remarks": it.get("desc") or "",
         })
     return out
+
+
+def _dj_nn_pic(url):
+    """牛牛封面 OSS(cattleduanju) 账号已停用(UserDisable)，全站 403 → 置空防裂图。"""
+    u = str(url or "")
+    if "cattleduanju.oss" in u:
+        return ""
+    return u
 
 
 class Spider(_BaseSpider):
