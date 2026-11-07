@@ -7236,6 +7236,48 @@ class _AG_HM_Service:
         return _ag_aes_cbc_decrypt(raw, cls.KEY, cls.IV).decode("utf-8", "ignore")
 
     @classmethod
+    def encrypt_b64(cls, plaintext: str) -> str:
+        # 等价 a3.a：先压掉 ", " / ": " 空格，再 AES/CBC + Base64
+        s = plaintext.replace(", ", ",").replace(": ", ":")
+        ct = _ag_aes_cbc_encrypt(s.encode("utf-8"), cls.KEY, cls.IV)
+        return base64.b64encode(ct).decode("ascii").strip()
+
+    @classmethod
+    def decrypt_b64(cls, word: str) -> str:
+        raw = base64.b64decode(word)
+        return _ag_aes_cbc_decrypt(raw, cls.KEY, cls.IV).decode("utf-8", "ignore")
+
+    @classmethod
+    def build_datas(cls) -> str:
+        # 等价 ShortHema.l()：动态设备信息 → a3.a 加密
+        now = datetime.datetime.now()
+        sess = str(uuid.uuid4())
+        obj = {
+            "version": "3.6.0",
+            "pname": "com.dz.hmjc",
+            "channelCode": "HMJC1000001",
+            "utdidTmp": "A" + now.strftime("%Y%m%d%H%M%S") + "TVBX",
+            "token": "",
+            "utdid": "7d2e96f3ed64e228ef1b337de386cdce",
+            "os": "android",
+            "osv": 30,
+            "brand": "Redmi",
+            "model": "M2012K10C",
+            "manu": "Xiaomi",
+            "userId": "",
+            "launch": "shortcut",
+            "mchid": "HMJC1000001",
+            "nchid": "HMJC1000004",
+            "session1": sess,
+            "session2": sess,
+            "startScene": "",
+            "recSwitch": 1,
+            "installTime": int(time.time() * 1000),
+            "p": 36,
+        }
+        return cls.encrypt_b64(json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
+
+    @classmethod
     def page_props(cls, path: str) -> dict:
         """抓取 kuaikaw.cn SSR 页面并解析 __NEXT_DATA__ → pageProps。"""
         html = _ag_request("https://www.kuaikaw.cn" + path, headers={
@@ -7265,21 +7307,65 @@ class _AG_HM_Service:
         return {}
 
     @classmethod
-    def api(cls, code, body_data):
-        plat = AGG_PLATFORM["河马"]
-        url = "%s%s/%s" % (plat["host"], plat["url1"], code)
-        enc_body = cls.encrypt(json.dumps(body_data, ensure_ascii=False))
+    def api(cls, code, body_data, retry=0):
+        # 等价 ShortHema.b1：freevideo.zqqds.cn + alg/datas/x-request-id + AES-B64 体
+        url = "https://freevideo.zqqds.cn/free-video-portal/portal/%s" % code
+        enc_body = cls.encrypt_b64(json.dumps(body_data, ensure_ascii=False))
         try:
             raw = _ag_request(url, method="POST", headers={
-                "datas": HM_STATIC_DATAS, "content-type": "text/plain",
-                "user-agent": "okhttp/4.10.0", "Referer": "https://freevideo.zqqds.cn",
+                "User-Agent": "okhttp/4.10.0",
+                "Content-Type": "application/json; charset=utf-8",
+                "alg": "HG45LKBS",
+                "datas": cls.build_datas(),
+                "x-request-id": str(uuid.uuid4()),
             }, body=enc_body)
             res = _ag_json(raw)
-            if res and res.get("data"):
-                return _ag_json(cls.decrypt(res["data"]))
+            code_v = res.get("code")
+            if code_v not in (0, None):
+                # code=8 刷新 datas 重试一次
+                if code_v == 8 and retry < 1:
+                    return cls.api(code, body_data, retry + 1)
+                return {}
+            data = res.get("data")
+            if isinstance(data, str) and data:
+                return _ag_json(cls.decrypt_b64(data))
+            return res
         except Exception:
             pass
         return {}
+
+    @classmethod
+    def play_url(cls, book_id, chapter_id) -> str:
+        """portal/1139 unClockType=load：免费/付费章均返回 chapterInfo[0].content 直链。"""
+        body = {
+            "bookId": str(book_id),
+            "chapterId": str(chapter_id),
+            "unClockType": "load",
+            "tierPlaySource": None,
+            "chapterIds": [str(chapter_id)],
+            "omap": {
+                "expId": None, "logId": None, "originName": "bigdata_rec",
+                "recId": None, "scene": "dzmf_video_sc_reco",
+                "sceneId": "dzmf_video_sc_reco",
+                "strategyId": "godum7go", "strategyName": "omap",
+            },
+        }
+        res = cls.api("1139", body)
+        ci = res.get("chapterInfo") or []
+        if not ci:
+            return ""
+        content = (ci[0] or {}).get("content") or {}
+        if not isinstance(content, dict):
+            return ""
+        url = (content.get("mp4Url") or "").strip()
+        if not url:
+            switch = content.get("mp4SwitchUrl") or []
+            if switch and switch[0]:
+                url = str(switch[0]).strip()
+        if not url:
+            url = (content.get("m3u8720p") or content.get("m3u8") or
+                   content.get("m3u8Url") or "").strip()
+        return url
 
 
 # ------ 牛牛服务 ------
@@ -9115,7 +9201,7 @@ class _AggSpider(_BaseSpider):
         VOD = {}
         try:
             if platform == "河马":
-                # 旧 1131/1132 已死；改走 /drama/{bookId} SSR。免费章带直链，付费章无源。
+                # 旧 1131/1132 已死；改走 /drama/{bookId} SSR。免费章直链，付费章 lazy id。
                 book_id = vid
                 pp = _AG_HM_Service.page_props("/drama/%s" % book_id)
                 v = pp.get("bookInfoVo") or {}
@@ -9126,12 +9212,13 @@ class _AggSpider(_BaseSpider):
                     url = (cv.get("m3u8") or cv.get("m3u8720p")
                            or cv.get("mp4") or cv.get("mp4720p") or "").strip()
                     name = c.get("chapterName") or ""
+                    ch_id = str(c.get("chapterId") or "")
                     if url:
                         # 免费章：直接塞播放地址，player 见 http 直出
                         eps.append("%s$%s" % (name, url))
                     else:
-                        # 付费章：SSR/episode/JS 均无源（锁章），直接 toast
-                        eps.append("%s$toast://付费章无免费源" % name)
+                        # 付费章：lazy id，player 走 portal/1139 unClockType=load 取源
+                        eps.append("%s$hm++%s++%s" % (name, book_id, ch_id))
                 if v or eps:
                     return {"vod_name": v.get("bookName"), "vod_pic": v.get("coverWap"),
                             "vod_id": or_id, "vod_remarks": v.get("statusDesc") or "",
@@ -9649,6 +9736,16 @@ class _AggSpider(_BaseSpider):
                     return {"parse": 0, "url": inp,
                             "header": {"User-Agent": _AG_HM_Service.UA,
                                        "Referer": "https://www.kuaikaw.cn/"}}
+                # 付费章 lazy：hm++{bookId}++{chapterId} → portal/1139 取源
+                if inp.startswith("hm++"):
+                    arr = inp.split("++")
+                    if len(arr) >= 3:
+                        book_id, chapter_id = arr[1], arr[2]
+                        play_url = _AG_HM_Service.play_url(book_id, chapter_id)
+                        if play_url:
+                            return {"parse": 0, "url": play_url,
+                                    "header": {"User-Agent": "okhttp/4.10.0"}}
+                        return {"parse": 0, "url": "toast://1139 取源失败"}
                 arr = inp.split("++")
                 chapter_id, chapter_index, book_id = arr[0], arr[1], arr[2]
                 body = {"bookId": book_id, "chapterId": chapter_id, "unClockType": "pay",
@@ -9670,6 +9767,11 @@ class _AggSpider(_BaseSpider):
                     play_url = ("https://api.cenguigui.cn/api/duanju/hema.php?book_id=%s&video_id=%s&type=mp4"
                                 % (book_id, chapter_index))
                     return {"parse": 0, "url": play_url}
+                # 兜底：再试 1139
+                play_url = _AG_HM_Service.play_url(book_id, chapter_id)
+                if play_url:
+                    return {"parse": 0, "url": play_url,
+                            "header": {"User-Agent": "okhttp/4.10.0"}}
                 return {"parse": 0, "url": "toast://解析失败"}
             if "百度" in flag:
                 html = _ag_post("https://sv.baidu.com/appui/api?cmd=video/relate&log=vhk&tn=1020970b&ctn=1008350n&blur=1",
