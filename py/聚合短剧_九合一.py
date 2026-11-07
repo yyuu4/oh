@@ -9235,9 +9235,14 @@ class _AggSpider(_BaseSpider):
             elif platform == "牛牛":
                 desc_res = _AG_NN_Service.api(cfg, "%s/api/v1/app/play/movieDesc" % plat["host"],
                                               {"id": vid, "typeId": "S1"}).get("data", {})
-                list_res = _AG_NN_Service.api(cfg, "%s/api/v1/app/play/movieDetails" % plat["host"],
-                                              {"id": vid, "source": 0, "typeId": "S1",
-                                               "userId": "546932"}).get("data", {})
+                # 部分剧 source=0 会 1012/空，需 0→1 回退（如 39793 仅 source=1）
+                list_res = {}
+                for _src in (0, 1):
+                    list_res = _AG_NN_Service.api(cfg, "%s/api/v1/app/play/movieDetails" % plat["host"],
+                                                  {"id": vid, "source": _src, "typeId": "S1",
+                                                   "userId": "546932"}).get("data", {})
+                    if list_res:
+                        break
                 eps = []
                 if list_res.get("episodeList"):
                     eps = ["%s$%s+%s+free" % (item.get("episode"), item.get("id"), vid)
@@ -9261,7 +9266,8 @@ class _AggSpider(_BaseSpider):
                         eps = ["第%s集$%s+%s+%s" % (it.get("index"), it.get("index"),
                                                    it.get("lock_type"), list_res["thirdPlayId"])
                                for it in erl]
-                return {"vod_name": desc_res.get("name"), "vod_pic": _dj_nn_pic(desc_res.get("cover")),
+                return {"vod_name": desc_res.get("name") or list_res.get("name"),
+                        "vod_pic": _dj_nn_pic(desc_res.get("cover")),
                         "vod_remarks": "评分:%s" % desc_res.get("score"),
                         "vod_content": desc_res.get("introduce"),
                         "vod_play_from": "牛牛短剧", "vod_play_url": "#".join(eps)}
@@ -9786,10 +9792,16 @@ class _AggSpider(_BaseSpider):
             if "牛牛" in flag:
                 p = inp.split("+")
                 if len(p) == 3 and p[2] == "free":
-                    r = _AG_NN_Service.api(cfg, "https://new.tianjinzhitongdaohe.com/api/v1/app/play/movieDetails",
-                                           {"id": p[1], "source": 0, "typeId": "S1",
-                                            "userId": "546932", "episodeId": p[0]})
-                    return {"parse": 0, "url": (r.get("data") or {}).get("url") or "toast://无法播放"}
+                    # free 直链同样需 source 0→1 回退
+                    url = ""
+                    for _src in (0, 1):
+                        r = _AG_NN_Service.api(cfg, "https://new.tianjinzhitongdaohe.com/api/v1/app/play/movieDetails",
+                                               {"id": p[1], "source": _src, "typeId": "S1",
+                                                "userId": "546932", "episodeId": p[0]})
+                        url = (r.get("data") or {}).get("url") or ""
+                        if url:
+                            break
+                    return {"parse": 0, "url": url or "toast://无法播放"}
                 elif len(p) == 3:
                     if p[1] != "free":
                         # ad_unlock 必须带 shortplay_id + index + lock_index，缺任一即 params error
