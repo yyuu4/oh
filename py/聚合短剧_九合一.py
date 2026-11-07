@@ -35,6 +35,16 @@
 #     vid→series_id 映射，playerContent 挂本机 /hg_dm 地址并预热取数，
 #     _StreamHandler._serve 增加 /hg_dm 路由（与视频流独立连接，最多等
 #     _DM_WAIT 秒）；init 加载映射、destroy 释放弹幕缓存
+#  10. 河马(HM)付费章打通：api() 改走 freevideo.zqqds.cn portal（alg=HG45LKBS
+#     + 动态 datas 设备头 + AES/CBC Body），detail 付费章塞 lazy
+#     hm++bookId++chapterId，player 识别 hm++ 后调 portal/1139 取 mp4Url
+#     （免费章同走 1139；旧 1133 保留兜底）
+#  11. 牛牛(NN)详情/播放空列表：movieDetails 需 source=0→1 回退（部分剧
+#     source=0 返回 1012/空，如 39793 仅 source=1 有数据；76287 等相反），
+#     desc 空时 vod_name 回退 list_res.name；player free 直链同样双 source
+#     回退。封面维持 _dj_nn_pic 清空（OSS cattleduanju 已 UserDisable）
+#  12. 五五(WW)源站挂：duanju55.com 全站 nginx 默认页、/index.php 404，
+#     未发现新域名——分类/搜索空属上游死站，暂不改代码
 # =====================================================================
 #  聚合短剧 · 九合一
 #     (红果 + 黄豆 + 黄果 + 野果 + 禁果 + 红果黄剧 + 聚合短剧[短] + 2048短剧 + 狂飙短剧)
