@@ -45,6 +45,16 @@
 #     回退。封面维持 _dj_nn_pic 清空（OSS cattleduanju 已 UserDisable）
 #  12. 五五(WW)源站挂：duanju55.com 全站 nginx 默认页、/index.php 404，
 #     未发现新域名——分类/搜索空属上游死站，暂不改代码
+#  13. 河马(HM)全章可播：对齐 sun.json 参考实现 ShortHema——detail 全章
+#     一律 lazy hm++bookId++chapterId（不再内嵌 SSR 免费直链，该链会间歇
+#     403）；SSR chapterList 空时回退 portal/1131；player 统一 1139 取源，
+#     1139 失败再试 1133。实测免费/付费章均 206 可播
+#  14. 五一(51)整站改版修复：旧 /new-theater-category、/play/{id}/{ep}/ 全 404。
+#     列表改 /newest、/recommend、/ai-duanju、/ai-huanlian、/ai-mogai（SSR 卡片，
+#     /{path}/{page}/ 翻页）；详情/播放改 /video/{id}/、/video/{id}/ep-{n}/，
+#     解析内嵌 videoInitialData（trackingEpisodes 全部分集 + epPlaySrcs/videoSrc
+#     m3u8 直链）；搜索改 /search/?keyword=（302 → /search/video/{kw}/）。
+#     封面仍走回环代理 eng=wuyi（pic.gyezbp.cn 仍为 AES 密文，_srv_pic 可解）
 # =====================================================================
 #  聚合短剧 · 九合一
 #     (红果 + 黄豆 + 黄果 + 野果 + 禁果 + 红果黄剧 + 聚合短剧[短] + 2048短剧 + 狂飙短剧)
@@ -6091,16 +6101,24 @@ AGG_FILTER = {
    "name": "分类",
    "value": [
     {
-     "n": "全部短剧",
-     "v": "0-0-0-0-0-0"
+     "n": "最新上架",
+     "v": "/newest"
     },
     {
-     "n": "男频",
-     "v": "0-0-0-1-0-0"
+     "n": "推荐",
+     "v": "/recommend"
     },
     {
-     "n": "女频",
-     "v": "0-0-0-2-0-0"
+     "n": "AI成人短剧",
+     "v": "/ai-duanju"
+    },
+    {
+     "n": "AI换脸",
+     "v": "/ai-huanlian"
+    },
+    {
+     "n": "AI魔改",
+     "v": "/ai-mogai"
     }
    ]
   }
@@ -7000,7 +7018,7 @@ AGG_FILTER = {
 
 # ---- 平台配置 (aggConfig.platform) ----
 AGG_PLATFORM = {
-    "51": {"host": "https://51hub.com", "list": "/new-theater-category", "detail": "/video/videolist", "search": "/search"},
+    "51": {"host": "https://51hub.com", "list": "/newest", "detail": "/video", "search": "/search"},
     "星星": {"host": "http://read.api.duodutek.com", "list": "/novel-api/app/pageModel/getResourceById", "detail": "/novel-api/basedata/book/getChapterList"},
     "河马": {"host": "https://www.kuaikaw.cn", "url1": "/free-video-portal/portal", "browse": "/browse/%s/%s", "drama": "/drama/%s", "search": "/seo/video/6007"},
     "七猫": {"host": "https://api-store.qmplaylet.com", "url1": "/api/v1/playlet/index", "url2": "https://api-read.qmplaylet.com/player/api/v1/playlet/info", "search": "/api/v1/playlet/search"},
@@ -7038,7 +7056,7 @@ AGG_HEADERS = {
 
 # filter_def 默认分类
 AGG_FILTER_DEF = {
-    "51": {"area": "0-0-0-0-0-0"}, "星星": {"area": "1287"}, "河马": {"area": "0"},
+    "51": {"area": "/newest"}, "星星": {"area": "1287"}, "河马": {"area": "0"},
     "星芽": {"area": "1"}, "西饭": {"area": "68@都市"}, "七猫": {"area": "0"},
     "围观": {"area": ""}, "牛牛": {"area": "全部"}, "山海": {"area": "1"}, "好看": {"area": "1"},
     "百度": {"class": "新剧", "area": "全部"}, "薏米": {"area": "channel_c6f50cd9"},
@@ -7680,29 +7698,77 @@ def _ag_51_warm_m3u8(html):
 
 
 def _ag_51_card_list(html, proxy_fn):
-    """解析 51 分类/搜索页卡片：aria-label 标题 + 顺序对应的封面。新版 SSR 结构。"""
+    """解析 51 新版分类/搜索页卡片：/video/{id}/ + data-src 封面 + 全N集。"""
     videos = []
     if not html:
         return videos
     doc = _ag_51_unescape(html)
-    # 卡片：/play/{id}/{ep}/ + aria-label（同一卡片可能出现两次，按 id 去重保序）
-    order = []
+    # 头部搜索建议里还嵌着一组“猜你喜欢”卡片，先整块剔除，避免混进列表
+    doc = re.sub(r'<div class="hg-search-suggest"[\s\S]*?(?=<header|<main|<div class="hg-page)',
+                 '', doc, count=1)
     seen = set()
-    for mo in re.finditer(r'href="/play/(\d+)/\d+/"[^>]*aria-label="([^"]*)"', doc):
+    for chunk in doc.split('<div class="hg-drama-card"')[1:]:
+        mo = re.search(r'<a class="hg-drama-card__cover-link" href="/video/(\d+)/">', chunk)
+        if not mo:
+            continue
         vid = mo.group(1)
         if vid in seen:
             continue
         seen.add(vid)
-        name = re.sub(r"\s+", " ", mo.group(2)).strip()
-        order.append((vid, name))
-    # 封面：Nuxt 负载里的 upload 图，按出现顺序与卡片对齐
-    covers = re.findall(r'https?://[^"\s]+?/upload[^"\s]*?\.(?:jpe?g|png|webp)', doc)
-    for i, (vid, name) in enumerate(order):
-        pic = covers[i] if i < len(covers) else ""
+        im = (re.search(r'<img[^>]*?\bdata-src="([^"]+)"', chunk)
+              or re.search(r'<img[^>]*?\bsrc="([^"]+)"', chunk))
+        pic = im.group(1) if im else ""
+        if pic.startswith("/static/web/images/cover-placeholder"):
+            pic = ""
+        nm = re.search(r'<img[^>]*?\balt="([^"]*)"', chunk)
+        name = nm.group(1).strip() if nm else ""
+        if not name:
+            nm = re.search(r'<div class="hg-drama-card__title"><a[^>]*>([\s\S]*?)<', chunk)
+            name = re.sub(r"<[^>]+>", "", nm.group(1)).strip() if nm else ""
+        ep = re.search(r'<span class="hg-drama-card__episode">([^<]*)</span>', chunk)
+        remarks = ep.group(1).strip() if ep else "五一"
         if name:
             videos.append({"vod_id": "51@" + vid, "vod_name": name,
-                           "vod_pic": proxy_fn(pic), "vod_remarks": "五一"})
+                           "vod_pic": proxy_fn(pic), "vod_remarks": remarks})
     return videos
+
+
+def _ag_51_video_info(html):
+    """解析 51 新版详情/分集页内嵌的 videoInitialData JSON。"""
+    if not html:
+        return None
+    doc = _ag_51_unescape(html)
+    mo = re.search(r'<script id="videoInitialData" type="application/json">([\s\S]*?)</script>',
+                   doc)
+    if not mo:
+        return None
+    try:
+        data = json.loads(mo.group(1))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    total = 0
+    for src in (data.get("trackingEpisodes"), data.get("epPlaySrcs")):
+        if not isinstance(src, dict):
+            continue
+        try:
+            total = max(total, max([int(k) for k in src.keys()] or [0]))
+        except Exception:
+            pass
+    if not total:
+        try:
+            total = int(data.get("ep") or 1)
+        except Exception:
+            total = 1
+    return {"id": str(data.get("id") or ""),
+            "title": data.get("title") or "",
+            "cover": data.get("coverSrc") or data.get("posterSrc") or "",
+            "desc": data.get("description") or "",
+            "total": total,
+            "ep": int(data.get("ep") or 1),
+            "srcs": data.get("epPlaySrcs") or {},
+            "videoSrc": data.get("videoSrc") or ""}
 
 
 def _ag_51_parse_home(html, proxy_fn):
@@ -9102,9 +9168,13 @@ class _AggSpider(_BaseSpider):
                               "url": "七猫@%s" % _ag_enc_uri(item.get("playlet_id"))})
                 return d
             if cate == "51":
-                url = "%s%s/%s" % (plat["host"], plat["list"], area)
+                # 51hub 已整体改版：列表页为 /newest、/recommend、/ai-duanju 等 SSR 页面
+                path = str(area or "/newest").strip() or "/newest"
+                if not path.startswith("/"):
+                    path = "/" + path
+                url = "%s%s/" % (plat["host"], path.rstrip("/"))
                 if int(page) > 1:
-                    url += "/page/%s" % page
+                    url += "%s/" % page
                 resp = _ag_request(url, method="GET", headers=_AG_HEADER_51, timeout=15)
                 for v in _ag_51_parse_home(resp, self._proxy51):
                     d.append({"title": v["vod_name"], "img": v["vod_pic"],
@@ -9211,24 +9281,38 @@ class _AggSpider(_BaseSpider):
         VOD = {}
         try:
             if platform == "河马":
-                # 旧 1131/1132 已死；改走 /drama/{bookId} SSR。免费章直链，付费章 lazy id。
+                # 对齐参考实现 ShortHema(csp_ShortHema)：全章一律 lazy
+                # hm++{bookId}++{chapterId}，player 统一 portal/1139 unClockType=load 取源。
+                # 此前免费章塞 SSR 直链——dzzt-video.cbread.cn 会间歇 403 且无回退，
+                # 导致部分剧免费章播不了；1139 对免费/付费章均稳定返回 mp4Url。
                 book_id = vid
                 pp = _AG_HM_Service.page_props("/drama/%s" % book_id)
                 v = pp.get("bookInfoVo") or {}
                 chapters = pp.get("chapterList") or []
+                if not chapters:
+                    # SSR 失败时回退 portal/1131（ShortHema.detailContent 同款）
+                    res = _AG_HM_Service.api("1131", {
+                        "bookId": str(book_id), "needNextChapter": 0,
+                        "isNeedAlias": "", "bookAlias": "",
+                        "resolutionRate": "1080P",
+                    })
+                    vi = res.get("videoInfo") or {}
+                    chapters = res.get("chapterList") or vi.get("chapterList") or []
+                    if vi and not v:
+                        v = vi
                 eps = []
                 for c in chapters:
+                    name = c.get("chapterName") or ""
+                    ch_id = str(c.get("chapterId") or "")
+                    if ch_id:
+                        eps.append("%s$hm++%s++%s" % (name, book_id, ch_id))
+                        continue
+                    # 极端兜底：无 chapterId 时才尝试 SSR 直链
                     cv = c.get("chapterVideoVo") or {}
                     url = (cv.get("m3u8") or cv.get("m3u8720p")
                            or cv.get("mp4") or cv.get("mp4720p") or "").strip()
-                    name = c.get("chapterName") or ""
-                    ch_id = str(c.get("chapterId") or "")
                     if url:
-                        # 免费章：直接塞播放地址，player 见 http 直出
                         eps.append("%s$%s" % (name, url))
-                    else:
-                        # 付费章：lazy id，player 走 portal/1139 unClockType=load 取源
-                        eps.append("%s$hm++%s++%s" % (name, book_id, ch_id))
                 if v or eps:
                     return {"vod_name": v.get("bookName"), "vod_pic": v.get("coverWap"),
                             "vod_id": or_id, "vod_remarks": v.get("statusDesc") or "",
@@ -9359,27 +9443,21 @@ class _AggSpider(_BaseSpider):
                                first.get("commentCount") or 0),
                            "vod_play_from": "围观短剧", "vod_play_url": "#".join(play_urls)}
             elif platform == "51":
-                # 51hub 已改版为 Nuxt SSR：直接解析 play 页内嵌 devalue 负载
-                html = _ag_request("%s/play/%s/1/" % (plat["host"], vid),
+                # 51hub 新版详情页 /video/{id}/：内嵌 videoInitialData
+                # （trackingEpisodes 给全部分集，epPlaySrcs/videoSrc 给当前集直链）
+                html = _ag_request("%s/video/%s/" % (plat["host"], vid),
                                    headers=_AG_HEADER_51, timeout=15)
-                info = _ag_51_nuxt_series(html)
+                info = _ag_51_video_info(html)
                 if info:
-                    play_urls = []
-                    for ep in info.get("_episodes", []):
-                        idx = ep.get("index") or ep.get("sort")
-                        title = ep.get("episode_title") or ("第%s集" % (ep.get("sort") or idx))
-                        # 逐集直链需访问对应分集页，播放时经 player 解析：token=51ep|playlet_id|index
-                        play_urls.append("%s$51ep|%s|%s" % (title, vid, idx))
-                    if not play_urls:
-                        play_urls = ["第1集$51ep|%s|1" % vid]
-                    pic = info.get("cover_img") or ""
-                    remarks = info.get("update_status") or (
-                        "全%s集" % info.get("total_serial") if info.get("total_serial") else "")
+                    total = int(info.get("total") or 1)
+                    # 逐集直链需访问对应分集页，播放时经 player 解析：token=51ep|video_id|index
+                    play_urls = ["第%s集$51ep|%s|%s" % (i, vid, i)
+                                 for i in range(1, total + 1)]
                     VOD = {"vod_id": or_id,
-                           "vod_name": info.get("drama_name") or info.get("video_title") or "未知短剧",
-                           "vod_pic": self._proxy51(pic),
-                           "vod_remarks": remarks,
-                           "vod_content": info.get("description") or "暂无简介",
+                           "vod_name": info.get("title") or "未知短剧",
+                           "vod_pic": self._proxy51(info.get("cover")),
+                           "vod_remarks": "全%s集" % total if total else "",
+                           "vod_content": info.get("desc") or "暂无简介",
                            "vod_play_from": "五一短剧",
                            "vod_play_url": "#".join(play_urls) or "暂无播放地址$0"}
             elif platform == "星星":
@@ -9668,9 +9746,8 @@ class _AggSpider(_BaseSpider):
                                         "desc": "西饭 | %s集" % dj.get("total"),
                                         "url": "西饭@%s#%s" % (dj.get("duanjuId"), dj.get("source"))})
                 elif pid == "51":
-                    su = "%s%s/%s" % (plat["host"], plat["search"], _ag_enc_uri(key))
-                    if int(page) > 1:
-                        su += "/page/%s" % page
+                    # 新版搜索：/search/?keyword=xx（302 → /search/video/xx/），SSR 卡片
+                    su = "%s%s/?keyword=%s" % (plat["host"], plat["search"], _ag_enc_uri(key))
                     resp = _ag_request(su, method="GET", headers=_AG_HEADER_51)
                     for v in _ag_51_parse_search(resp, self._proxy51):
                         results.append({"title": v["vod_name"], "img": v["vod_pic"],
@@ -9747,12 +9824,7 @@ class _AggSpider(_BaseSpider):
         inp = play_id
         try:
             if "河马" in flag:
-                # 新格式：detail 免费章塞了直链（http 开头）
-                if inp.startswith("http://") or inp.startswith("https://"):
-                    return {"parse": 0, "url": inp,
-                            "header": {"User-Agent": _AG_HM_Service.UA,
-                                       "Referer": "https://www.kuaikaw.cn/"}}
-                # 付费章 lazy：hm++{bookId}++{chapterId} → portal/1139 取源
+                # 主格式：hm++{bookId}++{chapterId} → portal/1139（免费/付费章统一）
                 if inp.startswith("hm++"):
                     arr = inp.split("++")
                     if len(arr) >= 3:
@@ -9761,7 +9833,36 @@ class _AggSpider(_BaseSpider):
                         if play_url:
                             return {"parse": 0, "url": play_url,
                                     "header": {"User-Agent": "okhttp/4.10.0"}}
+                        # 1139 空结果时再试 1133（旧路径，免费章偶发可用）
+                        body = {"bookId": str(book_id), "chapterId": str(chapter_id),
+                                "unClockType": "load", "tierPlaySource": None,
+                                "chapterIds": [str(chapter_id)],
+                                "omap": {"expId": None, "logId": None,
+                                         "originName": "bigdata_rec", "recId": None,
+                                         "scene": "dzmf_video_sc_reco",
+                                         "sceneId": "dzmf_video_sc_reco",
+                                         "strategyId": "godum7go",
+                                         "strategyName": "omap"}}
+                        res = _AG_HM_Service.api("1133", body)
+                        ci = res.get("chapterInfo") or []
+                        if ci and isinstance((ci[0] or {}).get("content"), dict):
+                            content = ci[0]["content"]
+                            u = (content.get("mp4Url") or "").strip()
+                            if not u:
+                                sw = content.get("mp4SwitchUrl") or []
+                                u = str(sw[0]).strip() if sw and sw[0] else ""
+                            if not u:
+                                u = (content.get("m3u8720p") or
+                                     content.get("m3u8") or "").strip()
+                            if u:
+                                return {"parse": 0, "url": u,
+                                        "header": {"User-Agent": "okhttp/4.10.0"}}
                         return {"parse": 0, "url": "toast://1139 取源失败"}
+                # 旧缓存详情里的 http 直链：部分会 403，若带 hm 语义以外仅作直出兜底
+                if inp.startswith("http://") or inp.startswith("https://"):
+                    return {"parse": 0, "url": inp,
+                            "header": {"User-Agent": _AG_HM_Service.UA,
+                                       "Referer": "https://www.kuaikaw.cn/"}}
                 arr = inp.split("++")
                 chapter_id, chapter_index, book_id = arr[0], arr[1], arr[2]
                 body = {"bookId": book_id, "chapterId": chapter_id, "unClockType": "pay",
@@ -9971,15 +10072,19 @@ class _AggSpider(_BaseSpider):
                                        "Referer": "https://www.duanju55.com/"}}
                 return {"parse": 0, "url": inp}
 
-            # 五一：token 形如 '51ep|<playlet_id>|<index>'，取对应分集页的 m3u8 直链
+            # 五一：token 形如 '51ep|<video_id>|<index>'，取对应分集页的 m3u8 直链
             if inp.startswith("51ep|"):
                 try:
                     _, pid, idx = inp.split("|", 2)
                 except ValueError:
                     return {"parse": 0, "url": "toast://解析失败"}
-                html = _ag_request("%s/play/%s/%s/" % (AGG_PLATFORM["51"]["host"], pid, idx),
-                                   headers=_AG_HEADER_51, timeout=15)
-                url = _ag_51_warm_m3u8(html)
+                page = "%s/video/%s/" % (AGG_PLATFORM["51"]["host"], pid)
+                if str(idx) not in ("", "1"):
+                    page += "ep-%s/" % idx
+                html = _ag_request(page, headers=_AG_HEADER_51, timeout=15)
+                info = _ag_51_video_info(html) or {}
+                url = ((info.get("srcs") or {}).get(str(idx))
+                       or info.get("videoSrc") or "")
                 if url:
                     return {"parse": 0, "url": url,
                             "header": {"User-Agent": _AG_HEADER_51["User-Agent"],
