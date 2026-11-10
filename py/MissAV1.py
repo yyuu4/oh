@@ -1,8 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# 版本: 1.0.0  (2026-11-10)
+# 版本: 1.0.4  (2026-11-10)
 # 更新简介:
+#   v1.0.4 (2026-11-10)
+#     - 直连域名: 写入 missav.fans / missav.media (抓取/详情/播放均无需代理)
+#     - 代理优先: 有代理先走 missav.ws; 代理不可用或 ws 失败时自动切换直连域名
+#     - 详情播放: 兼容 surrit.mrstcdn.store 与 packer 页, 播放地址优先 mrstcdn (直连可播)
+#     - 播放头 Referer/Origin 跟随当前活动域名, 不再写死 missav.ws
+#   v1.0.3 (2026-11-10)
+#     - 分类末尾新增: 韩国直播 (klive → /cn/klive)、中国直播 (clive → /cn/clive)
+#     - banned_slugs 加入 klive/clive 与页脚工具页 (contact/ads/terms/...),
+#       防止导航/页尾链接被解析成伪影片条目
+#     - 视频编号须含数字: 筛选空结果时回退正则不再误抓 contact/ads 等页脚链接
+#   v1.0.2 (2026-11-10)
+#     - 缓存上限: _cat_cache/_vid_cache 超过 512 条按最旧淘汰, 防长期运行内存增长
+#     - 线程隔离: 服务模式 get_spider 改为线程本地实例, 避免多线程共用 opener/cookiejar
+#     - 安全提示: 启动横幅与首页注明监听 0.0.0.0 (局域网可达)
+#     - 非法筛选值统一: height/cup/age/debut/sort/filters 不在合法集合时按 all 忽略
+#       (原 age=abc 返回默认、height=999 返回空, 现统一为忽略)
+#   v1.0.1 (2026-11-10)
+#     - 女优筛选与网页对齐: sort 增加 debut(出道)
+#     - 女优 age 取值改为网页真实值: <20→0-20, >60→60-99 (原值为无效参数)
+#     - 女优 debut 年份下限 2008→2000, 与网页 27 档一致
 #   v1.0.0 (2026-11-10)
 #     - 首个版本化发布; 文件由 MissAV.py 更名为 MissAV1.py
 #     - 代理: 支持 ext 配置 {"proxy": "..."}; 自动探测列表含 127.0.0.1 与 192.168.1.8:7144
@@ -35,12 +55,19 @@ except ImportError:
         def delCache(self, key): return "fail"
 
 class Spider(SpiderBase):
+    # 直连域名: 抓取/详情/播放全直连, 无需代理
+    DIRECT_HOSTS = ["https://missav.fans", "https://missav.media"]
+    # 代理优先时使用的主站 (本网络常需代理; 失败自动切 DIRECT_HOSTS)
+    PROXY_HOST = "https://missav.ws"
+
     def __init__(self):
         super(Spider, self).__init__()
-        self.primaryHost = "https://missav.ws"
-        self.fallbackHost = "https://www.thisav.my"
+        self.primaryHost = self.PROXY_HOST
+        self.fallbackHost = self.DIRECT_HOSTS[0]
         self.baseHost = self.primaryHost
-        
+        self._proxy_ok = False
+        self._prefer_direct = False
+
         self.tgGroup = "https://t.me/tvshare23"
         self.brandActor = "TG群: @tvshare23"
         self.brandDirector = "蝴蝶影视"
@@ -81,7 +108,9 @@ class Spider(SpiderBase):
             "twav": "/dm31/cn/twav",
             "furuke": "/dm15/cn/furuke",
             "marriedslash": "/dm37/cn/marriedslash",
-            "xxxav": "/dm42/cn/xxxav"
+            "xxxav": "/dm42/cn/xxxav",
+            "klive": "/cn/klive",
+            "clive": "/cn/clive"
         }
 
         self.color_palette = [
@@ -105,39 +134,102 @@ class Spider(SpiderBase):
     ]
 
     def _build_opener(self):
-        handlers = [
+        # 直连 opener (fans/media 不需要代理)
+        direct_handlers = [
             urllib.request.HTTPCookieProcessor(self.cj),
             urllib.request.HTTPSHandler(context=self.ctx)
         ]
-        # 优先: ext 配置 {"proxy": "http://192.168.1.8:7144"}
+        self._opener_direct = urllib.request.build_opener(*direct_handlers)
+
+        # 代理优先: ext 配置 {"proxy": "..."} > 探测列表
         cfg_proxy = ""
         try:
             if isinstance(self.options, dict):
                 cfg_proxy = str(self.options.get("proxy") or "").strip()
         except Exception:
             pass
-        if cfg_proxy:
-            handlers.append(urllib.request.ProxyHandler({
-                'http': cfg_proxy, 'https': cfg_proxy
-            }))
-        else:
+        proxy_url = cfg_proxy
+        if not proxy_url:
             import socket
             for host, port in self.PROXY_PROBE:
                 try:
                     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     s.settimeout(0.3)
                     if s.connect_ex((host, port)) == 0:
-                        handlers.append(urllib.request.ProxyHandler({
-                            'http': 'http://%s:%d' % (host, port),
-                            'https': 'http://%s:%d' % (host, port)
-                        }))
+                        proxy_url = "http://%s:%d" % (host, port)
                         s.close()
                         break
                     s.close()
                 except Exception:
                     pass
 
-        self.opener = urllib.request.build_opener(*handlers)
+        if proxy_url:
+            self._proxy_ok = True
+            proxy_handlers = [
+                urllib.request.HTTPCookieProcessor(self.cj),
+                urllib.request.HTTPSHandler(context=self.ctx),
+                urllib.request.ProxyHandler({
+                    'http': proxy_url, 'https': proxy_url
+                })
+            ]
+            self._opener_proxy = urllib.request.build_opener(*proxy_handlers)
+            self.opener = self._opener_proxy
+            if not self._prefer_direct:
+                self.primaryHost = self.PROXY_HOST
+                self.baseHost = self.primaryHost
+        else:
+            self._proxy_ok = False
+            self._opener_proxy = None
+            self.opener = self._opener_direct
+            self.primaryHost = self.DIRECT_HOSTS[0]
+            self.baseHost = self.primaryHost
+            self._prefer_direct = True
+
+    def _opener_for(self, host):
+        if (not self._prefer_direct) and self._proxy_ok and host == self.PROXY_HOST:
+            return getattr(self, "_opener_proxy", None) or self.opener
+        return getattr(self, "_opener_direct", None) or self.opener
+
+    def _host_candidates(self):
+        """候选主机: 代理优先 → 直连域名; 已切直连后不再回头试 ws。"""
+        if self._prefer_direct or not self._proxy_ok:
+            hosts = list(self.DIRECT_HOSTS)
+            cur = self.baseHost
+            if cur in hosts:
+                hosts.remove(cur)
+                hosts.insert(0, cur)
+            elif cur:
+                hosts.insert(0, cur)
+            # 去重保序
+            seen = set()
+            out = []
+            for h in hosts:
+                if h and h not in seen:
+                    seen.add(h)
+                    out.append(h)
+            return out
+        return [self.PROXY_HOST] + [h for h in self.DIRECT_HOSTS if h != self.PROXY_HOST]
+
+    @staticmethod
+    def _swap_host(url, new_host):
+        p = urllib.parse.urlparse(url)
+        np = urllib.parse.urlparse(new_host)
+        return urllib.parse.urlunparse(
+            (np.scheme or "https", np.netloc, p.path, p.params, p.query, p.fragment)
+        )
+
+    def _switch_host(self, host):
+        self.primaryHost = host
+        self.baseHost = host
+        if host in self.DIRECT_HOSTS:
+            # 直连已通, 不再回头试 missav.ws (省一次必败请求)
+            self._prefer_direct = True
+
+    @staticmethod
+    def _fetch_ok(res):
+        text = res.get("text") or ""
+        return (res.get("code") == 200 and len(text) >= 2000
+                and "Just a moment" not in text)
 
     def init(self, extend=""):
         if isinstance(extend, dict):
@@ -147,9 +239,10 @@ class Spider(SpiderBase):
                 self.options = json.loads(extend)
             except Exception:
                 self.options = {}
-        # ext 里带了代理配置则重建 opener 使其生效
+        # ext 里带了代理配置则重建 opener 使其生效 (并恢复代理优先)
         try:
             if isinstance(self.options, dict) and self.options.get("proxy"):
+                self._prefer_direct = False
                 self._build_opener()
         except Exception:
             pass
@@ -194,9 +287,10 @@ class Spider(SpiderBase):
             "Accept-Encoding": "gzip, deflate",
             "Connection": "keep-alive"
         }
+        opener = self._opener_for(cur_host)
         try:
             req = urllib.request.Request(target_url, headers=headers)
-            with self.opener.open(req, timeout=8) as resp:
+            with opener.open(req, timeout=8) as resp:
                 raw = resp.read()
                 enc = getattr(resp, "headers", {}).get("Content-Encoding", "")
                 if raw.startswith(b"\x1f\x8b") or enc == "gzip":
@@ -220,14 +314,14 @@ class Spider(SpiderBase):
         elif real_url.startswith("/"):
             real_url = self.baseHost + real_url
 
-        res = self._raw_fetch(real_url, self.baseHost)
-
-        if res.get("code") in (403, 451, 503, -1) or "Just a moment" in res.get("text", "") or len(res.get("text", "")) < 2000:
-            alt_url = real_url.replace(self.primaryHost, self.fallbackHost)
-            res_alt = self._raw_fetch(alt_url, self.fallbackHost)
-            if res_alt.get("code") == 200 and len(res_alt.get("text", "")) > 2000:
-                return res_alt
-
+        res = {"code": -1, "text": ""}
+        for host in self._host_candidates():
+            url = self._swap_host(real_url, host)
+            res = self._raw_fetch(url, host)
+            if self._fetch_ok(res):
+                if host != self.baseHost:
+                    self._switch_host(host)
+                return res
         return res
 
     def homeContent(self, filter):
@@ -265,7 +359,9 @@ class Spider(SpiderBase):
             {"type_name": "TWAV", "type_id": "twav"},
             {"type_name": "Furuke", "type_id": "furuke"},
             {"type_name": "人妻斩", "type_id": "marriedslash"},
-            {"type_name": "XXX-AV", "type_id": "xxxav"}
+            {"type_name": "XXX-AV", "type_id": "xxxav"},
+            {"type_name": "韩国直播", "type_id": "klive"},
+            {"type_name": "中国直播", "type_id": "clive"}
         ]
 
         result = {"class": classes}
@@ -324,16 +420,16 @@ class Spider(SpiderBase):
                 "init": "all",
                 "value": [
                     {"n": "选择年龄", "v": "all"},
-                    {"n": "< 20", "v": "<20"},
+                    {"n": "< 20", "v": "0-20"},
                     {"n": "20 - 30", "v": "20-30"},
                     {"n": "30 - 40", "v": "30-40"},
                     {"n": "40 - 50", "v": "40-50"},
                     {"n": "50 - 60", "v": "50-60"},
-                    {"n": "> 60", "v": ">60"}
+                    {"n": "> 60", "v": "60-99"}
                 ]
             }
 
-            years = [str(y) for y in range(2026, 2007, -1)]
+            years = [str(y) for y in range(2026, 1999, -1)]
             filter_actress_debut = {
                 "key": "debut",
                 "name": "出道年份",
@@ -347,7 +443,8 @@ class Spider(SpiderBase):
                 "init": "default",
                 "value": [
                     {"n": "默认排序", "v": "default"},
-                    {"n": "影片最多", "v": "videos"}
+                    {"n": "影片最多", "v": "videos"},
+                    {"n": "出道", "v": "debut"}
                 ]
             }
 
@@ -505,7 +602,12 @@ class Spider(SpiderBase):
         banned_slugs = {
             "chinese-subtitle", "new", "release", "uncensored-leak", "today-hot",
             "weekly-hot", "monthly-hot", "genres", "actresses", "makers", "series", "tags",
-            "vip", "saved", "playlists", "history", "login", "register", "siro", "luxu", "gana"
+            "vip", "saved", "playlists", "history", "login", "register", "siro", "luxu", "gana",
+            "klive", "clive",
+            # 页脚/工具页: 筛选空结果时回退正则易误抓
+            "contact", "ads", "terms", "upload", "articles", "about", "privacy",
+            "dmca", "disclaimer", "cookie", "sitemap", "search", "faq", "help",
+            "password", "forget", "profile", "settings",
         }
 
         for ch in card_chunks:
@@ -516,6 +618,9 @@ class Spider(SpiderBase):
             dvd_low = dvd_id.lower()
 
             if dvd_low in banned_slugs or dvd_low in seen_ids or len(dvd_id) < 3:
+                continue
+            # 影片编号几乎必含数字; 页脚链接 (contact/ads/terms/...) 无数字
+            if not any(c.isdigit() for c in dvd_id):
                 continue
             seen_ids.add(dvd_low)
 
@@ -594,22 +699,28 @@ class Spider(SpiderBase):
 
         if isinstance(extend, dict):
             if parse_mode == "actress":
-                for param_k in ("height", "cup", "age", "debut"):
+                for param_k, allowed in (
+                    ("height", _ACTRESS_HEIGHTS),
+                    ("cup", _ACTRESS_CUPS),
+                    ("age", _ACTRESS_AGES),
+                    ("debut", _ACTRESS_DEBUTS),
+                ):
                     val = extend.get(param_k)
-                    if val and val != "all":
+                    # 非法值按 all 忽略, 与 age/height 站点行为差异解耦
+                    if val and val != "all" and val in allowed:
                         query_parts.append("%s=%s" % (param_k, quote(val)))
 
                 sort_val = extend.get("sort")
-                if sort_val and sort_val != "default":
+                if sort_val and sort_val != "default" and sort_val in _ACTRESS_SORTS:
                     query_parts.append("sort=%s" % sort_val)
 
             elif parse_mode == "video":
                 active_sort = extend.get("sort", "default")
-                if active_sort and active_sort != "default":
+                if active_sort and active_sort != "default" and active_sort in _VIDEO_SORTS:
                     query_parts.append("sort=%s" % active_sort)
 
                 active_filters = extend.get("filters", "all")
-                if active_filters and active_filters != "all":
+                if active_filters and active_filters != "all" and active_filters in _VIDEO_FILTERS:
                     query_parts.append("filters=%s" % active_filters)
 
         if query_parts:
@@ -631,29 +742,68 @@ class Spider(SpiderBase):
         if not html:
             return ""
 
-        hls_match = re.search(r'hls\.loadSource\(["\']https?://[^/]+/([a-f0-9-]{36})/playlist\.m3u8["\']\)', html)
+        uuid_pat = r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})'
+
+        def _clean(u, pos):
+            ctx = html[max(0, pos - 40):min(len(html), pos + 80)].lower()
+            if any(bad in ctx for bad in ("user_uuid", "sample", "preview", "recombee", "thumbnail")):
+                return ""
+            return u
+
+        # 直连域名详情页: surrit.mrstcdn.store (含 JS 转义 \/ 与 packer 拼接)
+        for pat in (
+            r'surrit\.mrstcdn\.store(?:\\/|/)' + uuid_pat,
+            r'surrit\\+\.mrstcdn\\+\.store(?:\\/|/)' + uuid_pat,
+        ):
+            m = re.search(pat, html, re.I)
+            if m:
+                u = _clean(m.group(1), m.start(1))
+                if u:
+                    return u
+
+        # packer keys 含完整 uuid 分段时直接拼
+        pk = re.search(r"\}\('([\s\S]*?)',\s*16,\s*16,\s*'([^']+)'\.split\('\|'\)", html)
+        if pk and "mrstcdn" in pk.group(2):
+            keys = pk.group(2).split("|")
+            joined = "|".join(keys)
+            # 顺序: 0c1dcef7|e14b|4176|aacb|6a0a57dacff5 形态
+            m = re.search(
+                r'([a-f0-9]{8})\|([a-f0-9]{4})\|([a-f0-9]{4})\|([a-f0-9]{4})\|([a-f0-9]{12})',
+                joined, re.I
+            )
+            if m:
+                u = "%s-%s-%s-%s-%s" % m.groups()
+                if "sample" not in pk.group(1).lower():
+                    return u
+
+        hls_match = re.search(
+            r'hls\.loadSource\(["\']https?://[^/]+/' + uuid_pat + r'/playlist\.m3u8["\']\)', html)
         if hls_match:
-            return hls_match.group(1)
+            u = _clean(hls_match.group(1), hls_match.start(1))
+            if u:
+                return u
 
         urls_block = re.search(r'urls:\s*\[\s*["\']([^"\']+)["\']', html)
         if urls_block:
             target_link = urls_block.group(1)
             if "sample" not in target_link and "preview" not in target_link:
-                u_m = re.search(r'([a-f0-9-]{36})', target_link)
+                u_m = re.search(uuid_pat, target_link)
                 if u_m:
                     return u_m.group(1)
 
         scripts = re.findall(r'<script[^>]*>([\s\S]*?)</script>', html)
         for sc in scripts:
-            if ("surrit.com" in sc or "sixyik.com" in sc) and "sample" not in sc:
-                uuids = re.findall(r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', sc)
+            if any(k in sc for k in ("surrit.com", "sixyik.com", "mrstcdn.store")) and "sample" not in sc:
+                uuids = re.findall(uuid_pat, sc)
                 for u in uuids:
                     u_pos = sc.find(u)
                     surround = sc[max(0, u_pos - 40):min(len(sc), u_pos + 60)]
                     if not any(bad in surround for bad in ("user_uuid", "sample", "preview", "thumbnail", "recombee")):
                         return u
 
-        cands = re.findall(r'https?://(?:surrit\.com|sixyik\.com)/([a-f0-9-]{36})/(?:playlist\.m3u8)?', html)
+        cands = re.findall(
+            r'https?://(?:surrit\.com|sixyik\.com|surrit\.mrstcdn\.store)/' + uuid_pat + r'/(?:playlist\.m3u8)?',
+            html)
         for c in cands:
             c_pos = html.find(c)
             if "sample" not in html[max(0, c_pos - 30):min(len(html), c_pos + 60)]:
@@ -670,17 +820,30 @@ class Spider(SpiderBase):
             vid = raw_id.replace("vod@", "").strip("/")
             origin_href = "%s/dm247/cn/%s" % (self.primaryHost, vid)
 
-        cand_urls = [
-            origin_href if origin_href.startswith("http") else urllib.parse.urljoin(self.primaryHost, origin_href),
-            "%s/dm247/cn/%s" % (self.primaryHost, vid),
-            "%s/dm247/cn/%s" % (self.fallbackHost, vid)
-        ]
+        cand_urls = []
+        if origin_href.startswith("http"):
+            cand_urls.append(origin_href)
+        seen_u = set(cand_urls)
+        for h in self._host_candidates():
+            for path in ("/dm247/cn/%s" % vid, "/cn/%s" % vid):
+                u = h + path
+                if u not in seen_u:
+                    seen_u.add(u)
+                    cand_urls.append(u)
 
         html = ""
         for u in cand_urls:
             res = self._fetch(u)
             if res.get("code") == 200 and len(res.get("text", "")) > 3000:
                 html = res.get("text", "")
+                # 记录实际打开的站点, 供播放头 Referer 使用
+                try:
+                    final = res.get("final_url") or u
+                    fh = urllib.parse.urlparse(final)
+                    if fh.netloc:
+                        self._switch_host("%s://%s" % (fh.scheme or "https", fh.netloc))
+                except Exception:
+                    pass
                 break
 
         title_m = re.search(r'<title>(.*?)</title>', html, re.I)
@@ -715,9 +878,12 @@ class Spider(SpiderBase):
         play_urls = []
 
         if surrit_uuid:
-            real_m3u8 = "https://surrit.com/%s/playlist.m3u8" % surrit_uuid
+            # mrstcdn 直连可播; surrit.com 在部分网络直连 403, 作备线
+            real_m3u8 = "https://surrit.mrstcdn.store/%s/playlist.m3u8" % surrit_uuid
             play_froms.append("蝴蝶正片专线")
             play_urls.append("超清原画正片$%s" % real_m3u8)
+            play_froms.append("蝴蝶备线")
+            play_urls.append("原画备线$https://surrit.com/%s/playlist.m3u8" % surrit_uuid)
 
         pic = "https://fourhoi.com/%s/cover-n.jpg" % vid
 
@@ -737,14 +903,15 @@ class Spider(SpiderBase):
 
     def playerContent(self, flag, id, vipFlags):
         url = str(id).strip()
+        base = self.baseHost or self.primaryHost or self.PROXY_HOST
         return {
             "parse": 0,
             "jx": 0,
             "url": url,
             "header": {
                 "User-Agent": self._ua,
-                "Referer": "https://missav.ws/",
-                "Origin": "https://missav.ws",
+                "Referer": base + "/",
+                "Origin": base,
                 "Accept": "*/*",
                 "Connection": "keep-alive"
             }
@@ -802,14 +969,31 @@ SRV_CAT_PAGES = 10     # /cat/ 单分类默认页数
 SRV_CACHE_MINS = 30  # 分类列表缓存分钟数
 SRV_TIMEOUT = 15     # m3u8 下发超时秒数
 SRV_VID_CACHE_SECS = 120  # 解析出的播放地址缓存秒数
+SRV_CACHE_MAX = 512  # _cat_cache/_vid_cache 最大条数, 超出按最旧淘汰
+
+# 合法筛选值 (与网页 option 对齐); 非法值在 categoryContent 中按 all 忽略
+_VIDEO_SORTS = frozenset((
+    "default", "released_at", "published_at", "saved",
+    "today_views", "weekly_views", "monthly_views", "views",
+))
+_VIDEO_FILTERS = frozenset(("all", "individual", "multiple", "chinese-subtitle"))
+_ACTRESS_SORTS = frozenset(("default", "videos", "debut"))
+_ACTRESS_HEIGHTS = frozenset(
+    ["all"] + ["%d-%d" % (a, a + 4) for a in range(131, 191, 5)]
+)  # 131-135 .. 186-190
+_ACTRESS_CUPS = frozenset(["all"] + list("ABCDEFGHIJKLMNOPQ"))
+_ACTRESS_AGES = frozenset((
+    "all", "0-20", "20-30", "30-40", "40-50", "50-60", "60-99",
+))
+_ACTRESS_DEBUTS = frozenset(["all"] + [str(y) for y in range(2000, 2027)])
 
 # 播放请求头: 写入 M3U 条目属性, 供支持该写法的播放器在直连 CDN 分片时携带
 # (surrit CDN 验 Referer/Origin/UA; 服务端抓取 m3u8 时同样携带这些头)
-M3U_REFERER = "https://missav.ws/"
-M3U_ORIGIN = "https://missav.ws"
+# 默认值仅作兜底; 运行时用 _site_ref_origin() 跟随当前活动域名 (fans/media/ws)。
+M3U_REFERER = "https://missav.fans/"
+M3U_ORIGIN = "https://missav.fans"
 
-_spider = None
-_spider_lock = _threading.Lock()
+_spider_local = _threading.local()  # 每线程独立 Spider, 避免共享 opener/cookiejar 竞态
 _cat_cache = {}   # (tid, chunk) -> (ts, [(vod_id, vod_name, vod_pic)])
 _vid_cache = {}   # raw_id -> (ts, play_url)
 _cache_lock = _threading.Lock()
@@ -820,12 +1004,28 @@ def _log(msg):
 
 
 def get_spider():
-    global _spider
-    with _spider_lock:
-        if _spider is None:
-            _spider = Spider()
-            _spider.init("")
-        return _spider
+    """线程本地 Spider: 网络句柄不跨线程共享; 列表/播放缓存仍是全局+锁。"""
+    sp = getattr(_spider_local, "spider", None)
+    if sp is None:
+        sp = Spider()
+        sp.init("")
+        _spider_local.spider = sp
+    return sp
+
+
+def _cache_put_locked(cache, key, item):
+    """写入缓存并限制最大条数 (调用方需已持有 _cache_lock)。item=(ts, value)。"""
+    cache[key] = item
+    if len(cache) > SRV_CACHE_MAX:
+        # 按时间戳淘汰最旧, 且不淘汰刚写入的 key
+        drop_n = len(cache) - SRV_CACHE_MAX
+        for k in sorted(cache.keys(), key=lambda k: cache[k][0]):
+            if k == key:
+                continue
+            del cache[k]
+            drop_n -= 1
+            if drop_n <= 0:
+                break
 
 
 def srv_cats():
@@ -836,10 +1036,20 @@ def _m3u_title(name):
     return re.sub(r"\s+", " ", str(name or "")).strip().replace(",", "，")
 
 
+def _site_ref_origin():
+    """当前活动站点的 Referer / Origin, 播放头与 M3U 属性共用。"""
+    sp = get_spider()
+    base = sp.baseHost or sp.primaryHost or M3U_ORIGIN
+    if not base.startswith("http"):
+        base = "https://" + base
+    return base.rstrip("/") + "/", base.rstrip("/")
+
+
 def _m3u_header_attrs():
     sp = get_spider()
+    ref, origin = _site_ref_origin()
     return ('http-user-agent="%s" http-referer="%s" http-header="Origin=%s"'
-            % (sp._ua, M3U_REFERER, M3U_ORIGIN))
+            % (sp._ua, ref, origin))
 
 
 def cached_category(tid, chunk=1, pages=None):
@@ -872,7 +1082,7 @@ def cached_category(tid, chunk=1, pages=None):
             videos.append((vid, v.get("vod_name", ""), v.get("vod_pic", "")))
     _log("[%s] 抓取完成, 共 %d 条" % (tid, len(videos)))
     with _cache_lock:
-        _cat_cache[key] = (now, videos)
+        _cache_put_locked(_cat_cache, key, (now, videos))
     return videos
 
 
@@ -898,7 +1108,7 @@ def resolve_play_url(raw_id):
     if url:
         # 只缓存成功结果; 失败不缓存, 避免瞬时网络错误导致后续 2 分钟持续 503/黑屏
         with _cache_lock:
-            _vid_cache[raw_id] = (now, url)
+            _cache_put_locked(_vid_cache, raw_id, (now, url))
     return url
 
 
@@ -1020,10 +1230,11 @@ def fetch_abs_playlist(url, depth=0):
     3. 最多跟随 3 层 Variant，兼容某些 CDN 的多级 Master M3U8。
     """
     sp = get_spider()
+    ref, origin = _site_ref_origin()
     req = urllib.request.Request(url, headers={
         'User-Agent': sp._ua,
-        'Referer': M3U_REFERER,
-        'Origin': M3U_ORIGIN,
+        'Referer': ref,
+        'Origin': origin,
         'Accept': 'application/vnd.apple.mpegurl,application/x-mpegURL,*/*',
         'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
         'Connection': 'keep-alive',
@@ -1197,6 +1408,7 @@ def _index_page():
             "超出范围的块返回空列表。</p>"
             "<p>条目指向本机 <code>/v/&lt;id&gt;.m3u8</code>, 服务端实时解析详情页拿 surrit 播放地址并转绝对地址, "
             "播放器直连 CDN 拉分片。女优 / 类型 / 发行商为文件夹导航, 在 M3U 中无可播放条目。</p>"
+            "<p>服务监听 <code>0.0.0.0</code>, 局域网内设备可直接订阅; 仅在可信网络下运行。</p>"
             "<p>分类列表缓存 %d 分钟 (按块缓存)。</p>"
             "<ul>%s</ul></body></html>"
             % (len(items), SRV_PAGES, SRV_PAGES + 1, SRV_PAGES * 2,
@@ -1221,6 +1433,7 @@ def serve(port):
     ncats = len(srv_cats())
     print("=" * 64, flush=True)
     print("MissAV M3U 服务启动: %d 个分类, 端口 %d" % (ncats, port), flush=True)
+    print("  监听: 0.0.0.0:%d （局域网内可访问, 仅限可信网络）" % port, flush=True)
     print("  聚合订阅: http://127.0.0.1:%d/all.m3u （默认前 %d 页）" % (port, SRV_PAGES), flush=True)
     print("  分页: http://127.0.0.1:%d/all.m3u?chunk=2 （chunk=2=%d-%d页, 以此类推）"
           % (port, SRV_PAGES + 1, SRV_PAGES * 2), flush=True)
