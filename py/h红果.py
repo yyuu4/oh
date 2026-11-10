@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 VERSION_NOTE = (
+    "1.7.1 修起播：multi_video_model 上游已弃用旧 gorgon/medusa 签名（200 空包），"
+    "改用弹幕同款 SM3/SIMON Argus+Ladon 签名与 7.3.9.32 App query；分类/详情/搜索/弹幕不动。"
     "1.7.0 加弹幕（刀法移植自红果短剧弹幕版.py，签名/取数逐字节一致）："
     "playerContent 挂本机弹幕源 /hg_dm（B站XML，DanmakuFlameMaster/各壳原生认），"
     "取数走红果评论接口30s窗口4路并发、纯Python SM3/SIMON/Argus/Ladon 签名（零第三方依赖，"
@@ -4414,35 +4416,6 @@ def _device_config(config: Mapping[str, Any]) -> dict[str, str]:
 
 def _video_model(video_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
     devices = _device_config(config)
-    params = {
-        "iid": devices["install_id"],
-        "device_id": devices["device_id"],
-        "ac": "wifi",
-        "channel": "update_64",
-        "aid": "8662",
-        "app_name": "novelread",
-        "version_code": "71332",
-        "version_name": "7.1.3.32",
-        "device_platform": "android",
-        "os": "android",
-        "ssmix": "a",
-        "device_type": "25053RT47C",
-        "device_brand": "Redmi",
-        "language": "zh",
-        "os_api": "36",
-        "os_version": "16",
-        "manifest_version_code": "71332",
-        "resolution": "1280*2772",
-        "dpi": "520",
-        "update_version_code": "71332",
-        "host_abi": "arm64-v8a",
-        "dragon_device_type": "phone",
-        "pv_player": "71332",
-        "compliance_status": "0",
-        "need_personal_recommend": "1",
-        "player_so_load": "1",
-        "is_android_pad_screen": "0",
-    }
     payload = {
         "biz_param": {
             "detail_page_version": 0,
@@ -4456,30 +4429,22 @@ def _video_model(video_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
         },
         "mixed_video_id_map": {"1004": [video_id]},
     }
-    request_headers = {
-        "User-Agent": APP_UA,
-        "Accept": "application/json; charset=utf-8,application/x-protobuf",
-        "Content-Type": "application/json; charset=UTF-8",
-        "x-xs-from-web": "0",
-        "x-ss-req-ticket": str(int(time.time() * 1000)),
-        "x-tt-request-tag": "t=0;n=0",
-        "sdk-version": "2",
-        "passport-sdk-version": "50561",
-        "x-vc-bdturing-sdk-version": "3.7.2.cn",
-    }
-    if devices.get("cookie"):
-        request_headers["Cookie"] = devices["cookie"]
-    signed_headers, signed_url = _core_sixgod(
-        VIDEO_URL,
-        params,
-        devices,
-        payload,
-        request_headers,
-    )
+    # 1.7.1 修起播：multi_video_model 上游已弃用旧 x-gorgon/x-medusa 签名
+    # （200 空包），改走弹幕同款 SM3/SIMON Argus+Ladon 新签名与 7.3.9.32 App query。
+    # x-ss-stub 必须对同一份字节做 md5 → 先序列化 body 再签名。
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    query = _dm_query(devices["device_id"]) + "&iid=" + devices["install_id"]
+    request_headers = {
+        "content-type": "application/json; charset=utf-8",
+        "User-Agent": "com.dragon.read",
+        "accept": "application/json",
+    }
+    request_headers.update(
+        _dm_sign_headers(query, body, devices["device_id"], devices["install_id"])
+    )
     response = requests.post(
-        signed_url,
-        headers=signed_headers,
+        VIDEO_URL.split("?")[0] + "?" + query,
+        headers=request_headers,
         data=body,
         timeout=30,
     )
