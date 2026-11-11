@@ -59,6 +59,14 @@
 #     （200 空包→502），_video_model 改走弹幕同款 SM3/SIMON Argus+Ladon 新签名
 #     与 7.3.9.32 App query（复用本文件 _dm_sign_headers/_dm_query，先序列化
 #     body 再签 x-ss-stub）；分类/详情/搜索/弹幕不动
+#  16. 红果(HG)筛选失效：官网分类页改版为路径式 /category/{内容类型}/{分类项}?page=N，
+#     旧查询参数（tab/sort_type/gender/topic/background/setting/time）被官网 301
+#     丢弃（实测仅 page/tab 与个别 background 遗留 id 幸存）。home_meta 筛选组改为
+#     题材/更多题材两组 slug 值（对齐 h红果.py；单组≤20 防 OK影视 截断；
+#     action-adventure 官网仍空载故不暴露）；categoryContent/_category_loader 改拼
+#     路径式 URL，404/空载回退同内容类型“全部”；旧 tid（all/latest/hot/male/female/
+#     ai_comic/manju/comic 等）别名映射到新路由，历史书签不受影响；官网已下线的
+#     排序/时间/男频女频筛选随之移除
 # =====================================================================
 #  聚合短剧 · 九合一
 #     (红果 + 黄豆 + 黄果 + 野果 + 禁果 + 红果黄剧 + 聚合短剧[短] + 2048短剧 + 狂飙短剧)
@@ -4764,23 +4772,44 @@ def _search_by_keywords(keywords, page: int) -> dict:
     }
 
 
-def _category_loader(page: int, q: dict) -> dict:
-    """分类页带重试；page=1 偶发空列表时多试几次。"""
+# ===== 官方分类路由（2026-11 官网改版）：/category/{route}/{item}?page=N =====
+# 官网弃用查询参数式分类——/category?tab=...&topic=... 等一律 301 丢弃（仅 page/tab
+# 与个别 background 遗留 id 幸存），排序/时间/男频女频筛选已下线，只剩“内容类型 +
+# 分类项”两级。旧 tid 用别名映射兼容，历史书签不受影响。
+_HG_ROUTE_ALIAS = {
+    "all": "real-drama", "latest": "real-drama", "hot": "real-drama",
+    "male": "real-drama", "female": "real-drama", "短剧": "real-drama",
+    "ai_comic": "ai-drama", "ai_manju": "ai-drama", "AI漫剧": "ai-drama", "ai漫剧": "ai-drama",
+    "manju": "comic-drama", "漫剧": "comic-drama",
+    "comic": "comic", "漫画": "comic",
+    "real-drama": "real-drama", "ai-drama": "ai-drama", "comic-drama": "comic-drama",
+}
+
+
+def _hg_route_of(tid):
+    return _HG_ROUTE_ALIAS.get(str(tid or "").strip(), "real-drama")
+
+
+def _category_loader(page: int, route: str, cat: str = "") -> dict:
+    """官方分类页：/category/{route}/{item}?page=N，数据在 _ROUTER_DATA；带重试。
+    page=1 偶发空列表时多试几次；404（路由/分类项不存在）快速失败交由上层回退。"""
     page = max(1, int(page or 1))
-    q = dict(q or {})
-    if page > 1:
-        q["page"] = str(page)
+    route = _hg_route_of(route)
+    path = "/category/" + route
+    if cat:
+        path += "/" + str(cat)
     last = {}
     for attempt in range(3):
         try:
-            data = _data(SITE + "/category?" + urlencode(q))
+            data = _data(SITE + path + ("?page=%d" % page if page > 1 else ""))
             p = (data.get("loaderData") or {}).get("category_$") or (data.get("loaderData") or {}).get("category_page") or {}
             rows = p.get("recommendList") or []
             if rows or page > 1:
                 return p
             last = p or last
-        except Exception:
-            pass
+        except Exception as e:
+            if "HTTP Error 404" in str(e):
+                break
         try:
             time.sleep(0.5 * (attempt + 1))
         except Exception:
@@ -5593,54 +5622,35 @@ class _HongguoSpider(_BaseSpider):
         return {"class": class_list, "filters": filter_dict, "list": home_list[:40]}
 
     def home_meta(self):
-        """仅返回分类与筛选（无网络请求），供聚合入口快速构建标签。"""
+        """仅返回分类与筛选（无网络请求），供聚合入口快速构建标签。
+        2026-11 官网改版：分类=四内容类型（路径式 /category/{route}/{item}），
+        题材筛选用 slug 值对齐 h红果.py；单组≤20 防 OK影视 截断，
+        action-adventure 官网仍空载（total=0）故不暴露。"""
         class_list = [
-            {"type_id": "all", "type_name": "短剧"},
-            {"type_id": "ai_comic", "type_name": "AI漫剧"},
-            {"type_id": "latest", "type_name": "最新"},
-            {"type_id": "hot", "type_name": "最热"},
-            {"type_id": "male", "type_name": "男频"},
-            {"type_id": "female", "type_name": "女频"},
+            {"type_id": "real-drama", "type_name": "真人剧"},
+            {"type_id": "ai-drama", "type_name": "AI漫剧"},
+            {"type_id": "comic-drama", "type_name": "漫剧"},
+            {"type_id": "comic", "type_name": "漫画"},
         ]
         groups = [
-            {"key": "topic", "name": "主题", "value": [
-                {"n": "全部", "v": ""}, {"n": "现言", "v": "cate_1021"}, {"n": "女性成长", "v": "cate_1048"},
-                {"n": "脑洞", "v": "cate_262"}, {"n": "奇幻", "v": "cate_1020"}, {"n": "玄幻", "v": "cate_1019"},
-                {"n": "古言", "v": "cate_439"}, {"n": "战神", "v": "cate_1038"}, {"n": "宫斗", "v": "cate_246"},
-                {"n": "仙侠", "v": "cate_1013"}, {"n": "权谋", "v": "cate_1047"}, {"n": "种田", "v": "cate_1180"},
-                {"n": "年代爱情", "v": "cate_1022"}, {"n": "悬疑", "v": "cate_165"}, {"n": "喜剧", "v": "cate_303"},
-                {"n": "青春", "v": "cate_297"}, {"n": "志怪", "v": "cate_1027"}, {"n": "民国爱情", "v": "cate_1025"},
-                {"n": "灵异", "v": "cate_751"}, {"n": "家国情怀", "v": "cate_1235"}, {"n": "法律", "v": "cate_1136"},
-                {"n": "刑侦", "v": "cate_1148"}, {"n": "抗战", "v": "cate_504"}, {"n": "武侠", "v": "cate_1172"},
-                {"n": "民国传奇", "v": "cate_1240"}, {"n": "求生", "v": "cate_1168"}, {"n": "动作", "v": "cate_302"},
-                {"n": "科幻", "v": "cate_1092"}, {"n": "恐怖", "v": "cate_1219"}, {"n": "商战", "v": "cate_1225"},
+            {"key": "cat", "name": "题材", "value": [
+                {"n": "全部", "v": ""}, {"n": "爱情", "v": "romance"},
+                {"n": "年代", "v": "period"}, {"n": "逆袭", "v": "comeback"},
+                {"n": "传奇", "v": "legend"}, {"n": "成长", "v": "growth"},
+                {"n": "家庭", "v": "family"}, {"n": "家族", "v": "clan"},
+                {"n": "萌宝", "v": "cute-kids"}, {"n": "悬疑", "v": "suspense"},
+                {"n": "惊悚", "v": "thriller"}, {"n": "恐怖", "v": "horror"},
+                {"n": "志怪", "v": "supernatural"}, {"n": "古装", "v": "costume"},
+                {"n": "玄幻", "v": "fantasy"}, {"n": "奇幻", "v": "wonder"},
+                {"n": "都市", "v": "urban"}, {"n": "青春", "v": "youth"},
+                {"n": "喜剧", "v": "comedy"},
             ]},
-            {"key": "background", "name": "背景", "value": [
-                {"n": "全部", "v": ""}, {"n": "现代", "v": "cate_757"}, {"n": "都市", "v": "cate_1"},
-                {"n": "古代", "v": "cate_758"}, {"n": "乡村", "v": "cate_11"}, {"n": "年代", "v": "cate_79"},
-                {"n": "架空", "v": "cate_452"}, {"n": "职场", "v": "cate_127"}, {"n": "民国", "v": "cate_390"},
-                {"n": "校园", "v": "cate_4"}, {"n": "宫廷", "v": "cate_1153"}, {"n": "荒岛", "v": "cate_1162"},
-            ]},
-            {"key": "setting", "name": "设定", "value": [
-                {"n": "全部", "v": ""}, {"n": "打脸虐渣", "v": "cate_1051"}, {"n": "大男主", "v": "cate_1207"},
-                {"n": "大女主", "v": "cate_760"}, {"n": "马甲", "v": "cate_266"}, {"n": "重生", "v": "cate_36"},
-                {"n": "穿越", "v": "cate_37"}, {"n": "系统", "v": "cate_19"}, {"n": "先婚后爱", "v": "cate_265"},
-                {"n": "家长里短", "v": "cate_862"}, {"n": "小人物", "v": "cate_1010"}, {"n": "破镜重圆", "v": "cate_475"},
-                {"n": "神豪", "v": "cate_20"}, {"n": "豪门", "v": "cate_936"}, {"n": "强者回归", "v": "cate_1045"},
-                {"n": "异能", "v": "cate_598"}, {"n": "虐恋", "v": "cate_1008"}, {"n": "传承觉醒", "v": "cate_1007"},
-                {"n": "医生", "v": "cate_487"}, {"n": "强强联合", "v": "cate_1049"}, {"n": "赘婿逆袭", "v": "cate_1044"},
-                {"n": "甜宠", "v": "cate_96"}, {"n": "娱乐圈", "v": "cate_43"}, {"n": "神医", "v": "cate_26"},
-                {"n": "青梅竹马", "v": "cate_387"}, {"n": "姐弟恋", "v": "cate_762"}, {"n": "玄学", "v": "cate_929"},
-                {"n": "追妻火葬场", "v": "cate_616"}, {"n": "业界精英", "v": "cate_1293"}, {"n": "一见钟情", "v": "cate_477"},
-                {"n": "福宝", "v": "cate_1291"}, {"n": "捞偏门", "v": "cate_1287"}, {"n": "反派主角", "v": "cate_1042"},
-                {"n": "萌宠", "v": "cate_428"}, {"n": "双向救赎", "v": "cate_1200"}, {"n": "方言", "v": "cate_1255"},
-                {"n": "白月光", "v": "cate_615"}, {"n": "灵魂互换", "v": "cate_831"}, {"n": "病娇", "v": "cate_380"},
-                {"n": "暴富", "v": "cate_1191"}, {"n": "黑道", "v": "cate_826"}, {"n": "丧尸", "v": "cate_582"},
-                {"n": "特种兵", "v": "cate_375"},
-            ]},
-            {"key": "time", "name": "时间", "value": [
-                {"n": "全部", "v": ""}, {"n": "7天内上新", "v": "1"}, {"n": "14天内上新", "v": "2"},
-                {"n": "30天内上新", "v": "3"}, {"n": "90天内上新", "v": "4"},
+            {"key": "cat2", "name": "更多题材", "value": [
+                {"n": "全部", "v": ""}, {"n": "科幻", "v": "sci-fi"},
+                {"n": "灾难", "v": "disaster"}, {"n": "战争", "v": "war"},
+                {"n": "综艺", "v": "variety"}, {"n": "剧情", "v": "drama"},
+                {"n": "脑洞(AI/漫)", "v": "creative"}, {"n": "末世(AI/漫)", "v": "apocalypse"},
+                {"n": "豪门(AI/漫)", "v": "wealthy-family"}, {"n": "冒险(AI/漫)", "v": "adventure"},
             ]},
         ]
         filter_dict = {c["type_id"]: groups for c in class_list}
@@ -5667,52 +5677,34 @@ class _HongguoSpider(_BaseSpider):
             pg = max(1, int(pg))
         except (TypeError, ValueError):
             pg = 1
-        if q is None:
-            q = {"tab": "1", "sort_type": "1"}
-        return _category_loader(pg, q)
+        # 旧查询参数式分类已随官网改版废弃，统一走路径式默认分类（真人剧）
+        return _category_loader(pg, "real-drama", "")
     def categoryContent(self, tid, pg, filter, extend):
         try:
             page = max(1, int(pg))
         except (TypeError, ValueError):
             page = 1
-        # 漫剧 / AI漫剧：官网搜索不支持真翻页，多关键词轮换
-        if tid in ("comic", "manju", "漫剧"):
-            try:
-                p = _category_loader(page, {"tab": "2", "sort_type": "1"})
-                rows = p.get("recommendList") or []
-                if rows:
-                    page_data = p.get("pagination") or {}
-                    return {
-                        "page": page,
-                        "pagecount": int(page_data.get("totalPages") or 1),
-                        "limit": len(rows),
-                        "total": int(page_data.get("total") or len(rows)),
-                        "list": [_cat_item(x) for x in rows],
-                    }
-            except Exception:
-                pass
-            return _search_by_keywords(_MANJU_KEYWORDS, page)
-        if tid in ("ai_comic", "ai_manju", "AI漫剧", "ai漫剧"):
-            return _search_by_keywords(_AI_MANJU_KEYWORDS, page)
-        q = {"tab": "1", "sort_type": "1"}
-        if tid == "latest":
-            q["sort_type"] = "2"
-        elif tid == "hot":
-            q["sort_type"] = "1"
-        elif tid == "male":
-            q["gender"] = "1"
-        elif tid == "female":
-            q["gender"] = "2"
+        # 官网改版后分类页为路径式 /category/{route}/{item}?page=N；
+        # 筛选取 cat2(更多题材)优先于 cat(题材)；坏组合 404/空载回退同内容类型“全部”
+        route = _hg_route_of(tid)
+        ext = {}
         if isinstance(extend, str) and extend:
             try:
-                extend = json.loads(extend)
+                ext = json.loads(extend)
             except Exception:
-                extend = {}
-        if isinstance(extend, dict):
-            for k, v in extend.items():
-                if v and str(v) not in ("", "all", "0"):
-                    q[k] = str(v)
-        p = _category_loader(page, q)
+                ext = {}
+        elif isinstance(extend, dict):
+            ext = dict(extend)
+        cat = str(ext.get("cat2") or ext.get("cat") or ext.get("分类") or "").strip()
+        if isinstance(filter, dict):
+            f2 = str(filter.get("cat2") or filter.get("cat") or filter.get("分类") or "").strip()
+            if f2 and not cat:
+                cat = f2
+        if cat in ("all", "全部", "0", "all_cat"):
+            cat = ""
+        p = _category_loader(page, route, cat)
+        if cat and not (p.get("recommendList") or []):
+            p = _category_loader(page, route, "")
         rows = p.get("recommendList") or []
         page_data = p.get("pagination") or {}
         return {
