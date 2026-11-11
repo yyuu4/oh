@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# 版本: 1.0.7  (2026-11-10)
+# 版本: 1.0.8  (2026-11-10)
 # 更新简介:
+#   v1.0.8 (2026-11-10)
+#     - 漏口封堵: dummyimage 早退绕过反代、代理存活时非白名单资源仍直连 —— 一律改走本机反代
+#     - 白名单分层: 回环反代 (仅 127.0.0.1) 放行任意 http(s); 服务端 /seg /pl 仍白名单防 SSRF
+#     - 代理存活但反代启动失败: 播放/封面返回空地址并记日志, 禁止回退直连 CDN 漏 IP
+#     - 静态导出: 跳过回环改写 (避免文件里写死已退出的随机端口);
+#       探测到代理时无 --force-direct 直接拒绝导出
 #   v1.0.7 (2026-11-10)
 #     - /seg 反代增加 CDN/站点 host 白名单, 拦截 SSRF (仅 surrit/sixyik/fourhoi/missav)
 #     - 代理存活时 TVBox 插件播放改走本机反代 (playerContent 返回 127.0.0.1 /pl /seg),
@@ -65,6 +71,7 @@ import ssl
 import socket
 
 # /seg、localProxy、封面反代仅允许这些 host (防 SSRF; 子域同放行)
+# 注意: 仅约束「对局域网暴露的服务端 /seg /pl」; 回环反代不查此表 (见 _revproxy_host_ok)
 _SEG_ALLOWED_HOSTS = frozenset((
     "surrit.mrstcdn.store",
     "surrit.com",
@@ -73,11 +80,14 @@ _SEG_ALLOWED_HOSTS = frozenset((
     "missav.fans",
     "missav.media",
     "missav.ws",
+    "dummyimage.com",
 ))
 
 # 服务模式置 True: 封面由 Handler 按请求 Host 改写 /seg, 不用 127.0.0.1 反代
 # (否则局域网订阅端拿不到服务器回环地址)
 _srv_mode = False
+# 静态导出置 True: 跳过一切反代改写 (进程退出后随机端口失效, 文件必须内嵌可用直连地址)
+_static_mode = False
 
 
 def _seg_host_ok(url):
@@ -93,6 +103,21 @@ def _seg_host_ok(url):
         if host.endswith("." + h):
             return True
     return False
+
+
+def _revproxy_host_ok(url, proxy_alive=False):
+    """回环反代/localProxy 取流放行:
+    - 代理存活 → 任意 http(s) (取流走代理, 不漏 IP; 反代仅 127.0.0.1 可达)
+    - 代理死亡 → 仅服务端白名单 (防借回环反代扫内网)"""
+    try:
+        p = urlparse(url)
+    except Exception:
+        return False
+    if p.scheme not in ("http", "https") or not p.hostname:
+        return False
+    if proxy_alive:
+        return True
+    return _seg_host_ok(url)
 
 try:
     from base.spider import Spider as SpiderBase
@@ -337,7 +362,7 @@ class Spider(SpiderBase):
             p = "https://fourhoi.com/%s/cover-t.jpg" % fallback_id
 
         if not p:
-            return "https://dummyimage.com/640x360/1e293b/ffffff.png&text=NO_COVER"
+            p = "https://dummyimage.com/640x360/1e293b/ffffff.png&text=NO_COVER"
 
         # 彻底移除 @Referer= 与 @User-Agent= 等 iOS 无法识别的语法糖后缀
         if "@Referer=" in p:
@@ -346,15 +371,21 @@ class Spider(SpiderBase):
         return self._maybe_seg(p)
 
     def _maybe_seg(self, url):
-        """代理存活且 host 在白名单 → 改写为本机 /seg; 否则原样返回。
-        服务模式跳过: 由 M3U Handler 按订阅端可见的 Host 改写, 回环地址对局域网无效。"""
-        if not url or not self._proxy_alive() or not _seg_host_ok(url):
+        """代理存活 → 封面改写为本机 /seg; 否则原样返回。
+        - 静态导出: 一律原样 (进程退出后回环端口失效)
+        - 服务模式: 一律原样, 由 M3U Handler 按订阅端可见 Host 改写
+        - 回环反代放行任意 http(s), 不查服务端白名单"""
+        if not url or not self._proxy_alive():
             return url
-        if _srv_mode:
+        if _static_mode or _srv_mode:
+            return url
+        if not url.startswith(("http://", "https://")):
             return url
         port = _ensure_revproxy(self)
         if not port:
-            return url
+            # 代理存活但反代起不来: 不回退直连 (会漏 IP), 用空地址让 UI 显示占位
+            _log("反代启动失败, 放弃封面直连以隐藏真实 IP: %s" % url)
+            return ""
         return _seg_proxy_url(url, "127.0.0.1:%d" % port)
 
     def _raw_fetch(self, target_url, host_ctx=""):
@@ -665,9 +696,9 @@ class Spider(SpiderBase):
 
                 first_char = title[0].strip().upper()
                 bg_color, fg_color = self.color_palette[idx % len(self.color_palette)]
-                card_pic = "https://dummyimage.com/640x360/%s/%s.png&text=%s" % (
-                    bg_color, fg_color, quote(first_char)
-                )
+                card_pic = self._maybe_seg(
+                    "https://dummyimage.com/640x360/%s/%s.png&text=%s" % (
+                        bg_color, fg_color, quote(first_char)))
 
                 vod_list.append({
                     "vod_id": "folder@" + (clean_href if clean_href.startswith("http") else urllib.parse.urljoin(self.baseHost, clean_href)),
@@ -1013,8 +1044,8 @@ class Spider(SpiderBase):
             "Connection": "keep-alive"
         }
         # 代理存活: 播放地址改走本机反代 (playlist 用 /pl, 其它用 /seg), 设备不直连 CDN
-        # 服务模式下 TVBox 不直接调 playerContent (走 /v/), 仍按回环改写无妨
-        if self._proxy_alive() and url and _seg_host_ok(url):
+        # 不查白名单 (回环反代放行任意 http(s)); 反代起失败则不回退直连 —— 会漏真实 IP
+        if self._proxy_alive() and url and url.startswith(("http://", "https://")):
             port = _ensure_revproxy(self)
             if port:
                 local = "127.0.0.1:%d" % port
@@ -1022,6 +1053,9 @@ class Spider(SpiderBase):
                     url = "http://%s/pl?u=%s" % (local, quote(url, safe=""))
                 else:
                     url = _seg_proxy_url(url, local)
+            else:
+                _log("反代启动失败, 播放返回空地址以隐藏真实 IP: %s" % url)
+                url = ""
         return {
             "parse": 0,
             "jx": 0,
@@ -1060,7 +1094,7 @@ class Spider(SpiderBase):
         target = str(params.get("url") or params.get("u") or "").strip()
         if not target or not target.startswith(("http://", "https://")):
             return [400, "text/plain; charset=utf-8", "bad url"]
-        if not _seg_host_ok(target):
+        if not _revproxy_host_ok(target, self._proxy_alive()):
             return [403, "text/plain; charset=utf-8", "host not allowed"]
         sp = self
         # 把线程本地指到当前实例, 让 fetch_abs_playlist/_site_ref_origin 用同一 opener/代理状态
@@ -1593,7 +1627,8 @@ class _RevProxyHandler(BaseHTTPRequestHandler):
         if not target.startswith(("http://", "https://")):
             self._send(400, "bad url\n")
             return
-        if not _seg_host_ok(target):
+        # 回环反代: 代理存活放行任意 http(s); 代理死亡仅白名单 (防内网 SSRF)
+        if not _revproxy_host_ok(target, _revproxy_spider()._proxy_alive()):
             self._send(403, "host not allowed\n")
             return
         sp = _revproxy_spider()
@@ -1616,7 +1651,8 @@ class _RevProxyHandler(BaseHTTPRequestHandler):
         if not target.startswith(("http://", "https://")):
             self._send(400, "bad url\n")
             return
-        if not _seg_host_ok(target):
+        # 回环反代: 代理存活放行任意 http(s); 代理死亡仅白名单 (防内网 SSRF)
+        if not _revproxy_host_ok(target, _revproxy_spider()._proxy_alive()):
             self._send(403, "host not allowed\n")
             return
         sp = _revproxy_spider()
@@ -1893,7 +1929,10 @@ def serve(port):
 
 
 def build_m3u_static(cats=None, pages=5, threads=8, max_videos=0):
-    """静态模式: 一次性生成 M3U, 条目为直连 surrit 地址。"""
+    """静态模式: 一次性生成 M3U, 条目为直连 surrit 地址。
+    置 _static_mode: 跳过一切反代改写 (进程退出后随机端口失效)。"""
+    global _static_mode
+    _static_mode = True
     sp = get_spider()
     allcats = srv_cats()
     if cats:
@@ -1971,6 +2010,8 @@ def main(argv=None):
     ap.add_argument("--threads", type=int, default=8, help="静态模式详情页并发数 (默认8)")
     ap.add_argument("--max", type=int, default=0, help="静态模式最多抓多少条视频 (默认0=不限)")
     ap.add_argument("--cache-mins", type=int, default=10, help="服务模式分类列表缓存分钟数 (默认10)")
+    ap.add_argument("--force-direct", action="store_true",
+                    help="静态导出: 明确接受直连 CDN 暴露真实 IP 的风险 (代理存活时无此参数拒绝导出)")
     args = ap.parse_args(argv)
 
     global SRV_PAGES, SRV_CACHE_MINS
@@ -1982,10 +2023,14 @@ def main(argv=None):
         # 静态文件内嵌直连 CDN 地址, 播放器不经过本进程 → 无法藏 IP
         try:
             sp = get_spider()
-            if sp._proxy_ok:
-                _log("警告: 检测到代理配置, 但 --static 导出的是直连地址,")
+            if sp._proxy_ok and not args.force_direct:
+                _log("错误: 检测到代理, --static 导出的是直连地址,")
                 _log("      播放时播放器将直连 CDN 并暴露真实 IP。")
-                _log("      如需隐藏 IP 请改用服务模式 (去掉 --static)。")
+                _log("      要么改用服务模式 (去掉 --static),")
+                _log("      要么加 --force-direct 明确接受风险。")
+                return 1
+            if sp._proxy_ok and args.force_direct:
+                _log("警告: --force-direct 已指定, 静态文件将暴露真实 IP。")
         except Exception:
             pass
         m3u, ok, fail = build_m3u_static(
