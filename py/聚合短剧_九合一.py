@@ -67,12 +67,18 @@
 #     路径式 URL，404/空载回退同内容类型“全部”；旧 tid（all/latest/hot/male/female/
 #     ai_comic/manju/comic 等）别名映射到新路由，历史书签不受影响；官网已下线的
 #     排序/时间/男频女频筛选随之移除
+#  17. 两修既有上游破损：① 红果(HG)搜索空——官网搜索迁 /api/search/*+字节反爬后
+#     SSR 页恒空壳，移植 h红果.py 的「扫分类页按标题命中」兜底 + 45s 负缓存
+#     （_hg_search_scan/_search_neg_*），searchContent 空结果时自动扫四内容分类；
+#     ② 狂飙(KB)列表空——主站 ai.dramarush.tv 被 DNS 污染(31.13.112.9 黑洞)，
+#     _KB_HOST 改指未污染的 https://dramarush.tv（同站 tRPC/播放页实测全通，
+#     kbApiBase 壳配置仍可再覆盖）
 # =====================================================================
 #  聚合短剧 · 九合一
 #     (红果 + 黄豆 + 黄果 + 野果 + 禁果 + 红果黄剧 + 聚合短剧[短] + 2048短剧 + 狂飙短剧)
 #  由 __.py(红果) / ____.py(黄豆) / 黄果短剧修复DNS.py(黄果) / 野果.py(野果)
 #     / 禁果.py(禁果) / 红果黄剧.js(红果黄剧,已转 Python) / _______.js(聚合，已转 Python)
-#     / 2048成人短剧[18].py(麻豆成人,mdcmai4.xyz) / 狂飙短剧.py(狂飙短剧,ai.dramarush.tv) 融合而成
+#     / 2048成人短剧[18].py(麻豆成人,mdcmai4.xyz) / 狂飙短剧.py(狂飙短剧,dramarush.tv) 融合而成
 #  单文件 TVBox / CatVod Python 爬虫，class Spider 统一入口，按引擎前缀分发
 #      HG:: -> 红果   HD:: -> 黄豆   HGUO:: -> 黄果   YG:: -> 野果
 #      JG:: -> 禁果   HGJ:: -> 红果黄剧   AG:: -> 聚合(15平台)   MD:: -> 2048短剧
@@ -4650,9 +4656,11 @@ def _key_seed_from_model(model: Mapping[str, Any]) -> bytes:
             if result:
                 return result
     return b""
-def _page(url):
+def _page(url, retries=3):
     last_err = None
-    for attempt in range(3):
+    # retries=1 供翻页越界快速失败（官网越界页常为无 _ROUTER_DATA 的壳，
+    # 默认 3 连重试+退避会把单页拖到十几秒）
+    for attempt in range(max(1, int(retries or 1))):
         try:
             r = requests.get(
                 url,
@@ -4677,8 +4685,8 @@ def _page(url):
                 pass
     raise RuntimeError("page fetch failed: %s" % last_err)
 
-def _data(url):
-    html = _page(url)
+def _data(url, retries=3):
+    html = _page(url, retries=retries)
     m = re.search(r"(?:window\.)?_ROUTER_DATA\s*=\s*", html)
     if not m:
         return {}
@@ -4723,22 +4731,31 @@ def _filter_group(key, name, values):
 
 
 def _search_loader(key: str) -> dict:
-    """拉取搜索页 loaderData，失败重试。"""
-    last = {}
-    for attempt in range(3):
-        try:
-            data = _data(SITE + "/search/" + quote(str(key), safe=""))
-            page = (data.get("loaderData") or {}).get("search_(keyword)/page") or {}
-            if page.get("searchList"):
-                return page
-            last = page or last
-        except Exception:
-            pass
-        try:
-            time.sleep(0.5 * (attempt + 1))
-        except Exception:
-            pass
-    return last
+    """拉取搜索页 loaderData。官网搜索页已迁 API+反爬，SSR 常为无
+    _ROUTER_DATA 的空壳——此时 1 次快速失败交扫描兜底，不再 3×3 重试相乘拖到几十秒。"""
+    try:
+        r = requests.get(
+            SITE + "/search/" + quote(str(key), safe=""),
+            headers={
+                "User-Agent": UA,
+                "Accept-Language": "zh-CN,zh;q=0.9",
+                "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+                "Cache-Control": "no-cache",
+            },
+            timeout=12,
+        )
+        r.raise_for_status()
+        r.encoding = r.encoding or "utf-8"
+        html = r.text or ""
+        if "_ROUTER_DATA" not in html:
+            return {}
+        m = re.search(r"(?:window\.)?_ROUTER_DATA\s*=\s*", html)
+        if not m:
+            return {}
+        data = json.JSONDecoder().raw_decode(html[m.end():])[0]
+        return (data.get("loaderData") or {}).get("search_(keyword)/page") or {}
+    except Exception:
+        return {}
 
 
 def _search_by_keywords(keywords, page: int) -> dict:
@@ -4772,6 +4789,125 @@ def _search_by_keywords(keywords, page: int) -> dict:
     }
 
 
+# 搜索负缓存：搜不到的词 45s 内不再打接口/扫分类页（对齐 h红果.py）
+_SEARCH_NEG_TTL = 45.0
+_SEARCH_NEG_MAX = 512
+_SEARCH_NEG: dict = {}
+
+
+def _search_neg_key(key, page) -> str:
+    return "neg|%s|%s" % (str(key or ""), max(1, int(page or 1)))
+
+
+def _search_neg_put(key, page) -> None:
+    _SEARCH_NEG[_search_neg_key(key, page)] = time.time()
+    if len(_SEARCH_NEG) <= _SEARCH_NEG_MAX:
+        return
+    now = time.time()
+    for k in list(_SEARCH_NEG):
+        if _SEARCH_NEG[k] <= now - _SEARCH_NEG_TTL:
+            _SEARCH_NEG.pop(k, None)
+    while len(_SEARCH_NEG) > _SEARCH_NEG_MAX and _SEARCH_NEG:
+        _SEARCH_NEG.pop(next(iter(_SEARCH_NEG)), None)
+
+
+def _search_neg_hit(key, page) -> bool:
+    ts = _SEARCH_NEG.get(_search_neg_key(key, page))
+    if ts is None:
+        return False
+    if time.time() - ts > _SEARCH_NEG_TTL:
+        _SEARCH_NEG.pop(_search_neg_key(key, page), None)
+        return False
+    return True
+
+
+def _search_empty_page(page) -> dict:
+    return {"page": max(1, int(page or 1)), "pagecount": 1, "limit": 0, "total": 0, "list": []}
+
+
+def _hg_search_scan(key, page=1, max_pages=8):
+    """搜索兜底：官方搜索接口被风控时，扫官方分类页按标题命中（并发）。"""
+    key = str(key or "").strip()
+    page = max(1, int(page or 1))
+    empty = _search_empty_page(page)
+    if not key:
+        return empty
+    # 聚合版无榜单路由，只扫四个内容分类（与 home_meta class_list 一致）
+    routes = ["real-drama", "ai-drama", "comic-drama", "comic"]
+    per = 20
+    need = page * per
+
+    hits = []
+    seen = set()
+    # 各路由实际最大页（从 pagination.totalPages 学到），越界不再打
+    route_cap = {r: max_pages for r in routes}
+
+    def take(rows):
+        for x in rows:
+            if not isinstance(x, dict):
+                continue
+            it = _item(x)
+            nm = str(it.get("vod_name") or "")
+            if key not in nm:
+                continue
+            vid = str(it.get("vod_id") or "")
+            if not vid or vid in seen:
+                continue
+            seen.add(vid)
+            hits.append(it)
+
+    def work(rp):
+        r, p = rp
+        try:
+            pg = _category_loader(p, r, "")
+            rows = pg.get("recommendList") or []
+            try:
+                tp = int((pg.get("pagination") or {}).get("totalPages") or 0)
+            except (TypeError, ValueError):
+                tp = 0
+            if tp > 0:
+                route_cap[r] = min(route_cap.get(r, max_pages), tp)
+            return rows
+        except Exception as err:
+            try:
+                _hg_trace("搜索扫分类页失败 route=%s pg=%s %s" % (r, p, str(err)[:60]))
+            except Exception:
+                pass
+            return []
+
+    # 按页推进，够当前页就停，避免每次固定全量扫页触发风控。
+    for scan_page in range(1, max(1, int(max_pages or 1)) + 1):
+        active = [r for r in routes if scan_page <= route_cap.get(r, max_pages)]
+        if not active:
+            break
+        try:
+            if concurrent is not None:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+                    for rows in ex.map(work, [(r, scan_page) for r in active]):
+                        take(rows)
+            else:
+                for r in active:
+                    take(work((r, scan_page)))
+        except Exception as err:
+            try:
+                _hg_trace("搜索扫分类页线程池异常 pg=%s %s" % (scan_page, str(err)[:60]))
+            except Exception:
+                pass
+        if len(hits) >= need:
+            break
+    if not hits:
+        return empty
+    st = (page - 1) * per
+    chunk = hits[st:st + per]
+    return {
+        "page": page,
+        "pagecount": max(1, (len(hits) + per - 1) // per),
+        "limit": len(chunk),
+        "total": len(hits),
+        "list": chunk,
+    }
+
+
 # ===== 官方分类路由（2026-11 官网改版）：/category/{route}/{item}?page=N =====
 # 官网弃用查询参数式分类——/category?tab=...&topic=... 等一律 301 丢弃（仅 page/tab
 # 与个别 background 遗留 id 幸存），排序/时间/男频女频筛选已下线，只剩“内容类型 +
@@ -4792,23 +4928,26 @@ def _hg_route_of(tid):
 
 def _category_loader(page: int, route: str, cat: str = "") -> dict:
     """官方分类页：/category/{route}/{item}?page=N，数据在 _ROUTER_DATA；带重试。
-    page=1 偶发空列表时多试几次；404（路由/分类项不存在）快速失败交由上层回退。"""
+    page=1 偶发空列表时多试几次；404/越界页快速失败交由上层回退/扫描剪枝。"""
     page = max(1, int(page or 1))
     route = _hg_route_of(route)
     path = "/category/" + route
     if cat:
         path += "/" + str(cat)
     last = {}
-    for attempt in range(3):
+    # 翻页越界常回无数据壳：单次快速失败，避免 3×退避拖死搜索扫描
+    attempts = 3 if page == 1 else 1
+    for attempt in range(attempts):
         try:
-            data = _data(SITE + path + ("?page=%d" % page if page > 1 else ""))
+            data = _data(SITE + path + ("?page=%d" % page if page > 1 else ""),
+                         retries=3 if page == 1 else 1)
             p = (data.get("loaderData") or {}).get("category_$") or (data.get("loaderData") or {}).get("category_page") or {}
             rows = p.get("recommendList") or []
             if rows or page > 1:
                 return p
             last = p or last
         except Exception as e:
-            if "HTTP Error 404" in str(e):
+            if "HTTP Error 404" in str(e) or page > 1:
                 break
         try:
             time.sleep(0.5 * (attempt + 1))
@@ -5590,6 +5729,10 @@ class _HongguoSpider(_BaseSpider):
             _hg_cache_cleanup(False)
         except Exception:
             pass
+        try:
+            _SEARCH_NEG.clear()
+        except Exception:
+            pass
 
         # 弹幕缓存一并释放：长驻进程反复进出详情/播放，32 位内存水位只降不涨
         try:
@@ -5727,8 +5870,19 @@ class _HongguoSpider(_BaseSpider):
         if key in ("漫剧", "动漫短剧"):
             return _search_by_keywords(_MANJU_KEYWORDS, page)
 
+        # 负缓存命中(45s内同词同页全 miss)：直接回空，跳过接口与分类页扫描
+        if _search_neg_hit(key, page):
+            return _search_empty_page(page)
+
         p = _search_loader(key)
         rows = p.get("searchList") or []
+        if not rows:
+            # 官方搜索风控不可用时，扫官方分类页按标题命中兜底
+            scanned = _hg_search_scan(key, page)
+            if scanned.get("list"):
+                return scanned
+            # 全 miss：45s 负缓存，短时间重复搜同词不再打接口/扫分类页
+            _search_neg_put(key, page)
         total = int(p.get("totalCount") or len(rows) or 0)
         # 官网搜索基本只有一页有效结果
         return {
@@ -12263,7 +12417,9 @@ class _MadouSpider(_BaseSpider):
 # =====================================================================
 _KB_TAG = "KB"
 _KB_LINE_NAME = "狂飙短剧"
-_KB_HOST = "https://ai.dramarush.tv"
+# 2026-11: ai.dramarush.tv 被 DNS 污染(解析到 31.13.112.9，本机 Network unreachable)，
+# 改指同站未污染主域；壳里仍可传 {"kbApiBase": "..."} 覆盖
+_KB_HOST = "https://dramarush.tv"
 _KB_DEFAULT_TID = "recommend"
 _KB_UA = ("Mozilla/5.0 (Linux; Android 12; Mobile) AppleWebKit/537.36 "
           "(KHTML, like Gecko) Chrome/131.0 Safari/537.36")
@@ -12459,16 +12615,25 @@ class _KuangbiaoSpider(_BaseSpider):
         seen = set()
         if key:
             key_cmp = re.sub(r"\s+", "", key)
-            try:
-                d = self._api("feed.browse", {"categorySlug": "t-5jxcit", "limit": 30})
-                for x in self._items(d):
-                    name = re.sub(r"\s+", "", str(x.get("vod_name") or ""))
-                    vid = x.get("vod_id")
-                    if key_cmp and key_cmp in name and vid and vid not in seen:
-                        seen.add(vid)
-                        out.append(x)
-            except Exception:
-                out = []
+            # 多路拉页本地过滤：tRPC limit≤20；t-5jxcit 单路常不含目标剧，
+            # 补推荐流与成人分类，覆盖面才够（旧 limit:30 会直接 400 永远空）
+            for obj in (
+                {"limit": 20},
+                {"categorySlug": "t-5jxcit", "limit": 20},
+                {"tagSlug": "adult", "limit": 20},
+            ):
+                try:
+                    d = self._api("feed.browse", obj) if "categorySlug" in obj or "tagSlug" in obj else self._api("feed.recommend", obj)
+                    for x in self._items(d):
+                        name = re.sub(r"\s+", "", str(x.get("vod_name") or ""))
+                        vid = x.get("vod_id")
+                        if key_cmp and key_cmp in name and vid and vid not in seen:
+                            seen.add(vid)
+                            out.append(x)
+                except Exception:
+                    pass
+                if out:
+                    break
         if not out and key:
             try:
                 out = [x for x in self._list("t-5jxcit") if key in str(x.get("vod_name") or "")]
@@ -12622,8 +12787,17 @@ class _KuangbiaoSpider(_BaseSpider):
         seen_name = set()
         for x in arr:
             v = x.get("drama") if isinstance(x, dict) else {}
-            tags = [str(t.get("name") or "") for t in v.get("tags", []) if isinstance(t, dict)] if isinstance(v, dict) else []
-            adult = any(t.startswith("adult-") or "不伦" in t or "偷情" in t for t in tags)
+            # 成人判定同时看 tag name 与 slug：站点多用 av-* slug，仅看 name 会把
+            # tagSlug=adult 拉回的大部分成人剧误滤成 0/1 条
+            tags = []
+            for t in (v.get("tags") or []) if isinstance(v, dict) else []:
+                if isinstance(t, dict):
+                    tags.append(str(t.get("name") or ""))
+                    tags.append(str(t.get("slug") or ""))
+            adult = any(
+                t.startswith("adult-") or t.startswith("av-") or "不伦" in t or "偷情" in t
+                for t in tags
+            )
             if (mode == "adult" and not adult) or (mode == "normal" and adult):
                 continue
             it = self._it(x)
@@ -12662,7 +12836,9 @@ class _KuangbiaoSpider(_BaseSpider):
         cur = self.cursor.get(tid, {}).get(pg)
         if pg > 1 and not cur:
             return []
-        mode = "adult" if tid == "adult_short" else "normal" if tid == "normal_short" else "all"
+        # 成人/正规分流：tagSlug=adult 服务端已筛过，client 不再二次 mode 滤
+        # （旧 adult- name 判定会把 av-* slug 的成人剧滤没，只剩 1 条）
+        mode = "all" if tid == "adult_short" else "normal" if tid == "normal_short" else "all"
         seen = self.seen_page.setdefault(tid, set())
         out = []
         nxt = ""
@@ -12679,7 +12855,8 @@ class _KuangbiaoSpider(_BaseSpider):
                     seen.add(k)
                     out.append(x)
         else:
-            data = dict({"limit": 12}, **mp.get(tid, {"categorySlug": tid}))
+            # 站点 tRPC limit>20 直接 400（实测 30/50 均拒），上限 20
+            data = dict({"limit": 20}, **mp.get(tid, {"categorySlug": tid}))
             if cur:
                 data["cursor"] = cur
             loops = 8 if tid in ["adult_short", "normal_short"] else 1
