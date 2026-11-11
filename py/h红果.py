@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-VERSION = "1.7.2"
+VERSION = "1.7.3"
 VERSION_NOTE = (
+    "1.7.3 榜单对齐官网两修：① 后四类顺序改为 全部(hot-drama)→漫剧(hot-comic-drama)→"
+    "真人剧(hot-real-drama)→AI剧(hot-ai-drama)（与官网榜单下拉一致，原为热播/真人/AI/漫剧）；"
+    "② 四榜单补子榜筛选（官网各榜页 tab）：热播榜=默认空 slug，其余为 prestige/subscribe/new/"
+    "hot-search/must-watch/followed 及各内容类型后缀子榜；categoryContent 榜单分支按 cat 选子榜 slug "
+    "取页，空 cat 回主榜。分类筛选本体不动。"
     "1.7.2 分类筛选对照官网复检两修：① 榜单页新增第三形态——数据内联 "
     "_ROUTER_DATA.loaderData[\"rank_{slug}/page\"].content（今日四榜单实测 fn-args merge 为空数组、"
     "旧形态A/B均不存在导致全0条），先取内联再回退旧形态A/B解析；② 坏 cat slug 走404合成空页时"
@@ -649,11 +654,24 @@ _HG_CONTENT_TYPES = [
     # 漫画类：按官网保留展示（已拍板）。上游 multi_video_model 对漫画 vid 回
     # 101000 无播放源（已试遍 map key/platform 变体），播放失败属上游限制而非插件缺陷。
     ("comic", "漫画", [("", "全部")]),
-    # 官网导航“榜单”四路由(排在四个内容分类之后)，列表在内嵌 fn-args 里(见 _hg_rank_page)
-    ("hot-drama", "红果热播榜", [("", "全部")]),
-    ("hot-real-drama", "真人剧热播榜", [("", "全部")]),
-    ("hot-ai-drama", "AI剧热播榜", [("", "全部")]),
-    ("hot-comic-drama", "漫剧热播榜", [("", "全部")]),
+    # 官网导航“榜单”下拉顺序：全部→漫剧→真人剧→AI剧（2026-11 实测）；
+    # 筛选=各榜页子榜 tab（空 slug=该主榜本身）。
+    ("hot-drama", "红果热播榜", [
+        ("", "热播榜"), ("prestige-drama", "臻果榜"), ("subscribe-drama", "预约榜"),
+        ("new-drama", "新剧榜"), ("hot-search-drama", "热搜榜"),
+        ("must-watch-drama", "必看榜"), ("followed-drama", "收藏榜"),
+    ]),
+    ("hot-comic-drama", "漫剧热播榜", [
+        ("", "热播榜"), ("new-comic-drama", "新剧榜"), ("hot-search-comic-drama", "热搜榜"),
+    ]),
+    ("hot-real-drama", "真人剧热播榜", [
+        ("", "热播榜"), ("new-real-drama", "新剧榜"), ("hot-search-real-drama", "热搜榜"),
+        ("must-watch-real-drama", "必看榜"), ("followed-real-drama", "收藏榜"),
+    ]),
+    ("hot-ai-drama", "AI剧热播榜", [
+        ("", "热播榜"), ("new-ai-drama", "新剧榜"), ("hot-search-ai-drama", "热搜榜"),
+        ("must-watch-ai-drama", "必看榜"), ("followed-ai-drama", "收藏榜"),
+    ]),
 ]
 _HG_ROUTES = {k: v for k, v in ((a, b) for a, b, _ in _HG_CONTENT_TYPES)}
 _HG_RANK_ROUTES = frozenset(("hot-drama", "hot-real-drama", "hot-ai-drama", "hot-comic-drama"))
@@ -6043,11 +6061,13 @@ class Spider(_BaseSpider):
         if cat in ("all", "全部", "0", "all_cat"):
             cat = ""
         if route in _HG_RANK_ROUTES:
+            # 筛选值=子榜 slug；空/热播榜=主榜本身（与官网各榜页 tab 一致）
+            rank_slug = route if cat in ("", "热播榜") else cat
             try:
-                p = _hg_rank_page(route, page)
+                p = _hg_rank_page(rank_slug, page)
             except Exception as err:
                 try:
-                    _hg_trace("榜单页失败(空返) slug=%s pg=%s %s" % (route, page, err))
+                    _hg_trace("榜单页失败(空返) slug=%s pg=%s %s" % (rank_slug, page, err))
                 except Exception:
                     pass
                 p = {}
