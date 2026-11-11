@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 VERSION_NOTE = (
+    "1.7.2 分类筛选对照官网复检两修：① 榜单页新增第三形态——数据内联 "
+    "_ROUTER_DATA.loaderData[\"rank_{slug}/page\"].content（今日四榜单实测 fn-args merge 为空数组、"
+    "旧形态A/B均不存在导致全0条），先取内联再回退旧形态A/B解析；② 坏 cat slug 走404合成空页时"
+    "由「仅异常回退」扩为「异常或空结果均回退同route全部」（与聚合版对齐，不破坏翻页终止语义）。"
+    "分类筛选本体（四内容类型/23+8+8项/路径式URL/双组拆分）今日实测已与官网对齐，无需改动。"
     "1.7.1 修起播：multi_video_model 上游已弃用旧 gorgon/medusa 签名（200 空包），"
     "改用弹幕同款 SM3/SIMON Argus+Ladon 签名与 7.3.9.32 App query；分类/详情/搜索/弹幕不动。"
     "1.7.0 加弹幕（刀法移植自红果短剧弹幕版.py，签名/取数逐字节一致）："
@@ -781,10 +786,12 @@ def _rank_payload_from_merge(args):
 
 
 def _rank_content_from_html(html_text, slug):
-    """榜单列表在内嵌 data-fn-args 脚本里，站点有两种形态且按请求随机(实测约41%为形态B)：
+    """榜单列表解析，站点有三种形态：
+    形态C(2026-11 现行) = 数据内联 _ROUTER_DATA.loaderData["rank_<slug>/page"].content，
+      fn-args 的 merge 条目为空数组(见 _hg_rank_page 先取 payload 再回退本函数)；
     形态A = data-fn-name="r" 的 args = ["rank_<slug>/page", "content", {"isSuccess","pagination","rankList"}]；
     形态B = 该 r 标签缺失，榜单数据只在 mergeLoaderData 的 routerDataFnArgs(二次编码 JSON 字符串)里。
-    loaderData.content 本身为空壳，必须从 fn-args 取；两形态互斥，取到即回。"""
+    形态A/B互斥，取到即回；形态C由调用方优先提取。"""
     marker = "rank_%s/page" % slug
     for m in re.finditer(r"data-fn-args=(['\"])(.*?)\1", html_text or ""):
         try:
@@ -831,7 +838,18 @@ def _hg_rank_page(slug, page):
             payload = _router_payload(r.text or "")
             if not isinstance(payload, Mapping):
                 raise HongguoPluginError("榜单页路由数据格式错误")
-            content = _rank_content_from_html(r.text or "", slug)
+            # 形态C(2026-11 现行): 数据内联 loaderData["rank_<slug>/page"].content，
+            # fn-args 的 merge 条目为空数组；取不到再回退旧形态A/B。
+            content = None
+            try:
+                loader = (payload.get("loaderData") or {}).get("rank_%s/page" % slug) or {}
+                inner = loader.get("content")
+                if isinstance(inner, Mapping) and ("rankList" in inner or inner.get("pagination")):
+                    content = dict(inner)
+            except Exception:
+                content = None
+            if content is None:
+                content = _rank_content_from_html(r.text or "", slug)
             if not (content.get("rankList") or content.get("pagination")):
                 raise _HGDataEmpty("榜单页空载")
             _net_result(True)
@@ -6057,6 +6075,16 @@ class Spider(_BaseSpider):
                     pass
                 p = {}
         rows = p.get("recommendList") or []
+        # 坏 cat slug 走404合成空页(不抛异常)：空结果同样回退同route全部。
+        # 真·页越界时裸路由同页也空/同样404终止，行为不变。
+        if cat and not rows:
+            try:
+                p2 = _hg_category_page(route, "", page)
+                rows2 = p2.get("recommendList") or []
+                if rows2:
+                    p, rows = p2, rows2
+            except Exception:
+                pass
         items = []
         for x in rows:
             it = _cat_item(x)
