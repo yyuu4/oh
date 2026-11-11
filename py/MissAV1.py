@@ -1,8 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# 版本: 1.0.5  (2026-11-10)
+# 版本: 1.0.7  (2026-11-10)
 # 更新简介:
+#   v1.0.7 (2026-11-10)
+#     - /seg 反代增加 CDN/站点 host 白名单, 拦截 SSRF (仅 surrit/sixyik/fourhoi/missav)
+#     - 代理存活时 TVBox 插件播放改走本机反代 (playerContent 返回 127.0.0.1 /pl /seg),
+#       封面图同样改写; 设备不再直连 CDN, 真实 IP 只出现在代理出口
+#     - 代理连接层失败 (拒绝/重置) 时标死并直连重试一次: fetch_abs_playlist 与 /seg 对齐
+#     - 静态导出 --static 在探测到代理时告警: 文件内嵌直连地址, 播放会暴露真实 IP
+#     - 实现 localProxy (TVBox 内置代理入口): m3u8 重写分片 + 分片经代理取流
+#   v1.0.6 (2026-11-10)
+#     - 代理语义收紧为「隐藏真实 IP」: 代理存活时站点/playlist/分片全部经代理,
+#       仅在代理连接层失败 (ConnectionRefused/Reset) 时标记死亡并改直连
+#     - 代理存活时不再因 missav.fans/media 可用而放弃代理 (_switch_host 不再切直连优先)
+#     - 服务模式新增 /seg 反代: 代理存活时 playlist 分片改写为本机 /seg?u=...,
+#       由服务端经代理拉取后回给播放器, 播放器不再直连 CDN
 #   v1.0.5 (2026-11-10)
 #     - 详情页按原网页显示: 导演取 og:video:director/导演链接, 演员取站内女优链接
 #       (回退 og:video:actor), 简介用原页 meta description, 不再加交流群前缀
@@ -49,6 +62,37 @@ import http.cookiejar
 import gzip
 import zlib
 import ssl
+import socket
+
+# /seg、localProxy、封面反代仅允许这些 host (防 SSRF; 子域同放行)
+_SEG_ALLOWED_HOSTS = frozenset((
+    "surrit.mrstcdn.store",
+    "surrit.com",
+    "sixyik.com",
+    "fourhoi.com",
+    "missav.fans",
+    "missav.media",
+    "missav.ws",
+))
+
+# 服务模式置 True: 封面由 Handler 按请求 Host 改写 /seg, 不用 127.0.0.1 反代
+# (否则局域网订阅端拿不到服务器回环地址)
+_srv_mode = False
+
+
+def _seg_host_ok(url):
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    if host in _SEG_ALLOWED_HOSTS:
+        return True
+    for h in _SEG_ALLOWED_HOSTS:
+        if host.endswith("." + h):
+            return True
+    return False
 
 try:
     from base.spider import Spider as SpiderBase
@@ -70,6 +114,7 @@ class Spider(SpiderBase):
         self.fallbackHost = self.DIRECT_HOSTS[0]
         self.baseHost = self.primaryHost
         self._proxy_ok = False
+        self._proxy_dead = False   # 代理曾可用但连接层失败 → 改直连
         self._prefer_direct = False
 
         self._ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -130,7 +175,7 @@ class Spider(SpiderBase):
     # 局域网/本机常见代理端口, 依次探测, 通了就用 (抓取 missav.ws 需要; surrit CDN 播放不需要)
     PROXY_PROBE = [
         ("127.0.0.1", 7890), ("127.0.0.1", 7897),
-        ("127.0.0.1", 10808), ("127.0.0.1", 10809),
+        ("127.0.0.1", 10172), ("127.0.0.1", 1072),
         ("192.168.1.8", 7144),
     ]
 
@@ -166,6 +211,7 @@ class Spider(SpiderBase):
 
         if proxy_url:
             self._proxy_ok = True
+            self._proxy_dead = False
             proxy_handlers = [
                 urllib.request.HTTPCookieProcessor(self.cj),
                 urllib.request.HTTPSHandler(context=self.ctx),
@@ -180,36 +226,49 @@ class Spider(SpiderBase):
                 self.baseHost = self.primaryHost
         else:
             self._proxy_ok = False
+            self._proxy_dead = False
             self._opener_proxy = None
             self.opener = self._opener_direct
             self.primaryHost = self.DIRECT_HOSTS[0]
             self.baseHost = self.primaryHost
             self._prefer_direct = True
 
+    def _proxy_alive(self):
+        """代理是否仍应使用: 已配置/探测到, 且未发生连接层死亡。"""
+        return bool(self._proxy_ok and not self._proxy_dead and getattr(self, "_opener_proxy", None))
+
+    def _mark_proxy_dead(self):
+        """代理连接层失败 → 本进程后续全部改直连 (隐藏 IP 优先, 连不上才降级)。"""
+        if self._proxy_ok and not self._proxy_dead:
+            self._proxy_dead = True
+            self._prefer_direct = True
+            self.opener = getattr(self, "_opener_direct", None) or self.opener
+
     def _opener_for(self, host):
-        if (not self._prefer_direct) and self._proxy_ok and host == self.PROXY_HOST:
-            return getattr(self, "_opener_proxy", None) or self.opener
+        # 代理存活: 一切主机 (含 CDN 反代) 都经代理, 隐藏真实 IP
+        if self._proxy_alive():
+            return self._opener_proxy
         return getattr(self, "_opener_direct", None) or self.opener
 
     def _host_candidates(self):
-        """候选主机: 代理优先 → 直连域名; 已切直连后不再回头试 ws。"""
-        if self._prefer_direct or not self._proxy_ok:
-            hosts = list(self.DIRECT_HOSTS)
-            cur = self.baseHost
-            if cur in hosts:
-                hosts.remove(cur)
-                hosts.insert(0, cur)
-            elif cur:
-                hosts.insert(0, cur)
-            # 去重保序
-            seen = set()
-            out = []
-            for h in hosts:
-                if h and h not in seen:
-                    seen.add(h)
-                    out.append(h)
-            return out
-        return [self.PROXY_HOST] + [h for h in self.DIRECT_HOSTS if h != self.PROXY_HOST]
+        """候选主机: 代理存活 → ws 优先且直连域名也走代理; 代理死亡/未配 → 仅直连域名。"""
+        if self._proxy_alive():
+            hosts = [self.PROXY_HOST] + [h for h in self.DIRECT_HOSTS if h != self.PROXY_HOST]
+            return hosts
+        hosts = list(self.DIRECT_HOSTS)
+        cur = self.baseHost
+        if cur in hosts:
+            hosts.remove(cur)
+            hosts.insert(0, cur)
+        elif cur:
+            hosts.insert(0, cur)
+        seen = set()
+        out = []
+        for h in hosts:
+            if h and h not in seen:
+                seen.add(h)
+                out.append(h)
+        return out
 
     @staticmethod
     def _swap_host(url, new_host):
@@ -220,10 +279,11 @@ class Spider(SpiderBase):
         )
 
     def _switch_host(self, host):
+        """记录当前可用站点 (供 Referer); 代理存活时绝不因此放弃代理。"""
         self.primaryHost = host
         self.baseHost = host
-        if host in self.DIRECT_HOSTS:
-            # 直连已通, 不再回头试 missav.ws (省一次必败请求)
+        # 仅当代理已死才允许「直连优先」固化
+        if host in self.DIRECT_HOSTS and not self._proxy_alive():
             self._prefer_direct = True
 
     @staticmethod
@@ -244,7 +304,14 @@ class Spider(SpiderBase):
         try:
             if isinstance(self.options, dict) and self.options.get("proxy"):
                 self._prefer_direct = False
+                self._proxy_dead = False
                 self._build_opener()
+        except Exception:
+            pass
+        # 代理存活时确保本机反代在跑 (TVBox 插件播放/封面走它, 不直连 CDN)
+        try:
+            if self._proxy_alive():
+                _ensure_revproxy(self)
         except Exception:
             pass
         return True
@@ -265,17 +332,30 @@ class Spider(SpiderBase):
             p = "https:" + p
         elif p.startswith("/"):
             p = urllib.parse.urljoin(self.baseHost, p)
-        
+
         if not p and fallback_id:
             p = "https://fourhoi.com/%s/cover-t.jpg" % fallback_id
-            
+
         if not p:
             return "https://dummyimage.com/640x360/1e293b/ffffff.png&text=NO_COVER"
-            
+
         # 彻底移除 @Referer= 与 @User-Agent= 等 iOS 无法识别的语法糖后缀
         if "@Referer=" in p:
             p = p.split("@Referer=")[0]
-        return p
+        # 代理存活: 封面也走本机反代, 列表图片不暴露真实 IP
+        return self._maybe_seg(p)
+
+    def _maybe_seg(self, url):
+        """代理存活且 host 在白名单 → 改写为本机 /seg; 否则原样返回。
+        服务模式跳过: 由 M3U Handler 按订阅端可见的 Host 改写, 回环地址对局域网无效。"""
+        if not url or not self._proxy_alive() or not _seg_host_ok(url):
+            return url
+        if _srv_mode:
+            return url
+        port = _ensure_revproxy(self)
+        if not port:
+            return url
+        return _seg_proxy_url(url, "127.0.0.1:%d" % port)
 
     def _raw_fetch(self, target_url, host_ctx=""):
         cur_host = host_ctx if host_ctx else self.baseHost
@@ -304,8 +384,15 @@ class Spider(SpiderBase):
                 text = raw.decode("utf-8", errors="ignore")
                 return {"code": resp.getcode(), "text": text, "final_url": resp.geturl()}
         except urllib.error.HTTPError as e:
+            # HTTP 错误 = 代理已连通对端, 代理仍算存活
             return {"code": e.code, "text": ""}
-        except Exception:
+        except Exception as e:
+            # 仅连接层明确失败 (代理拒绝/重置) 才判代理死亡; 超时/HTTP 错误不算
+            reason = getattr(e, "reason", e)
+            if self._proxy_alive() and isinstance(reason, (
+                ConnectionRefusedError, ConnectionResetError,
+            )):
+                self._mark_proxy_dead()
             return {"code": -1, "text": ""}
 
     def _fetch(self, target_url):
@@ -905,7 +992,7 @@ class Spider(SpiderBase):
             "list": [{
                 "vod_id": raw_id,
                 "vod_name": html_lib.unescape(vod_name),
-                "vod_pic": pic,
+                "vod_pic": self._maybe_seg(pic),
                 "vod_actor": actor_text,
                 "vod_director": director_text,
                 "vod_remarks": "",
@@ -918,17 +1005,28 @@ class Spider(SpiderBase):
     def playerContent(self, flag, id, vipFlags):
         url = str(id).strip()
         base = self.baseHost or self.primaryHost or self.PROXY_HOST
+        header = {
+            "User-Agent": self._ua,
+            "Referer": base + "/",
+            "Origin": base,
+            "Accept": "*/*",
+            "Connection": "keep-alive"
+        }
+        # 代理存活: 播放地址改走本机反代 (playlist 用 /pl, 其它用 /seg), 设备不直连 CDN
+        # 服务模式下 TVBox 不直接调 playerContent (走 /v/), 仍按回环改写无妨
+        if self._proxy_alive() and url and _seg_host_ok(url):
+            port = _ensure_revproxy(self)
+            if port:
+                local = "127.0.0.1:%d" % port
+                if ".m3u8" in url.lower():
+                    url = "http://%s/pl?u=%s" % (local, quote(url, safe=""))
+                else:
+                    url = _seg_proxy_url(url, local)
         return {
             "parse": 0,
             "jx": 0,
             "url": url,
-            "header": {
-                "User-Agent": self._ua,
-                "Referer": base + "/",
-                "Origin": base,
-                "Accept": "*/*",
-                "Connection": "keep-alive"
-            }
+            "header": header
         }
 
     def searchContent(self, key, quick, pg="1"):
@@ -955,7 +1053,65 @@ class Spider(SpiderBase):
         return ""
 
     def localProxy(self, params):
-        return [404, "text/plain; charset=utf-8", "Disabled"]
+        """TVBox 内置本地代理入口: m3u8 重写分片 + 分片/KEY 经代理取流。"""
+        if not isinstance(params, dict):
+            return [400, "text/plain; charset=utf-8", "bad params"]
+        typ = str(params.get("type") or "").lower()
+        target = str(params.get("url") or params.get("u") or "").strip()
+        if not target or not target.startswith(("http://", "https://")):
+            return [400, "text/plain; charset=utf-8", "bad url"]
+        if not _seg_host_ok(target):
+            return [403, "text/plain; charset=utf-8", "host not allowed"]
+        sp = self
+        # 把线程本地指到当前实例, 让 fetch_abs_playlist/_site_ref_origin 用同一 opener/代理状态
+        try:
+            _spider_local.spider = self
+        except Exception:
+            pass
+        ref, origin = _site_ref_origin()
+        headers = {
+            "User-Agent": sp._ua,
+            "Referer": ref,
+            "Origin": origin,
+            "Accept": "*/*",
+            "Connection": "keep-alive",
+        }
+        if typ in ("m3u8", "pl"):
+            try:
+                body = fetch_abs_playlist(target)
+                if sp._proxy_alive():
+                    port = _ensure_revproxy(sp)
+                    if port:
+                        body = _rewrite_playlist_via_seg(body, "127.0.0.1:%d" % port)
+                return [200, "application/vnd.apple.mpegurl", body]
+            except Exception:
+                if sp._proxy_alive():
+                    return [502, "text/plain; charset=utf-8", "playlist fetch failed via proxy"]
+                return [502, "text/plain; charset=utf-8", "playlist fetch failed"]
+        # media / 其它二进制: 经当前 opener (代理存活则走代理) 拉取后原样返回
+        try:
+            opener = sp._opener_for(target)
+            req = urllib.request.Request(target, headers=headers)
+            with opener.open(req, timeout=SRV_TIMEOUT) as r:
+                data = r.read()
+                ctype = r.headers.get("Content-Type", "application/octet-stream")
+            return [200, ctype, data]
+        except Exception as e:
+            reason = getattr(e, "reason", e)
+            if sp._proxy_alive() and isinstance(reason, (
+                ConnectionRefusedError, ConnectionResetError,
+            )):
+                sp._mark_proxy_dead()
+                try:
+                    opener = sp._opener_for(target)
+                    req = urllib.request.Request(target, headers=headers)
+                    with opener.open(req, timeout=SRV_TIMEOUT) as r:
+                        data = r.read()
+                        ctype = r.headers.get("Content-Type", "application/octet-stream")
+                    return [200, ctype, data]
+                except Exception:
+                    pass
+            return [502, "text/plain; charset=utf-8", "media fetch failed"]
 
     def destroy(self):
         self.options = {}
@@ -1114,7 +1270,9 @@ def resolve_play_url(raw_id):
         lst = d.get("list", []) if isinstance(d, dict) else []
         if lst:
             play = str(lst[0].get("vod_play_url", "") or "")
-            url = (play.split("$", 1)[1] if "$" in play else play).strip()
+            # 可能是 多线路name$url$$$name$url; 只取第一条线路的地址
+            first = play.split("$$$", 1)[0]
+            url = (first.split("$", 1)[1] if "$" in first else first).strip()
             if not sp.isVideoFormat(url):
                 url = ""
     except Exception:
@@ -1254,24 +1412,38 @@ def fetch_abs_playlist(url, depth=0):
         'Connection': 'keep-alive',
     })
 
-    with sp.opener.open(req, timeout=SRV_TIMEOUT) as r:
-        raw = r.read()
-        enc = getattr(r, 'headers', {}).get('Content-Encoding', '')
-        if raw.startswith(b'\x1f\x8b') or enc == 'gzip':
-            try:
-                raw = gzip.decompress(raw)
-            except Exception:
-                pass
-        elif enc == 'deflate':
-            try:
-                raw = zlib.decompress(raw)
-            except Exception:
+    def _open_once():
+        opener = sp._opener_for(url)
+        with opener.open(req, timeout=SRV_TIMEOUT) as r:
+            raw = r.read()
+            enc = getattr(r, 'headers', {}).get('Content-Encoding', '')
+            if raw.startswith(b'\x1f\x8b') or enc == 'gzip':
                 try:
-                    raw = zlib.decompress(raw, -zlib.MAX_WBITS)
+                    raw = gzip.decompress(raw)
                 except Exception:
                     pass
-        text = raw.decode('utf-8', 'replace')
-        final = r.geturl()
+            elif enc == 'deflate':
+                try:
+                    raw = zlib.decompress(raw)
+                except Exception:
+                    try:
+                        raw = zlib.decompress(raw, -zlib.MAX_WBITS)
+                    except Exception:
+                        pass
+            return raw.decode('utf-8', 'replace'), r.geturl()
+
+    try:
+        text, final = _open_once()
+    except Exception as e:
+        # 代理连接层失败 → 标死并直连重试一次 (与 _raw_fetch 语义一致)
+        reason = getattr(e, "reason", e)
+        if sp._proxy_alive() and isinstance(reason, (
+            ConnectionRefusedError, ConnectionResetError,
+        )):
+            sp._mark_proxy_dead()
+            text, final = _open_once()
+        else:
+            raise
 
     # Master Playlist：主动选择最佳清晰度。
     if depth < 3 and '#EXT-X-STREAM-INF' in text.upper():
@@ -1287,6 +1459,195 @@ def _v_url(host, vod_id):
     return "http://%s/v/%s.m3u8" % (host, quote(vod_id, safe=""))
 
 
+def _seg_proxy_url(abs_url, local_host):
+    """把 CDN 绝对地址改写为本机 /seg 反代 (代理存活时播放器不直连 CDN)。"""
+    return "http://%s/seg?u=%s" % (local_host, quote(abs_url, safe=""))
+
+
+def _rewrite_playlist_via_seg(text, local_host):
+    """Media Playlist 中的分片/KEY/MAP 绝对地址 → 本机 /seg?u=..."""
+    out = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            out.append(line)
+            continue
+        if stripped.startswith("#"):
+            line = re.sub(
+                r'URI="(https?://[^"]+)"',
+                lambda m: 'URI="%s"' % _seg_proxy_url(m.group(1), local_host),
+                line,
+            )
+            out.append(line)
+        elif stripped.startswith("http://") or stripped.startswith("https://"):
+            out.append(_seg_proxy_url(stripped, local_host))
+        else:
+            out.append(line)
+    return "\n".join(out) + "\n"
+
+
+# --- 本机反代 (TVBox 插件模式): 127.0.0.1 随机端口, 提供 /pl 与 /seg ---
+_revproxy = {"httpd": None, "port": None, "lock": _threading.Lock(), "options": {}}
+
+
+def _ensure_revproxy(spider=None):
+    """确保本机反代在跑, 返回端口; 失败返回 None。仅绑 127.0.0.1。
+    spider 非空时把其 options 存入反代, 供 handler 线程重建同配置实例。"""
+    with _revproxy["lock"]:
+        if spider is not None:
+            try:
+                if isinstance(spider.options, dict) and spider.options:
+                    _revproxy["options"] = dict(spider.options)
+            except Exception:
+                pass
+        if _revproxy["httpd"] is not None and _revproxy["port"]:
+            return _revproxy["port"]
+        try:
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), _RevProxyHandler)
+            port = httpd.server_address[1]
+            t = _threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            _revproxy["httpd"] = httpd
+            _revproxy["port"] = port
+            _log("本机反代已启动: http://127.0.0.1:%d (/pl /seg)" % port)
+            return port
+        except Exception as e:
+            _log("本机反代启动失败: %s" % e)
+            return None
+
+
+def _revproxy_spider():
+    """反代 handler 线程用: 优先复用线程本地, 否则用存档 options 建实例。"""
+    sp = getattr(_spider_local, "spider", None)
+    if sp is None:
+        sp = Spider()
+        opts = {}
+        try:
+            opts = dict(_revproxy.get("options") or {})
+        except Exception:
+            opts = {}
+        sp.init(opts)
+        _spider_local.spider = sp
+    return sp
+
+
+def _seg_fetch_bytes(target, headers, timeout=SRV_TIMEOUT):
+    """经当前 opener 拉字节; 代理连接层失败标死并直连重试一次。"""
+    sp = get_spider()
+    try:
+        opener = sp._opener_for(target)
+        req = urllib.request.Request(target, headers=headers)
+        with opener.open(req, timeout=timeout) as r:
+            return r.read(), r.headers.get("Content-Type", "application/octet-stream")
+    except Exception as e:
+        reason = getattr(e, "reason", e)
+        if sp._proxy_alive() and isinstance(reason, (
+            ConnectionRefusedError, ConnectionResetError,
+        )):
+            sp._mark_proxy_dead()
+            opener = sp._opener_for(target)
+            req = urllib.request.Request(target, headers=headers)
+            with opener.open(req, timeout=timeout) as r:
+                return r.read(), r.headers.get("Content-Type", "application/octet-stream")
+        raise
+
+
+class _RevProxyHandler(BaseHTTPRequestHandler):
+    """只绑 127.0.0.1 的反代: /pl 拉 playlist 并改写分片, /seg 拉单个资源。"""
+
+    server_version = "missav-revproxy/1.0"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _send(self, code, body, ctype="text/plain; charset=utf-8"):
+        data = body.encode("utf-8") if isinstance(body, str) else (body or b"")
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_GET(self):
+        try:
+            parsed = urlparse(self.path)
+            path = parsed.path
+            qs = urllib.parse.parse_qs(parsed.query)
+            if path == "/seg":
+                self._handle_seg(qs)
+                return
+            if path == "/pl":
+                self._handle_pl(qs)
+                return
+            self._send(404, "not found\n")
+        except Exception:
+            self._send(500, "error\n")
+
+    def _handle_seg(self, qs):
+        target = qs.get("u", [""])[0]
+        if not target.startswith(("http://", "https://")):
+            self._send(400, "bad url\n")
+            return
+        if not _seg_host_ok(target):
+            self._send(403, "host not allowed\n")
+            return
+        sp = _revproxy_spider()
+        ref, origin = _site_ref_origin()
+        headers = {
+            "User-Agent": sp._ua,
+            "Referer": ref,
+            "Origin": origin,
+            "Accept": "*/*",
+            "Connection": "keep-alive",
+        }
+        try:
+            data, ctype = _seg_fetch_bytes(target, headers)
+            self._send(200, data, ctype)
+        except Exception:
+            self._send(502, "seg fetch failed\n")
+
+    def _handle_pl(self, qs):
+        target = qs.get("u", [""])[0]
+        if not target.startswith(("http://", "https://")):
+            self._send(400, "bad url\n")
+            return
+        if not _seg_host_ok(target):
+            self._send(403, "host not allowed\n")
+            return
+        sp = _revproxy_spider()
+        try:
+            body = fetch_abs_playlist(target)
+            if sp._proxy_alive():
+                port = _revproxy.get("port") or _ensure_revproxy()
+                if port:
+                    body = _rewrite_playlist_via_seg(body, "127.0.0.1:%d" % port)
+            self._send(200, body, "application/vnd.apple.mpegurl")
+        except Exception:
+            if sp._proxy_alive():
+                self._send(502, "playlist fetch failed via proxy\n")
+            else:
+                self._send(502, "playlist fetch failed\n")
+
+
+def _m3u_logo(pic, host, sp=None):
+    """M3U tvg-logo: 代理存活且 host 白名单 → 改写为请求 Host 的 /seg。"""
+    if not pic:
+        return ""
+    if sp is None:
+        try:
+            sp = get_spider()
+        except Exception:
+            sp = None
+    if sp is not None and sp._proxy_alive() and _seg_host_ok(pic) and host:
+        return _seg_proxy_url(pic, host)
+    return pic
+
+
 def build_cat_m3u(tid, host, chunk=1, pages=None):
     cats = {c["type_id"]: c["type_name"] for c in srv_cats()}
     if tid not in cats:
@@ -1299,7 +1660,8 @@ def build_cat_m3u(tid, host, chunk=1, pages=None):
              "#EXT-X-APTV-LATENCY: FALSE",
              "#EXT-X-APTV-LOGO: FALSE"]
     for vid, name, pic in videos:
-        logo = ' tvg-logo="%s"' % pic if pic else ""
+        logo_url = _m3u_logo(pic, host)
+        logo = ' tvg-logo="%s"' % logo_url if logo_url else ""
         lines.append('#EXTINF:-1 group-title="%s"%s %s,%s' % (cname, logo, hattrs, _m3u_title(name)))
         lines.append(_v_url(host, vid))
     return "\n".join(lines) + "\n"
@@ -1371,7 +1733,8 @@ class Handler(BaseHTTPRequestHandler):
                      "#EXT-X-APTV-LOGO: FALSE"]
             for c in cats:
                 for vid, name, pic in cached_category(c["type_id"], chunk=chunk):
-                    logo = ' tvg-logo="%s"' % pic if pic else ""
+                    logo_url = _m3u_logo(pic, host)
+                    logo = ' tvg-logo="%s"' % logo_url if logo_url else ""
                     lines.append('#EXTINF:-1 group-title="%s"%s %s,%s'
                                  % (names[c["type_id"]], logo, hattrs, _m3u_title(name)))
                     lines.append(_v_url(host, vid))
@@ -1386,6 +1749,52 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(200, body, "application/vnd.apple.mpegurl")
             return
+        m = re.match(r"^/seg$", path)
+        if m:
+            target = qs.get("u", [""])[0]
+            if not (target.startswith("http://") or target.startswith("https://")):
+                self._send(400, "bad url\n")
+                return
+            if not _seg_host_ok(target):
+                self._send(403, "host not allowed\n")
+                return
+            # 反代分片: 代理存活则经代理拉取, 播放器只见本机地址
+            sp = get_spider()
+            ref, origin = _site_ref_origin()
+            headers = {
+                "User-Agent": sp._ua,
+                "Referer": ref,
+                "Origin": origin,
+                "Accept": "*/*",
+                "Connection": "keep-alive",
+            }
+            try:
+                data, ctype = _seg_fetch_bytes(target, headers)
+                self._send(200, data, ctype)
+            except Exception:
+                self._send(502, "seg fetch failed\n")
+            return
+        m = re.match(r"^/pl$", path)
+        if m:
+            target = qs.get("u", [""])[0]
+            if not (target.startswith("http://") or target.startswith("https://")):
+                self._send(400, "bad url\n")
+                return
+            if not _seg_host_ok(target):
+                self._send(403, "host not allowed\n")
+                return
+            sp = get_spider()
+            try:
+                body = fetch_abs_playlist(target)
+                if sp._proxy_alive():
+                    body = _rewrite_playlist_via_seg(body, host)
+                self._send(200, body, "application/vnd.apple.mpegurl")
+            except Exception:
+                if sp._proxy_alive():
+                    self._send(502, "playlist fetch failed via proxy\n")
+                else:
+                    self._send(502, "playlist fetch failed\n")
+            return
         m = re.match(r"^/v/(.+)\.m3u8$", path)
         if m:
             raw_id = unquote(m.group(1))
@@ -1395,11 +1804,26 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if ".m3u8" in url.lower():
                 try:
-                    self._send(200, fetch_abs_playlist(url), "application/vnd.apple.mpegurl")
+                    body = fetch_abs_playlist(url)
+                    # 代理存活: 分片改走本机 /seg (服务端经代理), 播放器不直连 CDN
+                    sp = get_spider()
+                    if sp._proxy_alive():
+                        body = _rewrite_playlist_via_seg(body, host)
+                    self._send(200, body, "application/vnd.apple.mpegurl")
                 except Exception:
-                    self._redirect(url)  # 服务端下发失败则 302 让播放器直连
+                    sp = get_spider()
+                    if sp._proxy_alive():
+                        # 代理模式下禁止 302 直连 CDN (会暴露真实 IP)
+                        self._send(502, "playlist fetch failed via proxy\n")
+                    else:
+                        self._redirect(url)  # 无代理时才允许播放器直连
             else:
-                self._redirect(url)
+                sp = get_spider()
+                if sp._proxy_alive():
+                    # 非 playlist 资源也走反代, 避免 302 暴露真实 IP 连 CDN
+                    self._redirect(_seg_proxy_url(url, host))
+                else:
+                    self._redirect(url)
             return
         self._send(404, "not found\n")
 
@@ -1420,8 +1844,9 @@ def _index_page():
             "<a href='/all-2.m3u'>/all-2.m3u</a> (第 2 块, %d–%d 页) · "
             "也支持 <code>?chunk=N</code> 参数 (参数优先)。块之间不重叠, "
             "超出范围的块返回空列表。</p>"
-            "<p>条目指向本机 <code>/v/&lt;id&gt;.m3u8</code>, 服务端实时解析详情页拿 surrit 播放地址并转绝对地址, "
-            "播放器直连 CDN 拉分片。女优 / 类型 / 发行商为文件夹导航, 在 M3U 中无可播放条目。</p>"
+            "<p>条目指向本机 <code>/v/&lt;id&gt;.m3u8</code>, 服务端实时解析详情页拿 surrit 播放地址。"
+            "代理存活时分片经本机 <code>/seg</code> 反代 (服务端走代理, 播放器不直连 CDN); "
+            "代理不可用时才回退播放器直连。女优 / 类型 / 发行商为文件夹导航, 在 M3U 中无可播放条目。</p>"
             "<p>服务监听 <code>0.0.0.0</code>, 局域网内设备可直接订阅; 仅在可信网络下运行。</p>"
             "<p>分类列表缓存 %d 分钟 (按块缓存)。</p>"
             "<ul>%s</ul></body></html>"
@@ -1443,6 +1868,8 @@ def _prewarm():
 
 
 def serve(port):
+    global _srv_mode
+    _srv_mode = True
     srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     ncats = len(srv_cats())
     print("=" * 64, flush=True)
@@ -1552,6 +1979,15 @@ def main(argv=None):
 
     if args.static:
         _log("MissAV -> 静态 M3U 开始")
+        # 静态文件内嵌直连 CDN 地址, 播放器不经过本进程 → 无法藏 IP
+        try:
+            sp = get_spider()
+            if sp._proxy_ok:
+                _log("警告: 检测到代理配置, 但 --static 导出的是直连地址,")
+                _log("      播放时播放器将直连 CDN 并暴露真实 IP。")
+                _log("      如需隐藏 IP 请改用服务模式 (去掉 --static)。")
+        except Exception:
+            pass
         m3u, ok, fail = build_m3u_static(
             cats=[c for c in args.cats.split(",") if c.strip()] or None,
             pages=args.pages, threads=args.threads, max_videos=args.max)
