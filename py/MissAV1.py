@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# 版本: 1.0.4  (2026-11-10)
+# 版本: 1.0.5  (2026-11-10)
 # 更新简介:
+#   v1.0.5 (2026-11-10)
+#     - 详情页按原网页显示: 导演取 og:video:director/导演链接, 演员取站内女优链接
+#       (回退 og:video:actor), 简介用原页 meta description, 不再加交流群前缀
+#     - 全站清除「蝴蝶影视/蝴蝶」: 插件名、列表标注、线路名、详情默认值均去品牌化
 #   v1.0.4 (2026-11-10)
 #     - 直连域名: 写入 missav.fans / missav.media (抓取/详情/播放均无需代理)
 #     - 代理优先: 有代理先走 missav.ws; 代理不可用或 ws 失败时自动切换直连域名
@@ -68,9 +72,6 @@ class Spider(SpiderBase):
         self._proxy_ok = False
         self._prefer_direct = False
 
-        self.tgGroup = "https://t.me/tvshare23"
-        self.brandActor = "TG群: @tvshare23"
-        self.brandDirector = "蝴蝶影视"
         self._ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
         self.options = {}
 
@@ -249,7 +250,7 @@ class Spider(SpiderBase):
         return True
 
     def getName(self):
-        return "蝴蝶影视·MissAV"
+        return "MissAV"
 
     def isVideoFormat(self, url):
         low = (url or "").lower()
@@ -525,7 +526,7 @@ class Spider(SpiderBase):
                 if is_ranking:
                     rank_m = re.search(r'(第\s*\d+\s*名)', block)
                     sub_desc = rank_m.group(1).replace(" ", "") if rank_m else ""
-                    remarks_text = ("蝴蝶影视 · %s" % sub_desc) if sub_desc else "蝴蝶影视"
+                    remarks_text = sub_desc
                 else:
                     count_m = re.search(r'(\d+)\s*(?:条影片|條影片|部影片|部)', block)
                     debut_m = re.search(r'(\d{4})\s*(?:出道|年出道)', block)
@@ -535,7 +536,7 @@ class Spider(SpiderBase):
                     if debut_m:
                         meta_arr.append("%s出道" % debut_m.group(1))
                     sub_desc = " · ".join(meta_arr) if meta_arr else ""
-                    remarks_text = ("蝴蝶影视 · %s" % sub_desc) if sub_desc else "蝴蝶影视"
+                    remarks_text = sub_desc
 
                 display_name = ("%s\n%s" % (title, sub_desc)) if sub_desc else title
 
@@ -573,7 +574,7 @@ class Spider(SpiderBase):
                     continue
 
                 count_m = re.search(r'(\d+)\s*(?:条影片|條影片|部影片|部)', cell)
-                remarks = ("蝴蝶影视 · %s部" % count_m.group(1)) if count_m else "蝴蝶影视"
+                remarks = ("%s部" % count_m.group(1)) if count_m else ""
 
                 first_char = title[0].strip().upper()
                 bg_color, fg_color = self.color_palette[idx % len(self.color_palette)]
@@ -660,7 +661,7 @@ class Spider(SpiderBase):
             clean_pic = self._clean_pic_url(raw_pic, dvd_id)
 
             dur_m = re.search(r'(\d{1,2}:\d{2}(?::\d{2})?)', ch)
-            dur = ("蝴蝶影视 · %s" % dur_m.group(1)) if dur_m else "蝴蝶影视"
+            dur = dur_m.group(1) if dur_m else ""
 
             pack_id = "%s@@%s" % (dvd_id, full_href)
 
@@ -853,6 +854,7 @@ class Spider(SpiderBase):
             if t_raw:
                 vod_name = t_raw
 
+        # 演员: 站内女优链接优先, 回退 og:video:actor (与原网页一致, 不带品牌后缀)
         actress_matches = re.findall(r'<a[^>]+href=["\'][^"\']*/actresses/[^"\']+["\'][^>]*>([\s\S]*?)</a>', html)
         clean_actresses = []
         for a in actress_matches:
@@ -860,17 +862,29 @@ class Spider(SpiderBase):
             if name and not any(k in name for k in ("排行", "Ranking", "一览", "SEP", "OCT", "NOV", "202")):
                 if name not in clean_actresses:
                     clean_actresses.append(name)
+        if not clean_actresses:
+            for m in re.finditer(r'<meta[^>]+property=["\']og:video:actor["\'][^>]+content=["\']([^"\']+)["\']', html, re.I):
+                name = html_lib.unescape(m.group(1)).strip()
+                if name and name not in clean_actresses:
+                    clean_actresses.append(name)
+        actor_text = ", ".join(clean_actresses)
 
-        actor_text = ", ".join(clean_actresses) if clean_actresses else self.brandActor
+        # 导演: 原页 导演: 链接优先, 回退 og:video:director
+        director_text = ""
+        dm = re.search(r'<span>\s*导演\s*[:：]\s*</span>\s*<a[^>]*>([\s\S]*?)</a>', html)
+        if dm:
+            director_text = html_lib.unescape(re.sub(r'<[^>]+>', '', dm.group(1))).strip()
+        if not director_text:
+            dm = re.search(r'<meta[^>]+property=["\']og:video:director["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
+            if dm:
+                director_text = html_lib.unescape(dm.group(1)).strip()
 
+        # 简介: 原页 meta description (无交流群前缀、无品牌文案)
         desc_m = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']*)["\']', html)
-        desc = desc_m.group(1).strip() if desc_m else "蝴蝶影视高清聚合，全网同步更新。"
-        vod_content = (
-            "【🔥 官方交流群: %s】\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "%s"
-        ) % (self.tgGroup, desc)
-        escaped_desc = vod_content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        if not desc_m:
+            desc_m = re.search(r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']*)["\']', html, re.I)
+        desc = html_lib.unescape(desc_m.group(1)).strip() if desc_m else ""
+        escaped_desc = desc.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
         surrit_uuid = self._extract_surrit_uuid(html)
 
@@ -880,9 +894,9 @@ class Spider(SpiderBase):
         if surrit_uuid:
             # mrstcdn 直连可播; surrit.com 在部分网络直连 403, 作备线
             real_m3u8 = "https://surrit.mrstcdn.store/%s/playlist.m3u8" % surrit_uuid
-            play_froms.append("蝴蝶正片专线")
+            play_froms.append("正片专线")
             play_urls.append("超清原画正片$%s" % real_m3u8)
-            play_froms.append("蝴蝶备线")
+            play_froms.append("备用线路")
             play_urls.append("原画备线$https://surrit.com/%s/playlist.m3u8" % surrit_uuid)
 
         pic = "https://fourhoi.com/%s/cover-n.jpg" % vid
@@ -893,10 +907,10 @@ class Spider(SpiderBase):
                 "vod_name": html_lib.unescape(vod_name),
                 "vod_pic": pic,
                 "vod_actor": actor_text,
-                "vod_director": self.brandDirector,
-                "vod_remarks": "蝴蝶影视",
+                "vod_director": director_text,
+                "vod_remarks": "",
                 "vod_content": escaped_desc,
-                "vod_play_from": "$$$".join(play_froms) if play_froms else "蝴蝶专线",
+                "vod_play_from": "$$$".join(play_froms) if play_froms else "正片专线",
                 "vod_play_url": "$$$".join(play_urls) if play_urls else ("超清原画正片$" + cand_urls[0])
             }]
         }
