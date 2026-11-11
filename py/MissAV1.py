@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# 版本: 1.0.8  (2026-11-10)
+# 版本: 1.0.10  (2026-11-11)
 # 更新简介:
+#   v1.0.10 (2026-11-11)
+#     - 详情页线路扩为 4 条 (原序): 代理正片 / 正片专线 / 代理备用 / 备用线路
+#     - playerContent 按 flag 分流: 代理线清 _proxy_dead 再走反代, 不可用则回退直连;
+#       直连线始终直连绝不改写; 未知 flag 维持原「存活走代理」行为
+#   v1.0.9 (2026-11-11)
+#     - 节点慢/不稳定: 超时 (TimeoutError/socket.timeout) 与拒绝/重置一样标死代理并直连重试,
+#       修复 OK影视播放框「连接超时」且不自动切直连的问题
+#     - 代理首跳短超时 (6s): 避免等满 15s 播放器先放弃; 标死后直连仍用完整 SRV_TIMEOUT
 #   v1.0.8 (2026-11-10)
 #     - 漏口封堵: dummyimage 早退绕过反代、代理存活时非白名单资源仍直连 —— 一律改走本机反代
 #     - 白名单分层: 回环反代 (仅 127.0.0.1) 放行任意 http(s); 服务端 /seg /pl 仍白名单防 SSRF
@@ -18,7 +26,7 @@
 #     - 实现 localProxy (TVBox 内置代理入口): m3u8 重写分片 + 分片经代理取流
 #   v1.0.6 (2026-11-10)
 #     - 代理语义收紧为「隐藏真实 IP」: 代理存活时站点/playlist/分片全部经代理,
-#       仅在代理连接层失败 (ConnectionRefused/Reset) 时标记死亡并改直连
+#       仅在代理连接层失败 (拒绝/重置/超时) 时标记死亡并改直连
 #     - 代理存活时不再因 missav.fans/media 可用而放弃代理 (_switch_host 不再切直连优先)
 #     - 服务模式新增 /seg 反代: 代理存活时 playlist 分片改写为本机 /seg?u=...,
 #       由服务端经代理拉取后回给播放器, 播放器不再直连 CDN
@@ -118,6 +126,18 @@ def _revproxy_host_ok(url, proxy_alive=False):
     if proxy_alive:
         return True
     return _seg_host_ok(url)
+
+
+def _conn_layer_fail(reason):
+    """连接层失败: 拒绝/重置/超时 → 代理慢节点或不可达, 应标死并改直连。
+    HTTPError 等在调用方已单独处理, 不会走到这里。"""
+    if isinstance(reason, (ConnectionRefusedError, ConnectionResetError, TimeoutError)):
+        return True
+    # py<3.10 的 socket.timeout; 3.10+ 已是 TimeoutError 别名
+    if type(reason).__name__ in ("timeout", "TimeoutError"):
+        return True
+    return False
+
 
 try:
     from base.spider import Spider as SpiderBase
@@ -418,11 +438,9 @@ class Spider(SpiderBase):
             # HTTP 错误 = 代理已连通对端, 代理仍算存活
             return {"code": e.code, "text": ""}
         except Exception as e:
-            # 仅连接层明确失败 (代理拒绝/重置) 才判代理死亡; 超时/HTTP 错误不算
+            # 连接层失败 (拒绝/重置/超时) 才判代理死亡; HTTP 错误不算
             reason = getattr(e, "reason", e)
-            if self._proxy_alive() and isinstance(reason, (
-                ConnectionRefusedError, ConnectionResetError,
-            )):
+            if self._proxy_alive() and _conn_layer_fail(reason):
                 self._mark_proxy_dead()
             return {"code": -1, "text": ""}
 
@@ -1011,11 +1029,17 @@ class Spider(SpiderBase):
 
         if surrit_uuid:
             # mrstcdn 直连可播; surrit.com 在部分网络直连 403, 作备线
+            # 代理线与直连线共用同一 CDN URL, 区分只在 playerContent 的 flag 分支
             real_m3u8 = "https://surrit.mrstcdn.store/%s/playlist.m3u8" % surrit_uuid
+            backup_m3u8 = "https://surrit.com/%s/playlist.m3u8" % surrit_uuid
+            play_froms.append("代理正片")
+            play_urls.append("超清原画正片$%s" % real_m3u8)
             play_froms.append("正片专线")
             play_urls.append("超清原画正片$%s" % real_m3u8)
+            play_froms.append("代理备用")
+            play_urls.append("原画备线$%s" % backup_m3u8)
             play_froms.append("备用线路")
-            play_urls.append("原画备线$https://surrit.com/%s/playlist.m3u8" % surrit_uuid)
+            play_urls.append("原画备线$%s" % backup_m3u8)
 
         pic = "https://fourhoi.com/%s/cover-n.jpg" % vid
 
@@ -1043,19 +1067,32 @@ class Spider(SpiderBase):
             "Accept": "*/*",
             "Connection": "keep-alive"
         }
+        flag_s = str(flag or "").strip()
         # 代理存活: 播放地址改走本机反代 (playlist 用 /pl, 其它用 /seg), 设备不直连 CDN
         # 不查白名单 (回环反代放行任意 http(s)); 反代起失败则不回退直连 —— 会漏真实 IP
-        if self._proxy_alive() and url and url.startswith(("http://", "https://")):
+        def _via_revproxy(u):
             port = _ensure_revproxy(self)
-            if port:
-                local = "127.0.0.1:%d" % port
-                if ".m3u8" in url.lower():
-                    url = "http://%s/pl?u=%s" % (local, quote(url, safe=""))
-                else:
-                    url = _seg_proxy_url(url, local)
-            else:
-                _log("反代启动失败, 播放返回空地址以隐藏真实 IP: %s" % url)
-                url = ""
+            if not port:
+                _log("反代启动失败, 返回空地址以隐藏真实 IP: %s" % u)
+                return ""
+            local = "127.0.0.1:%d" % port
+            if ".m3u8" in u.lower():
+                return "http://%s/pl?u=%s" % (local, quote(u, safe=""))
+            return _seg_proxy_url(u, local)
+
+        if flag_s in ("代理正片", "代理备用"):
+            # 显式代理线: 清 dead 给代理第二次机会; 仍不可用则回退直连 (不黑屏)
+            if getattr(self, "_proxy_ok", False):
+                self._proxy_dead = False
+                self._prefer_direct = False
+            if self._proxy_alive() and url.startswith(("http://", "https://")):
+                url = _via_revproxy(url)
+        elif flag_s in ("正片专线", "备用线路"):
+            # 直连线: 始终直连, 绝不改写反代 (用户主动选择暴露直连出口)
+            pass
+        elif self._proxy_alive() and url.startswith(("http://", "https://")):
+            # 未知/空 flag: 维持原行为
+            url = _via_revproxy(url)
         return {
             "parse": 0,
             "jx": 0,
@@ -1126,15 +1163,14 @@ class Spider(SpiderBase):
         try:
             opener = sp._opener_for(target)
             req = urllib.request.Request(target, headers=headers)
-            with opener.open(req, timeout=SRV_TIMEOUT) as r:
+            to = PROXY_HOP_TIMEOUT if sp._proxy_alive() else SRV_TIMEOUT
+            with opener.open(req, timeout=to) as r:
                 data = r.read()
                 ctype = r.headers.get("Content-Type", "application/octet-stream")
             return [200, ctype, data]
         except Exception as e:
             reason = getattr(e, "reason", e)
-            if sp._proxy_alive() and isinstance(reason, (
-                ConnectionRefusedError, ConnectionResetError,
-            )):
+            if sp._proxy_alive() and _conn_layer_fail(reason):
                 sp._mark_proxy_dead()
                 try:
                     opener = sp._opener_for(target)
@@ -1172,6 +1208,7 @@ SRV_PAGES = 5        # 每块抓几页 (--pages), /all.m3u 用
 SRV_CAT_PAGES = 10     # /cat/ 单分类默认页数
 SRV_CACHE_MINS = 30  # 分类列表缓存分钟数
 SRV_TIMEOUT = 15     # m3u8 下发超时秒数
+PROXY_HOP_TIMEOUT = 6  # 代理存活时首跳短超时: 快速标死并降级直连, 不让播放器干等
 SRV_VID_CACHE_SECS = 120  # 解析出的播放地址缓存秒数
 SRV_CACHE_MAX = 512  # _cat_cache/_vid_cache 最大条数, 超出按最旧淘汰
 
@@ -1448,7 +1485,9 @@ def fetch_abs_playlist(url, depth=0):
 
     def _open_once():
         opener = sp._opener_for(url)
-        with opener.open(req, timeout=SRV_TIMEOUT) as r:
+        # 代理存活首跳用短超时, 失败标死后直连用完整 SRV_TIMEOUT
+        to = PROXY_HOP_TIMEOUT if sp._proxy_alive() else SRV_TIMEOUT
+        with opener.open(req, timeout=to) as r:
             raw = r.read()
             enc = getattr(r, 'headers', {}).get('Content-Encoding', '')
             if raw.startswith(b'\x1f\x8b') or enc == 'gzip':
@@ -1469,11 +1508,9 @@ def fetch_abs_playlist(url, depth=0):
     try:
         text, final = _open_once()
     except Exception as e:
-        # 代理连接层失败 → 标死并直连重试一次 (与 _raw_fetch 语义一致)
+        # 代理连接层失败 (含超时) → 标死并直连重试一次 (与 _raw_fetch 语义一致)
         reason = getattr(e, "reason", e)
-        if sp._proxy_alive() and isinstance(reason, (
-            ConnectionRefusedError, ConnectionResetError,
-        )):
+        if sp._proxy_alive() and _conn_layer_fail(reason):
             sp._mark_proxy_dead()
             text, final = _open_once()
         else:
@@ -1566,18 +1603,18 @@ def _revproxy_spider():
 
 
 def _seg_fetch_bytes(target, headers, timeout=SRV_TIMEOUT):
-    """经当前 opener 拉字节; 代理连接层失败标死并直连重试一次。"""
+    """经当前 opener 拉字节; 代理连接层失败标死并直连重试一次。
+    代理存活首跳用 PROXY_HOP_TIMEOUT 快速失败, 标死后直连用完整 timeout。"""
     sp = get_spider()
     try:
         opener = sp._opener_for(target)
         req = urllib.request.Request(target, headers=headers)
-        with opener.open(req, timeout=timeout) as r:
+        to = PROXY_HOP_TIMEOUT if sp._proxy_alive() else timeout
+        with opener.open(req, timeout=to) as r:
             return r.read(), r.headers.get("Content-Type", "application/octet-stream")
     except Exception as e:
         reason = getattr(e, "reason", e)
-        if sp._proxy_alive() and isinstance(reason, (
-            ConnectionRefusedError, ConnectionResetError,
-        )):
+        if sp._proxy_alive() and _conn_layer_fail(reason):
             sp._mark_proxy_dead()
             opener = sp._opener_for(target)
             req = urllib.request.Request(target, headers=headers)
