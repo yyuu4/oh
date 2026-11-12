@@ -73,6 +73,22 @@
 #     ② 狂飙(KB)列表空——主站 ai.dramarush.tv 被 DNS 污染(31.13.112.9 黑洞)，
 #     _KB_HOST 改指未污染的 https://dramarush.tv（同站 tRPC/播放页实测全通，
 #     kbApiBase 壳配置仍可再覆盖）
+#  18. 2048短剧(MD)分类空、全部播不了：站点 mdcmai4.xyz 已死（DNS 落停放 IP、
+#     连接超时），整站迁 madouai.xyz。实测新站 /api/v1/categories、short-dramas、
+#     short-dramas/{id}、videos、videos/search、m3u8 与 image 中转全 200，且
+#     23 个分类 categoryId 与 _MD_CATEGORIES 逐一相同，只换 _MD_API_BASE 即通；
+#     播放仍走站点 /api/v1/m3u8/proxy（中转回的清单分片已是带 auth_key 绝对地址），
+#     封面 /uploads/ 直链、其余相对路径走 image 中转，均随 apiBase 自动切新域；
+#     另留 _MD_API_BASES 备用域(mdcmai.xyz/mdcmai5.xyz)，壳未指定 apiBase 时
+#     init 探活失败自动换域(进程内只探一次)，下次再换域不必改代码
+#  19. 西饭(AG::西饭)搜索畸形出「西饭@None#None」：解析直读 elements[].duanjuVo，
+#     而真实结构是 elements[].contents[].duanjuVo（顶层无该字段），改为与分类解析
+#     同构的双层遍历并跳过无 duanjuId 的空项；实测搜索「爱」出 10 条西饭结果，
+#     标题/封面(heytapimage 200)/id 全正常、畸形项 0
+#  20. 西饭(AG::西饭)个别集 playerContent 返回 url="None" 播放 NETERR：上游
+#     episodeList 该集 playUrl 为 null，"%s$%s" 拼接把 None 变成字面量 "None"
+#     传给播放器；detail 拼分集时跳过无 playUrl 的项，列表全空回退
+#     「暂无播放地址$0」，不再产出 "None" 播放 id
 # =====================================================================
 #  聚合短剧 · 九合一
 #     (红果 + 黄豆 + 黄果 + 野果 + 禁果 + 红果黄剧 + 聚合短剧[短] + 2048短剧 + 狂飙短剧)
@@ -9514,10 +9530,12 @@ class _AggSpider(_BaseSpider):
                 did, src = (vid.split("#") + [""])[:2]
                 r = _ag_fetch("%s%s?duanjuId=%s&source=%s&appId=drama"
                               % (plat["host"], plat["url2"], did, src)).get("result", {})
-                eps = ["%s$%s" % (i.get("index"), i.get("playUrl")) for i in r.get("episodeList", [])]
+                # 上游偶发 playUrl=null：不跳过会被 %s 拼成字面量 "None" 传给播放器
+                eps = ["%s$%s" % (i.get("index"), i.get("playUrl"))
+                       for i in r.get("episodeList", []) if i.get("playUrl")]
                 VOD = {"vod_name": r.get("title"), "vod_pic": r.get("coverImageUrl"),
                        "vod_content": r.get("desc"), "vod_play_from": "西饭短剧",
-                       "vod_play_url": "#".join(eps)}
+                       "vod_play_url": "#".join(eps) or "暂无播放地址$0"}
             elif platform == "七猫":
                 d = unquote(vid)
                 sign = _ag_md5("playlet_id=%s%s" % (d, AGG_KEYS))
@@ -9853,11 +9871,16 @@ class _AggSpider(_BaseSpider):
                            % (plat["host"], plat["search"], (int(page) - 1) * 30,
                               _ag_enc_uri(key), ts))
                     res = _ag_json(_ag_request(url))
-                    for vod in ((res.get("result") or {}).get("elements") or []):
-                        dj = vod.get("duanjuVo", {})
-                        results.append({"title": dj.get("title"), "img": dj.get("coverImageUrl"),
-                                        "desc": "西饭 | %s集" % dj.get("total"),
-                                        "url": "西饭@%s#%s" % (dj.get("duanjuId"), dj.get("source"))})
+                    # 真实结构是 elements[].contents[].duanjuVo（顶层无 duanjuVo，
+                    # 直读会拼出「西饭@None#None」畸形项），与分类解析同构
+                    for soup in ((res.get("result") or {}).get("elements") or []):
+                        for vod in (soup.get("contents") or []):
+                            dj = vod.get("duanjuVo") or {}
+                            if not dj.get("duanjuId"):
+                                continue
+                            results.append({"title": dj.get("title"), "img": dj.get("coverImageUrl"),
+                                            "desc": "西饭 | %s集" % dj.get("total"),
+                                            "url": "西饭@%s#%s" % (dj.get("duanjuId"), dj.get("source"))})
                 elif pid == "51":
                     # 新版搜索：/search/?keyword=xx（302 → /search/video/xx/），SSR 卡片
                     su = "%s%s/?keyword=%s" % (plat["host"], plat["search"], _ag_enc_uri(key))
@@ -11944,7 +11967,7 @@ class _HuangjuSpider(_BaseSpider):
 
 # =====================================================================
 #  ENGINE MD · 麻豆成人 (原 2048成人短剧[18].py 融合)
-#    site: https://mdcmai4.xyz
+#    site: https://madouai.xyz (原 mdcmai4.xyz 已停解析)
 #    分类: /api/v1/categories?type=video
 #    列表: /api/v1/videos?page&size&categoryId[&sortBy]          长视频(单集)
 #          /api/v1/short-dramas?productId=1&sortBy&page&size   AI短剧
@@ -11962,7 +11985,10 @@ _MD_LINE_NAME = "2048短剧"
 _MD_LINE_AI = "麻豆AI短剧"
 _MD_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
           "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-_MD_API_BASE = "https://mdcmai4.xyz"
+_MD_API_BASE = "https://madouai.xyz"
+# 站点换域频繁(mdcmai4.xyz 已死→madouai.xyz)，留备用域：壳没指定 apiBase 时，
+# 默认域探活失败自动换，免得下次再挂就整源空白
+_MD_API_BASES = ("https://madouai.xyz", "https://mdcmai.xyz", "https://mdcmai5.xyz")
 _MD_SIZE = 24
 _MD_AI_TID = "ai"
 
@@ -12039,8 +12065,22 @@ def _md_http_json(url, headers, timeout=20):
         return {}
 
 
+_MD_ALIVE = {}
+
+
+def _md_alive(base):
+    """探一次站点是否活着(进程内缓存)，init 换备用域时用。"""
+    if base in _MD_ALIVE:
+        return _MD_ALIVE[base]
+    d = _md_http_json(base + "/api/v1/categories?type=video",
+                      {"User-Agent": _MD_UA, "Accept": "application/json"}, 6)
+    ok = bool(d)
+    _MD_ALIVE[base] = ok
+    return ok
+
+
 class _MadouSpider(_BaseSpider):
-    """2048短剧 (mdcmai4.xyz)：AI短剧 + 长视频双形态,单一入口按 cate 分流。"""
+    """2048短剧 (madouai.xyz，原 mdcmai4.xyz 已死)：AI短剧 + 长视频双形态,单一入口按 cate 分流。"""
 
     def __init__(self):
         self.name = _MD_LINE_NAME
@@ -12054,8 +12094,15 @@ class _MadouSpider(_BaseSpider):
                 conf = json.loads(extend) if isinstance(extend, str) else extend
                 if isinstance(conf, dict) and conf.get("apiBase"):
                     self.apiBase = str(conf["apiBase"]).rstrip("/")
+                    return
         except Exception:
             pass
+        # 壳没指定：默认域探活失败就自动挑备用域(默认域活着时进程内只探一次)
+        if not _md_alive(self.apiBase):
+            for b in _MD_API_BASES:
+                if b != self.apiBase and _md_alive(b):
+                    self.apiBase = b
+                    break
 
     def getName(self):
         return _MD_LINE_NAME
