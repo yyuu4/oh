@@ -4455,7 +4455,7 @@ def _video_model(video_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
     payload = {
         "biz_param": {
             "detail_page_version": 0,
-            "device_level": 3,
+            "device_level": 1,
             "disable_digg_stat": False,
             "need_all_video_definition": True,
             "need_mp4_align": False,
