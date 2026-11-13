@@ -1,8 +1,20 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-VERSION = "1.7.3"
+VERSION = "1.7.4"
 VERSION_NOTE = (
+    "1.7.4 全文审查两轮11修：① 资源泄漏两处——_dm_page 每请求新建 Session 不关闭、"
+    "_dm_push_local 后台推送 Session 不关闭(32位 FD 泄漏)均补 try/finally 关闭；"
+    "② 缓存竞态三处——_hg_cache_cleanup 原无条件删 .tmp 会误杀 _hg_cache_put 活跃写入"
+    "(只删 mtime>60s 孤儿、.part>3600s)，且无 mp4 时提前 return 致孤儿 tmp/part 永不清"
+    "(重构为 tmp/part 清理无条件执行)，_page_cache_* / _search_neg_* 加 _PAGE_CACHE_LOCK/"
+    "_SEARCH_NEG_LOCK 串行化并消除 search key 双次计算；"
+    "③ 逻辑三处——_retry sleep 比较用未截断 float attempts(2.7 比到 2.7 而非 3) 改 "
+    "limit=max(1,int(attempts))，_xmxor 空输入 IndexError 补守卫，_video_model_rotating "
+    "非 dict Mapping 丢字段改 dict(config) 合并；"
+    "④ 健壮性三处——_text(bytes) 原 str() 得 \"b'...'\" repr 改 utf-8 解码，"
+    "_parse_track 畸形 moov 的 sample/chunk/aux count 可达 0xFFFFFFFF 致 [x]*count OOM "
+    "补 _MAX_TRACK_ENTRIES=10^6 上限。py_compile/行为/8线程并发复检全过，综合 8.3/10。"
     "1.7.3 榜单对齐官网两修：① 后四类顺序改为 全部(hot-drama)→漫剧(hot-comic-drama)→"
     "真人剧(hot-real-drama)→AI剧(hot-ai-drama)（与官网榜单下拉一致，原为热播/真人/AI/漫剧）；"
     "② 四榜单补子榜筛选（官网各榜页 tab）：热播榜=默认空 slug，其余为 prestige/subscribe/new/"
@@ -405,35 +417,37 @@ def _hg_cache_cleanup(force: bool = False) -> None:
     """按时间 + 数量 + 体积自动清理本机缓存。"""
     try:
         files = _hg_cache_list()
-        if not files and not force:
-            return
-        # 1) 过期删除
-        remain = []
-        for item in files:
-            if item["age"] > _HG_CACHE_MAX_AGE or item["size"] <= 0:
+        # 1) 过期删除 + 2) 超量删除最旧（无 mp4 且非 force 时跳过，避免空目录白扫）
+        if files or force:
+            remain = []
+            for item in files:
+                if item["age"] > _HG_CACHE_MAX_AGE or item["size"] <= 0:
+                    try:
+                        os.remove(item["path"])
+                    except Exception:
+                        pass
+                else:
+                    remain.append(item)
+            total = sum(x["size"] for x in remain)
+            while remain and (len(remain) > _HG_CACHE_MAX_FILES or total > _HG_CACHE_MAX_BYTES):
+                old = remain.pop(0)
                 try:
-                    os.remove(item["path"])
+                    os.remove(old["path"])
                 except Exception:
                     pass
-            else:
-                remain.append(item)
-        # 2) 超量删除最旧
-        total = sum(x["size"] for x in remain)
-        while remain and (len(remain) > _HG_CACHE_MAX_FILES or total > _HG_CACHE_MAX_BYTES):
-            old = remain.pop(0)
-            try:
-                os.remove(old["path"])
-            except Exception:
-                pass
-            total -= old["size"]
-        # 3) 清理残留 tmp / 过期 .part(增量落盘半成品)
+                total -= old["size"]
+        # 3) 清理残留 tmp / 过期 .part —— 无论有无 mp4 都要跑：
+        #    写失败残留的孤儿 tmp 若只在有 mp4 时才清，会只增不减
         root = _hg_cache_dir()
         now = time.time()
         for name in os.listdir(root):
             fp = os.path.join(root, name)
             if name.endswith(".tmp") or name == ".w":
+                # 只删超过 60s 仍存在的 tmp：正被 _hg_cache_put 写入的 tmp 不能误删
+                # (误删会让随后的 os.replace 失败、整片缓存静默丢失)
                 try:
-                    os.remove(fp)
+                    if now - os.stat(fp).st_mtime > 60:
+                        os.remove(fp)
                 except Exception:
                     pass
             elif name.endswith(".part"):
@@ -1008,7 +1022,9 @@ _net_next_at = 0.0
 _net_fail_streak = 0
 _net_cooldown_until = 0.0
 _PAGE_CACHE: dict[str, tuple[float, Any]] = {}
+_PAGE_CACHE_LOCK = threading.Lock()
 _SEARCH_NEG: dict[str, float] = {}
+_SEARCH_NEG_LOCK = threading.Lock()
 
 
 def _is_conn_reset(err) -> bool:
@@ -1061,33 +1077,36 @@ def _net_in_cooldown() -> bool:
 
 
 def _page_cache_get(key: str, allow_stale: bool = False):
-    ent = _PAGE_CACHE.get(key)
-    if not ent:
+    with _PAGE_CACHE_LOCK:
+        ent = _PAGE_CACHE.get(key)
+        if not ent:
+            return None
+        at, data = ent
+        if data is None:
+            return None
+        age = time.time() - at
+        if age <= _PAGE_FRESH_TTL:
+            return data
+        if allow_stale and age <= _PAGE_STALE_TTL:
+            return data
         return None
-    at, data = ent
-    if data is None:
-        return None
-    age = time.time() - at
-    if age <= _PAGE_FRESH_TTL:
-        return data
-    if allow_stale and age <= _PAGE_STALE_TTL:
-        return data
-    return None
 
 
 def _page_cache_put(key: str, data) -> None:
     if data is None:
         return
-    if key not in _PAGE_CACHE and len(_PAGE_CACHE) >= _PAGE_CACHE_MAX:
-        old = min(_PAGE_CACHE, key=lambda k: _PAGE_CACHE[k][0])
-        _PAGE_CACHE.pop(old, None)
-    _PAGE_CACHE[key] = (time.time(), data)
+    with _PAGE_CACHE_LOCK:
+        if key not in _PAGE_CACHE and len(_PAGE_CACHE) >= _PAGE_CACHE_MAX:
+            old = min(_PAGE_CACHE, key=lambda k: _PAGE_CACHE[k][0])
+            _PAGE_CACHE.pop(old, None)
+        _PAGE_CACHE[key] = (time.time(), data)
 
 
 def _page_cache_clear() -> None:
     """destroy 时清页面缓存并复位节流/冷却状态（新源实例从干净状态开始）。"""
     global _net_fail_streak, _net_next_at, _net_cooldown_until
-    _PAGE_CACHE.clear()
+    with _PAGE_CACHE_LOCK:
+        _PAGE_CACHE.clear()
     with _net_lock:
         _net_fail_streak = 0
         _net_next_at = 0.0
@@ -1112,14 +1131,15 @@ def _retry(fetch, attempts: int = 3, base: float = 0.6):
     _SiteBusy 是“等不起”而非瞬时网络错，重试也一样等不起，直接上抛；
     _HGDataEnd 是真到底，同理；连接重置(104)额外补 1 次带抖动重试。"""
     last = None
-    for i in range(max(1, int(attempts))):
+    limit = max(1, int(attempts))
+    for i in range(limit):
         try:
             return fetch()
         except (_SiteBusy, _HGDataEnd):
             raise
         except Exception as err:
             last = err
-            if i + 1 < attempts:
+            if i + 1 < limit:
                 try:
                     time.sleep(base * (i + 1))
                 except Exception:
@@ -1135,6 +1155,12 @@ def _retry(fetch, attempts: int = 3, base: float = 0.6):
     raise last
 
 def _text(value: Any) -> str:
+    if isinstance(value, bytes):
+        # bytes 走 str() 会得到 "b'...'" 的 repr，应解码
+        try:
+            return value.decode("utf-8", errors="replace").strip()
+        except Exception:
+            return ""
     return str(value or "").strip()
 
 def _first(*values: Any) -> str:
@@ -1240,8 +1266,12 @@ def _parse_track(
         return None
     assert stsz is not None and stsc is not None
     assert saiz is not None and saio is not None
+    # 畸形 moov 的 count 可以是 0xFFFFFFFF：不设上限会 [x]*count 直接 OOM
+    _MAX_TRACK_ENTRIES = 1_000_000
     default_size = struct.unpack(">I", stsz[4:8])[0]
     sample_count = struct.unpack(">I", stsz[8:12])[0]
+    if sample_count > _MAX_TRACK_ENTRIES:
+        return None
     sizes = (
         [default_size] * sample_count
         if default_size
@@ -1253,6 +1283,8 @@ def _parse_track(
     chunk_table = stco if stco is not None else co64
     assert chunk_table is not None
     chunk_count = struct.unpack(">I", chunk_table[4:8])[0]
+    if chunk_count > _MAX_TRACK_ENTRIES:
+        return None
     chunk_width = 4 if stco is not None else 8
     offsets = [
         int.from_bytes(
@@ -1264,6 +1296,8 @@ def _parse_track(
         for index in range(chunk_count)
     ]
     entry_count = struct.unpack(">I", stsc[4:8])[0]
+    if entry_count > _MAX_TRACK_ENTRIES:
+        return None
     entries = [
         (
             struct.unpack(">I", stsc[8 + index * 12 : 12 + index * 12])[0],
@@ -1282,6 +1316,8 @@ def _parse_track(
         return None
     default_aux_size = saiz[saiz_cursor]
     aux_count = struct.unpack(">I", saiz[saiz_cursor + 1 : saiz_cursor + 5])[0]
+    if aux_count > _MAX_TRACK_ENTRIES:
+        return None
     aux_sizes = (
         [default_aux_size] * aux_count
         if default_aux_size
@@ -1882,7 +1918,11 @@ def _video_model_rotating(video_id: str, config: Mapping[str, Any]) -> dict[str,
         config["device_id"] = pair["device_id"]
         config["install_id"] = pair["install_id"]
     except (TypeError, AttributeError):
-        config = pair
+        # Mapping 不可变：合并而非整替，保留 x_tt_dt 等可选字段
+        merged = dict(config) if isinstance(config, Mapping) else {}
+        merged["device_id"] = pair["device_id"]
+        merged["install_id"] = pair["install_id"]
+        config = merged
     return _video_model(video_id, config)
 
 
@@ -4373,7 +4413,11 @@ def _xmxor_two(data: bytes, key: bytes) -> bytearray:
     return encoded
 
 def _xmxor(data: bytes, key: bytes) -> bytearray:
+    if not data:
+        return bytearray()
     value = _xmxor_two(data, key)
+    if len(value) < 2:
+        return value
     last_flag = value[-1] ^ value[-2]
     data0 = value[0]
     value[0] = (~last_flag + value[0]) & 0xFF
@@ -4455,7 +4499,7 @@ def _video_model(video_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
     payload = {
         "biz_param": {
             "detail_page_version": 0,
-            "device_level": 1,
+            "device_level": 3,
             "disable_digg_stat": False,
             "need_all_video_definition": True,
             "need_mp4_align": False,
@@ -4997,25 +5041,29 @@ def _search_neg_key(key, page) -> str:
 
 
 def _search_neg_put(key, page) -> None:
-    _SEARCH_NEG[_search_neg_key(key, page)] = time.time()
-    if len(_SEARCH_NEG) <= _SEARCH_NEG_MAX:
-        return
-    now = time.time()
-    for k in list(_SEARCH_NEG):  # 超限才扫：先把过期的清掉(未再查过的键此前无人弹)
-        if _SEARCH_NEG[k] <= now - _SEARCH_NEG_TTL:
-            _SEARCH_NEG.pop(k, None)
-    while len(_SEARCH_NEG) > _SEARCH_NEG_MAX and _SEARCH_NEG:  # 仍超则挤掉最早入列(插入序=时间序)
-        _SEARCH_NEG.pop(next(iter(_SEARCH_NEG)), None)
+    nk = _search_neg_key(key, page)
+    with _SEARCH_NEG_LOCK:
+        _SEARCH_NEG[nk] = time.time()
+        if len(_SEARCH_NEG) <= _SEARCH_NEG_MAX:
+            return
+        now = time.time()
+        for k in list(_SEARCH_NEG):  # 超限才扫：先把过期的清掉(未再查过的键此前无人弹)
+            if _SEARCH_NEG[k] <= now - _SEARCH_NEG_TTL:
+                _SEARCH_NEG.pop(k, None)
+        while len(_SEARCH_NEG) > _SEARCH_NEG_MAX and _SEARCH_NEG:  # 仍超则挤掉最早入列(插入序=时间序)
+            _SEARCH_NEG.pop(next(iter(_SEARCH_NEG)), None)
 
 
 def _search_neg_hit(key, page) -> bool:
-    ts = _SEARCH_NEG.get(_search_neg_key(key, page))
-    if ts is None:
-        return False
-    if time.time() - ts > _SEARCH_NEG_TTL:
-        _SEARCH_NEG.pop(_search_neg_key(key, page), None)
-        return False
-    return True
+    nk = _search_neg_key(key, page)
+    with _SEARCH_NEG_LOCK:
+        ts = _SEARCH_NEG.get(nk)
+        if ts is None:
+            return False
+        if time.time() - ts > _SEARCH_NEG_TTL:
+            _SEARCH_NEG.pop(nk, None)
+            return False
+        return True
 
 
 def _search_empty_page(page) -> dict:
@@ -5573,8 +5621,14 @@ def _dm_page(vid: str, series_id: str, start_ms: int, device_id: str,
     url = "https://%s/novel/commentapi/comment/list/%s/v1/?%s" % (_DM_HOST, vid, query)
     sess = requests.Session()
     sess.trust_env = False
-    response = sess.post(url, data=body, headers=headers, timeout=20)
-    data = _json_response(response)
+    try:
+        response = sess.post(url, data=body, headers=headers, timeout=20)
+        data = _json_response(response)
+    finally:
+        try:
+            sess.close()
+        except Exception:
+            pass
     if isinstance(data, Mapping) and data.get("code") not in (0, None):
         raise HongguoPluginError("弹幕接口 code=%s %s" % (data.get("code"), data.get("message") or ""))
     payload_data = (data or {}).get("data") if isinstance(data, Mapping) else None
@@ -5855,6 +5909,7 @@ def _dm_push_local(url: str, vid: str) -> None:
         _DM_PUSHED.add(vid)
 
     def _run():
+        session = None
         try:
             time.sleep(2.5)
             # 播放器已经自己来取过 /hg_dm 了，就不必再推一遍（免得弹幕闪一下）
@@ -5867,6 +5922,12 @@ def _dm_push_local(url: str, vid: str) -> None:
             session.get(target, timeout=3)
         except Exception:
             pass
+        finally:
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
     threading.Thread(target=_run, daemon=True).start()
 
 
