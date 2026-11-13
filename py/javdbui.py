@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.4.18"
-# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商海报网格加「可用性」筛选——网页原样筛选（网页 EntityMoviesPage 实体页只有这一组：全部/可播放/含磁链/含字幕；filter_by 第4段；盒子上先在列表选好再点进实体即生效）+修复「全部」分类排序筛选失效（_latest_list 补传 sort_by）；v1.4.17，实体网格筛选补全为可用性+时长+标签组（标签取四类并集修跨类型返空；时长客户端过滤+按(base,dur)缓存）；v1.4.18，未登录三播放源修复——详情接口被 JWT 拦截后降级 javdb580 HTML + /v1/movies/{id}/magnets 磁力 + /api/dmm/preview 预览（伪链播放时逐候选探测），列表期补 id→番号/标题缓存，搜索 HTML 兜底，热播回退 /v1/rankings/playback，HOST 换 catembylegacy；
+VERSION = "1.5.1"
+# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商海报网格加「可用性」筛选——网页原样筛选（网页 EntityMoviesPage 实体页只有这一组：全部/可播放/含磁链/含字幕；filter_by 第4段；盒子上先在列表选好再点进实体即生效）+修复「全部」分类排序筛选失效（_latest_list 补传 sort_by）；v1.4.17，实体网格筛选补全为可用性+时长+标签组（标签取四类并集修跨类型返空；时长客户端过滤+按(base,dur)缓存）；v1.4.18，未登录三播放源修复——详情接口被 JWT 拦截后降级 javdb580 HTML + /v1/movies/{id}/magnets 磁力 + /api/dmm/preview 预览（伪链播放时逐候选探测），列表期补 id→番号/标题缓存，搜索 HTML 兜底，热播回退 /v1/rankings/playback，HOST 换 catembylegacy；v1.5.0，新增「AI栏目」「LTX破解」两个分类（排在热播前面，与网页端 /drama、/ltx 对齐）——AI走 /api/v/drama/{categories,feed,详情}，选集 dramap_ 播放时 playlist→play 逐级取链，封面 AES-128-CBC 解码（cryptography/PyCryptodome/纯 Python 三级兜底）；LTX 走 /api/ltx/list，有 javdbId 直接复用 JavDB 详情三播放源，纯 magnet 给磁力+115，纯 ed2k 不生成播放项（网页同样只给复制）；v1.5.1，更新说明补记备用镜像域名：https://javdb.com、https://javdb581.com、https://javdb582.com；
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 import os
 import re
@@ -68,6 +68,24 @@ HTML_HOSTS = ["https://javdb580.com", "https://javdb.com"]
 PREVIEW_API = "/api/dmm/preview"
 # 预览伪链前缀（与 OFF_PREFIX_115 同构，真正地址在播放时逐候选探测）
 PREVIEW_PREFIX = "http://javdbpv/"
+
+# AI栏目（网页 /drama）+ LTX破解（网页 /ltx）：与网页端对齐，排在「热播」前面。
+# 两组接口都是**站点 host 相对路径**（非 API_BASE），且只在部分镜像上存在。
+DRAMA_CATES = [
+    ("duanju", "AI成人短剧"),
+    ("manju", "AI成人漫剧"),
+    ("huanlian", "AI换脸"),
+    ("mogai", "AI魔改"),
+]
+DRAMA_SORTS = [("new", "最新"), ("hot", "热门")]            # 上游只认 new|hot
+LTX_SORTS = [("date", "最新上架"), ("update", "最近更新")]   # date 为默认，不传参
+DRAMA_PREFIX = "drama_"            # 列表 vod_id：drama_{id}
+DRAMA_PLAY_PREFIX = "dramap_"      # 选集 vod_id：dramap_{id}_{ep}
+LTX_PREFIX = "ltx_"                # 列表 vod_id：ltx_{番号}
+# AI 封面 AES-128-CBC（GET /api/v/drama/cover-key；key/iv 是 16 个 ASCII 字符，
+# padding none，input raw-bytes）——兜底常量与线上一致。
+DRAMA_COVER_KEY = "f5d965df75336270"
+DRAMA_COVER_IV = "97b60394abc2fbe1"
 
 # API 签名常量（从前端 JS bundle 逆出）
 JD_SALT = "lpw6vgqzsp"
@@ -531,6 +549,150 @@ def _set_cookie_text(set_cookie):
     return "; ".join(str(v).split(";")[0].strip() for v in set_cookie if str(v).split(";")[0].strip())
 
 
+# ==================== AI 封面 AES-128-CBC ====================
+# GET /api/v/drama/cover-key → {algorithm:"AES-128-CBC", padding:"none",
+# input:"raw-bytes", key:"...", iv:"..."}；key/iv 是 **16 个 ASCII 字符**（不是 hex）。
+# 后端优先级：cryptography → PyCryptodome → 纯 Python（TVBox 运行时可能两者皆无）。
+_AES_BACKEND = []
+_AES_SBOX_HEX = (
+    "637c777bf26b6fc53001672bfed7ab76ca82c97dfa5947f0add4a2af9ca472c0"
+    "b7fd9326363ff7cc34a5e5f171d8311504c723c31896059a071280e2eb27b275"
+    "09832c1a1b6e5aa0523bd6b329e32f8453d100ed20fcb15b6acbbe394a4c58cf"
+    "d0efaafb434d338545f9027f503c9fa851a3408f929d38f5bcb6da2110fff3d2"
+    "cd0c13ec5f974417c4a77e3d645d197360814fdc222a908846eeb814de5e0bdb"
+    "e0323a0a4906245cc2d3ac629195e479e7c8376d8dd54ea96c56f4ea657aae08"
+    "ba78252e1ca6b4c6e8dd741f4bbd8b8a703eb5664803f60e613557b986c11d9e"
+    "e1f8981169d98e949b1e87e9ce5528df8ca1890dbfe6426841992d0fb054bb16"
+)
+_AES_SBOX = [int(_AES_SBOX_HEX[i:i + 2], 16) for i in range(0, 512, 2)]
+_AES_INV_SBOX = [0] * 256
+for _i, _v in enumerate(_AES_SBOX):
+    _AES_INV_SBOX[_v] = _i
+
+
+def _aes_backend():
+    """可用的 AES-128-CBC 后端名；探测一次后缓存（纯 Python 恒可用）。"""
+    if _AES_BACKEND:
+        return _AES_BACKEND[0]
+    name = "pure"
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher  # noqa: F401
+        name = "cryptography"
+    except Exception:
+        try:
+            from Crypto.Cipher import AES  # noqa: F401
+            name = "crypto"
+        except Exception:
+            name = "pure"
+    _AES_BACKEND.append(name)
+    return name
+
+
+def _aes_xtime(a):
+    a <<= 1
+    return (a ^ 0x11B) & 0xFF if a & 0x100 else a & 0xFF
+
+
+def _aes_mul(a, b):
+    r = 0
+    for _ in range(8):
+        if b & 1:
+            r ^= a
+        a = _aes_xtime(a)
+        b >>= 1
+    return r
+
+
+def _aes_expand(key):
+    """AES-128 密钥扩展 → 176 字节轮密钥。"""
+    w = list(key)
+    rcon = 1
+    while len(w) < 176:
+        t = w[-4:]
+        if len(w) % 16 == 0:
+            t = [_AES_SBOX[t[1]] ^ rcon, _AES_SBOX[t[2]],
+                 _AES_SBOX[t[3]], _AES_SBOX[t[0]]]
+            rcon = _aes_xtime(rcon)
+        for i in range(4):
+            w.append(w[-16] ^ t[i])
+    return w
+
+
+_AES_MUL_TBL = {}
+
+
+def _aes_mul_tbl():
+    if not _AES_MUL_TBL:
+        for n in (9, 11, 13, 14):
+            _AES_MUL_TBL[n] = [_aes_mul(i, n) for i in range(256)]
+    return _AES_MUL_TBL
+
+
+def _aes_dec_block(rk, blk):
+    """单块 AES-128 解密：AddRoundKey(10) → 9 轮(InvShift/InvSub/AddKey/InvMix) → 末轮。"""
+    s = [blk[i] ^ rk[160 + i] for i in range(16)]
+    t = _aes_mul_tbl()
+    m9, m11, m13, m14 = t[9], t[11], t[13], t[14]
+    for rnd in range(9, 0, -1):
+        # InvShiftRows：行 r 右移 r（new[i] = old[(i-r) mod 4]）
+        s[1], s[5], s[9], s[13] = s[13], s[1], s[5], s[9]
+        s[2], s[6], s[10], s[14] = s[10], s[14], s[2], s[6]
+        s[3], s[7], s[11], s[15] = s[7], s[11], s[15], s[3]
+        s = [_AES_INV_SBOX[x] for x in s]
+        k = rnd * 16
+        s = [s[i] ^ rk[k + i] for i in range(16)]
+        out = [0] * 16
+        for c in range(4):
+            i = c * 4
+            a, b, c2, d = s[i], s[i + 1], s[i + 2], s[i + 3]
+            out[i] = m14[a] ^ m11[b] ^ m13[c2] ^ m9[d]
+            out[i + 1] = m9[a] ^ m14[b] ^ m11[c2] ^ m13[d]
+            out[i + 2] = m13[a] ^ m9[b] ^ m14[c2] ^ m11[d]
+            out[i + 3] = m11[a] ^ m13[b] ^ m9[c2] ^ m14[d]
+        s = out
+    s[1], s[5], s[9], s[13] = s[13], s[1], s[5], s[9]
+    s[2], s[6], s[10], s[14] = s[10], s[14], s[2], s[6]
+    s[3], s[7], s[11], s[15] = s[7], s[11], s[15], s[3]
+    s = [_AES_INV_SBOX[x] for x in s]
+    return [s[i] ^ rk[i] for i in range(16)]
+
+
+def _aes_pure_decrypt(data, key, iv):
+    """纯 Python AES-128-CBC 解密（padding none），逐块与前块异或。"""
+    rk = _aes_expand(key)
+    out = bytearray(len(data))
+    prev = list(iv)
+    for off in range(0, len(data), 16):
+        blk = list(data[off:off + 16])
+        dec = _aes_dec_block(rk, blk)
+        for i in range(16):
+            out[off + i] = dec[i] ^ prev[i]
+        prev = blk
+    return bytes(out)
+
+
+def _aes128_cbc_decrypt(data, key, iv):
+    """AES-128-CBC 解密（上游 padding none）。失败返回 b""。"""
+    data = bytes(data or b"")
+    key = bytes(key or b"")
+    iv = bytes(iv or b"")
+    if not data or len(data) % 16 or len(key) != 16 or len(iv) != 16:
+        return b""
+    backend = _aes_backend()
+    try:
+        if backend == "cryptography":
+            from cryptography.hazmat.primitives.ciphers import (
+                Cipher, algorithms, modes)
+            d = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
+            return d.update(data) + d.finalize()
+        if backend == "crypto":
+            from Crypto.Cipher import AES
+            return AES.new(key, AES.MODE_CBC, iv).decrypt(data)
+    except Exception:
+        return b""
+    return _aes_pure_decrypt(data, key, iv)
+
+
 # ==================== Spider ====================
 
 class Spider:
@@ -582,6 +744,8 @@ class Spider:
         self._html_cache = {}     # id -> (ts, detail|None)
         self._magnets_cache = {}  # id -> (ts, [magnet])
         self._dmm_cache = {}      # number -> (ts, [candidate])；空列表=确定无预览
+        self._ltx_items = {}      # 番号 -> LTX 条目（列表期缓存，详情页复用）
+        self._site_api_ok = None  # (ts, host) AI/LTX 接口可用的站点 host
         self._api_action = ""
         self.html_hosts = list(HTML_HOSTS)
         self.preview_api = PREVIEW_API
@@ -977,6 +1141,8 @@ class Spider:
     @staticmethod
     def _classes():
         return [
+            {"type_id": "drama",       "type_name": "AI栏目"},
+            {"type_id": "ltx",         "type_name": "LTX破解"},
             {"type_id": "hot",         "type_name": "热播"},
             {"type_id": "all",         "type_name": "全部"},
             {"type_id": "censored",    "type_name": "有码"},
@@ -1119,6 +1285,18 @@ class Spider:
         # 热播 / 全部：同款筛选（可用性 + 排序），均走 /v1/movies/latest
         filters["all"] = list(avail_opts) + list(sort_opts)
         filters["hot"] = list(avail_opts) + list(sort_opts)
+        # AI栏目 / LTX破解（网页 DramaPage、LtxPage 同款筛选）
+        # 分类值用静态表：homeContent 必须秒回，不为此多打一次网络请求。
+        filters["drama"] = [
+            {"key": "cate", "name": "栏目", "init": "duanju",
+             "value": [{"n": n, "v": k} for k, n in DRAMA_CATES]},
+            {"key": "sort", "name": "排序", "init": "new",
+             "value": [{"n": n, "v": k} for k, n in DRAMA_SORTS]},
+        ]
+        filters["ltx"] = [
+            {"key": "sort", "name": "排序", "init": "date",
+             "value": [{"n": n, "v": k} for k, n in LTX_SORTS]},
+        ]
         # 类别 4 类：网页「类别」页的完整筛选组
         for tid in MOVIE_TYPES:
             if tid == "uncensored" and not self.enable_uncensored:
@@ -1509,6 +1687,165 @@ class Spider:
         lst = self._movies_to_list(data.get("movies"))
         return self._page_result(lst, page)
 
+    # ---------- AI栏目（/drama）/ LTX破解（/ltx） ----------
+    def _site_api(self, path, params=None):
+        """AI/LTX 接口：站点 host 相对路径（非 API_BASE），且只在部分镜像上存在。
+        当前 host 出不了 JSON 时按 _host_pool() 逐个探活，命中者缓存 5 分钟。"""
+        if not requests or self.s is None:
+            return {}
+        now = time.time()
+        order = []
+        cached = self._site_api_ok
+        if isinstance(cached, tuple) and cached[1] and now - cached[0] < 300:
+            order.append(cached[1])
+        for h in self._host_pool():
+            if h not in order:
+                order.append(h)
+        for h in order:
+            try:
+                r = self.s.get(h + path, params=params or {},
+                               headers={"Accept": "application/json",
+                                        "User-Agent": WEB_UA,
+                                        "Referer": h + "/"},
+                               timeout=self.timeout, verify=self.verify)
+                if r.status_code != 200 or not r.content:
+                    continue
+                data = r.json()
+                if not isinstance(data, dict):
+                    continue          # SPA 回落成 HTML → 换下一个 host
+                self._site_api_ok = (now, h)
+                return data
+            except Exception:
+                continue
+        return {}
+
+    def _drama_list(self, fs, page):
+        """AI栏目列表：/api/v/drama/feed（上游 sort 只认 new|hot）。"""
+        cate = _to_text(fs.get("cate") or "")
+        if not any(k == cate for k, _n in DRAMA_CATES):
+            cate = DRAMA_CATES[0][0]
+        sort = _to_text(fs.get("sort") or "new")
+        if sort not in ("new", "hot"):
+            sort = "new"
+        data = self._site_api("/api/v/drama/feed", {
+            "cate": cate, "page": page, "size": 24, "sort": sort})
+        items = data.get("items") if isinstance(data, dict) else None
+        out = []
+        for it in items or []:
+            v = self._drama_item(it, cate)
+            if v:
+                out.append(v)
+        pc = _safe_int(data.get("pages"), 0)
+        if not pc:
+            pc = page + 1 if out else page
+        return {"list": out, "page": page, "pagecount": pc,
+                "limit": len(out),
+                "total": _safe_int(data.get("total"), len(out))}
+
+    def _drama_item(self, it, cate=""):
+        if not isinstance(it, dict):
+            return None
+        iid = _safe_int(it.get("id"), 0)
+        title = _to_text(it.get("title") or "")
+        if not iid or not title:
+            return None
+        eps = _safe_int(it.get("episodes"), 0)
+        score = _to_text(it.get("score") or "")
+        created = _to_text(it.get("createdAt") or "")
+        parts = []
+        if eps:
+            parts.append("%d集" % eps)
+        if score:
+            parts.append("★%s" % score)
+        if it.get("finished"):
+            parts.append("已完结")
+        return {
+            "vod_id": "%s%d" % (DRAMA_PREFIX, iid),
+            "vod_name": title,
+            "vod_pic": self._drama_pic(_to_text(it.get("cover") or "")),
+            "vod_remarks": " ".join(parts),
+            "vod_year": created[:4],
+            "type_name": _to_text(dict(DRAMA_CATES).get(cate) or "AI"),
+        }
+
+    def _drama_pic(self, url, allow_inline=False):
+        """AI 封面是 AES 密文（pic.drleao.cn，Content-Type: binary/octet-stream）。
+        - 已配 img_proxy：外部代理拿到的同样是密文，只会出坏图 → 留空
+        - 有 siteKey：走 localProxy 解密，JSON 只放 URL（列表页 20 张不内联）
+        - 无 siteKey（AT）：localProxy 路由不中 → 只有详情页单张允许内联成 data URI，
+          列表页一律留空，否则 20×268KB 会把列表 JSON 撑到 7MB+
+        """
+        if not url:
+            return ""
+        if _to_text(self.img_proxy):
+            return ""
+        key = self._site_key()
+        if key:
+            try:
+                tok = base64.urlsafe_b64encode(
+                    url.encode("utf-8")).decode("ascii").rstrip("=")
+                q = self._pic_proxy_base()          # 已含 do=py
+                if "siteKey=" not in q:
+                    q += "&siteKey=%s" % quote(key)
+                return q + "&kind=image&token=%s" % quote(tok, safe="")
+            except Exception:
+                return ""
+        if not allow_inline or _aes_backend() is None:
+            return ""
+        return self._pic_data_uri(url)
+
+    def _ltx_list(self, fs, page):
+        """LTX破解列表：/api/ltx/list（sort=date 是默认值，上游不收该参数）。"""
+        sort = _to_text(fs.get("sort") or "date")
+        if sort not in ("date", "update"):
+            sort = "date"
+        params = {"page": page, "page_size": 24}
+        if sort != "date":
+            params["sort"] = sort
+        data = self._site_api("/api/ltx/list", params)
+        items = data.get("items") if isinstance(data, dict) else None
+        out = []
+        for it in items or []:
+            v = self._ltx_item(it)
+            if v:
+                out.append(v)
+        ps = _safe_int(data.get("pageSize"), 24) or 24
+        total = _safe_int(data.get("total"), 0)
+        pc = (total + ps - 1) // ps if total else 0
+        if not pc:
+            pc = page + 1 if out else page
+        return {"list": out, "page": page, "pagecount": pc,
+                "limit": len(out), "total": total or len(out)}
+
+    def _ltx_item(self, it):
+        if not isinstance(it, dict):
+            return None
+        number = _to_text(it.get("number") or "")
+        if not number:
+            return None
+        title = _to_text(it.get("title") or "")
+        name = "[%s] %s" % (number, title) if title else number
+        date = _to_text(it.get("publishDate") or "")
+        size = _safe_int(it.get("sizeBytes"), 0)
+        cover = _to_text(it.get("coverUrl") or it.get("thumbUrl") or "")
+        parts = ["LTX"]
+        if date:
+            parts.append(date[:10])
+        if size:
+            s = _format_size_mb(size / (1024.0 * 1024))
+            if s:
+                parts.append(s)
+        # 缓存条目供详情页复用（q= 查不到 tid，只能靠这里的番号索引）
+        self._ltx_items[number] = it
+        return {
+            "vod_id": LTX_PREFIX + number,
+            "vod_name": name,
+            "vod_pic": self._proxy_pic(cover) if cover else "",
+            "vod_remarks": " ".join(parts),
+            "vod_year": date[:4],
+            "type_name": "LTX",
+        }
+
     def categoryContent(self, tid, pg=1, filter=None, extend=None):
         t = _to_text(tid)
         page = _safe_int(pg, 1)
@@ -1522,6 +1859,12 @@ class Spider:
         # ---- 排行榜（网页 6 类）----
         if t == "rankings":
             return self._rankings_list(fs)
+
+        # ---- AI栏目 / LTX破解（网页 /drama、/ltx）----
+        if t == "drama":
+            return self._drama_list(fs, page)
+        if t == "ltx":
+            return self._ltx_list(fs, page)
 
         # ---- 演员（网页 3 类）----
         if t == "actors":
@@ -1897,6 +2240,12 @@ class Spider:
         if not vid:
             return {"list": []}
 
+        # AI栏目 / LTX破解前缀分派：不走 JavDB /v2|/v4/movies
+        if vid.startswith(DRAMA_PREFIX):
+            return self._drama_detail(vid[len(DRAMA_PREFIX):])
+        if vid.startswith(LTX_PREFIX):
+            return self._ltx_detail(vid[len(LTX_PREFIX):])
+
         # 注：actor_/series_/maker_ 现为 vod_tag=folder，点击进 categoryContent 的下一层海报网格，
         # 不再走 detailContent（避免误出「选集」）。
 
@@ -2045,6 +2394,156 @@ class Spider:
             "vod_remarks": number,
             "vod_play_from": "$$$".join(play_from),
             "vod_play_url": "$$$".join(play_url) if play_url else "",
+        }
+        return {"list": [vod]}
+
+    # ---------- AI栏目 / LTX破解 详情 ----------
+    def _drama_detail(self, id_str):
+        """GET /api/v/drama/{id} → 选集 dramap_{id}_{ep}（播放地址不在详情期取，
+        避免 N 次网络请求；真地址在 playerContent 里 playlist→play 逐级取）。"""
+        iid = _safe_int(id_str, 0)
+        if not iid:
+            return {"list": []}
+        data = self._site_api("/api/v/drama/%d" % iid)
+        if not data or data.get("error") or not isinstance(data.get("title"), str) \
+                or not data.get("title"):
+            return {"list": []}
+        title = _to_text(data.get("title"))
+        cover = _to_text(data.get("cover") or "")
+        desc = _to_text(data.get("description") or "")
+        score = _to_text(data.get("score") or "")
+        author = _to_text(data.get("author") or "")
+        created = _to_text(data.get("createdAt") or "")
+        finished = bool(data.get("finished"))
+        cate = data.get("category") if isinstance(data.get("category"), dict) else {}
+        tags = [t for t in (data.get("tags") or []) if isinstance(t, str)]
+        eps = data.get("episodeList") if isinstance(data.get("episodeList"), list) else []
+
+        info = []
+        if author:
+            info.append("作者: %s" % author)
+        if score:
+            info.append("评分: %s" % score)
+        if _to_text(cate.get("name") or ""):
+            info.append("栏目: %s" % _to_text(cate.get("name")))
+        if tags:
+            info.append("类别: %s" % "、".join(tags))
+        if created:
+            info.append("更新: %s" % created)
+        info.append("状态: %s" % ("已完结" if finished else "连载中"))
+        if desc:
+            info.append("")
+            info.append(desc)
+
+        eps_out = []
+        for e in eps:
+            if not isinstance(e, dict):
+                continue
+            ep = _safe_int(e.get("ep"), 0)
+            if not ep:
+                continue
+            nm = _to_text(e.get("title") or "") or ("第%d集" % ep)
+            eps_out.append("%s$%s%d_%d" % (
+                _sanitize_play(nm), DRAMA_PLAY_PREFIX, iid, ep))
+        if not eps_out:
+            eps_out.append("正片$%s%d_1" % (DRAMA_PLAY_PREFIX, iid))
+
+        vod = {
+            "vod_id": DRAMA_PREFIX + str(iid),
+            "vod_name": title,
+            "vod_pic": self._drama_pic(cover, allow_inline=True),
+            "vod_content": "\n".join(info),
+            "vod_blurb": desc[:120],
+            "vod_desc": "\n".join(info),
+            "vod_scoring": score,
+            "vod_score": score,
+            "vod_year": created[:4],
+            "vod_genre": "、".join(tags),
+            "vod_remarks": ("%d集" % len(eps)) if eps else "",
+            "vod_play_from": "AI短剧",
+            "vod_play_url": "#".join(eps_out),
+        }
+        return {"list": [vod]}
+
+    def _ltx_detail(self, number):
+        """LTX 条目详情。有 javdbId → 直接复用现有 JavDB 详情（HTML 兜底后
+        预览/磁力/115离线 三条源都可用）；否则用 LTX 自己的 magnet。"""
+        number = _to_text(number or "").strip()
+        if not number:
+            return {"list": []}
+        it = self._ltx_items.get(number)
+        if not it:
+            data = self._site_api("/api/ltx/list",
+                                  {"page": 1, "page_size": 24, "q": number})
+            rows = data.get("items") if isinstance(data, dict) else None
+            for x in rows or []:
+                if isinstance(x, dict) and _to_text(x.get("number") or "") == number:
+                    it = x
+                    break
+            if it is None:
+                for x in rows or []:
+                    if isinstance(x, dict) and number in _to_text(x.get("number") or ""):
+                        it = x
+                        break
+        if not isinstance(it, dict):
+            return {"list": []}
+
+        javdb_id = _to_text(it.get("javdbId") or "")
+        if javdb_id:
+            try:
+                d = self.detailContent([javdb_id])
+                lst = d.get("list") if isinstance(d, dict) else None
+                if lst:
+                    return {"list": lst}
+            except Exception:
+                pass
+
+        title = _to_text(it.get("title") or "")
+        name = "[%s] %s" % (number, title) if title else number
+        cover = _to_text(it.get("coverUrl") or it.get("thumbUrl") or "")
+        date = _to_text(it.get("publishDate") or "")
+        size = _safe_int(it.get("sizeBytes"), 0)
+        ed2k = _to_text(it.get("ed2k") or "")
+        tags = [t for t in (it.get("tags") or []) if isinstance(t, str)]
+
+        info = ["番号: %s" % number]
+        if date:
+            info.append("发行: %s" % date)
+        s = _format_size_mb(size / (1024.0 * 1024)) if size else ""
+        if s:
+            info.append("大小: %s" % s)
+        if tags:
+            info.append("类别: %s" % "、".join(tags))
+        info.append("来源: LTX破解")
+        if ed2k and not ed2k.startswith("magnet:"):
+            info.append("链接: %s" % ed2k)
+
+        play_from, play_url = [], []
+        if ed2k.startswith("magnet:"):
+            # 网页本身也不播放 LTX：有 magnet 就给磁力/115两条源，
+            # 纯 ed2k:// 条目 TVBox 播不了（115 也未验证收 ed2k）→ 不生成播放项。
+            if self.enable_magnet:
+                play_from.append("磁力")
+                play_url.append("磁力$%s" % _sanitize_play(ed2k))
+            if self.enable_offline_115:
+                b64 = _off_id_encode(ed2k, name, "LTX", number)
+                play_from.append("115离线")
+                play_url.append("115离线$%s%s%s?t=%d" % (
+                    _sanitize_play("LTX " + number), OFF_PREFIX_115, b64,
+                    int(time.time())))
+
+        vod = {
+            "vod_id": LTX_PREFIX + number,
+            "vod_name": name,
+            "vod_pic": self._proxy_pic(cover) if cover else "",
+            "vod_content": "\n".join(info),
+            "vod_blurb": " | ".join([b for b in (number, date[:10], "LTX") if b]),
+            "vod_desc": "\n".join(info),
+            "vod_year": date[:4],
+            "vod_genre": "、".join(tags),
+            "vod_remarks": "LTX",
+            "vod_play_from": "$$$".join(play_from),
+            "vod_play_url": "$$$".join(play_url),
         }
         return {"list": [vod]}
 
@@ -3175,6 +3674,60 @@ class Spider:
         self._set_off_last("实验直链 offlineTestMp4=%s" % mode)
         return res
 
+    def _play_drama(self, key):
+        """dramap_{id}_{ep} → /api/v/drama/{id}/playlist?ep=N（上游直接回 m3u8 内容，
+        网页拿该 URL 当源）→ /play?ep=N 取 {url}。两步都拿不到就给明确错误。"""
+        m = re.match(r"^(\d+)_(\d+)$", _to_text(key or "").strip())
+        if not m:
+            return _play_err("AI短剧播放参数错误")
+        if self.s is None:
+            return _play_err("AI短剧暂无可播放地址（网络未初始化）")
+        iid, ep = int(m.group(1)), int(m.group(2))
+        host = self.host.rstrip("/")
+        cached = self._site_api_ok
+        if isinstance(cached, tuple) and cached[1]:
+            host = cached[1].rstrip("/")
+        base = "%s/api/v/drama/%d" % (host, iid)
+        headers = {"User-Agent": self.ua, "Referer": host + "/",
+                   "Accept": "*/*"}
+        # ① playlist：200 且响应体以 #EXTM3U 开头 → 该 URL 即 m3u8 源
+        try:
+            r = self.s.get(base + "/playlist", params={"ep": ep},
+                           headers=dict(headers, Accept=(
+                               "application/vnd.apple.mpegurl,"
+                               "text/plain,*/*")),
+                           timeout=self.timeout, verify=self.verify)
+            if r.status_code == 200 and r.content:
+                if (r.text or "").lstrip().startswith("#EXTM3U"):
+                    return {"parse": 0, "jx": 0, "playUrl": "",
+                            "url": "%s/playlist?ep=%d" % (base, ep),
+                            "header": headers}
+                try:
+                    u = _to_text((r.json() or {}).get("url") or "")
+                except Exception:
+                    u = ""
+                if u.startswith(("http://", "https://")):
+                    return {"parse": 0, "jx": 0, "playUrl": "", "url": u,
+                            "header": headers}
+        except Exception:
+            pass
+        # ② play：JSON {url}
+        try:
+            r = self.s.get(base + "/play", params={"ep": ep},
+                           headers=dict(headers, Accept="application/json"),
+                           timeout=self.timeout, verify=self.verify)
+            if r.status_code == 200 and r.content:
+                try:
+                    u = _to_text((r.json() or {}).get("url") or "")
+                except Exception:
+                    u = ""
+                if u.startswith(("http://", "https://")):
+                    return {"parse": 0, "jx": 0, "playUrl": "", "url": u,
+                            "header": headers}
+        except Exception:
+            pass
+        return _play_err("AI短剧暂无可播放地址（上游 playlist/play 均未返回地址）")
+
     def playerContent(self, flag, ids, vipFlags=None):
         vid = str(ids[0]) if isinstance(ids, (list, tuple)) and ids else str(ids or "")
         self._set_off_last("收到播放请求：%s" % _to_text(vid)[:50])
@@ -3194,6 +3747,11 @@ class Spider:
 
         if vid.startswith("115off:"):
             return self._play_offline_safe(vid[len("115off:"):].strip())
+
+        # AI短剧选集：dramap_{id}_{ep} → playlist(m3u8) → play(直链)，
+        # 对齐网页 DramaDetailPage 的 N0（playlist 成功即用其 URL 当源）。
+        if vid.startswith(DRAMA_PLAY_PREFIX):
+            return self._play_drama(vid[len(DRAMA_PLAY_PREFIX):])
 
         # 预览伪链：详情页只存番号，真正地址在这里逐候选探测（每次重新探测，
         # 因为 mirror_proxy/proxy/direct 的可用性会随时间漂移）
@@ -3363,7 +3921,9 @@ class Spider:
 
     @classmethod
     def _decode_pic(cls, raw, ctype=""):
-        """网页端同款解码：① 首字节为 XOR 密钥 ② 0x7F 定值密钥（跳过 0..2）。
+        """网页端同款解码：① 首字节为 XOR 密钥 ② 0x7F 定值密钥（跳过 0..2）
+        ③ AI 封面 AES-128-CBC（pic.drleao.cn，Content-Type: binary/octet-stream，
+        密文长度必为 16 倍数）。
         解不出且 Content-Type 是图片则原样返回；否则返回空（404）。"""
         raw = bytes(raw or b"")
         if not raw:
@@ -3383,6 +3943,13 @@ class Spider:
                 if cls._pic_mime(head):
                     dec = bytes(raw[i] ^ 0x7F for i in range(skip, len(raw)))
                     return dec, cls._pic_mime(dec)
+            if len(raw) % 16 == 0:
+                dec = _aes128_cbc_decrypt(
+                    raw, DRAMA_COVER_KEY.encode("utf-8"),
+                    DRAMA_COVER_IV.encode("utf-8"))
+                m2 = cls._pic_mime(dec)
+                if m2:
+                    return dec, m2
         ct = _to_text(ctype).split(";")[0].strip().lower()
         if ct.startswith("image/"):
             return raw, ct
@@ -3434,8 +4001,8 @@ if __name__ == "__main__":
     hc = sp.homeContent()
     print("classes", len(hc.get("class") or []),
           "filters", list((hc.get("filters") or {}).keys()))
-    for tid in ("hot", "all", "censored", "uncensored", "western", "fc2",
-                "rankings", "actors", "series", "makers"):
+    for tid in ("drama", "ltx", "hot", "all", "censored", "uncensored",
+                "western", "fc2", "rankings", "actors", "series", "makers"):
         try:
             print(tid, len((sp.categoryContent(tid, "1", {}, {}) or {})
                            .get("list") or []))
