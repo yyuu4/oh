@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.4.17"
-# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商海报网格加「可用性」筛选——网页原样筛选（网页 EntityMoviesPage 实体页只有这一组：全部/可播放/含磁链/含字幕；filter_by 第4段；盒子上先在列表选好再点进实体即生效）+修复「全部」分类排序筛选失效（_latest_list 补传 sort_by）；v1.4.17，实体网格筛选补全为可用性+时长+标签组（标签取四类并集修跨类型返空；时长客户端过滤+按(base,dur)缓存）；
+VERSION = "1.4.18"
+# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商海报网格加「可用性」筛选——网页原样筛选（网页 EntityMoviesPage 实体页只有这一组：全部/可播放/含磁链/含字幕；filter_by 第4段；盒子上先在列表选好再点进实体即生效）+修复「全部」分类排序筛选失效（_latest_list 补传 sort_by）；v1.4.17，实体网格筛选补全为可用性+时长+标签组（标签取四类并集修跨类型返空；时长客户端过滤+按(base,dur)缓存）；v1.4.18，未登录三播放源修复——详情接口被 JWT 拦截后降级 javdb580 HTML + /v1/movies/{id}/magnets 磁力 + /api/dmm/preview 预览（伪链播放时逐候选探测），列表期补 id→番号/标题缓存，搜索 HTML 兜底，热播回退 /v1/rankings/playback，HOST 换 catembylegacy；
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 import os
 import re
 import json
 import time
+import html as html_mod
 import base64
 import hashlib
 import warnings
@@ -41,23 +42,32 @@ C0_IMG_BASE = "https://c0.jdbstatic.com"
 # 站点 ext（TVBox 源里 ext 字段传 JSON）可覆盖上面两项及其它开关：
 #   {
 #     "proxy": "7890", "img": "https://...",
-#     "host": "https://bbjavdb.emby.edu.kg", "noProbe": true,
-#     "cookie115": "", "enableOffline115": true,
+#     "host": "https://catembylegacy.fastcdn.dpdns.org", "noProbe": true,
+#     "detailHost": "https://javdb580.com", "previewApi": "/api/dmm/preview",
+#     "cookie": "", "cookie115": "", "enableOffline115": true,
 #     "offlineSavePath": "0", "offlineAppVer": "4.8.2",
 #     "offlineProxy": "", "offlineDebug": 1
 #   }
 
 # JavDB Web UI 镜像（SPA，数据全走 JSON API）
-HOST = "https://bbjavdb.emby.edu.kg"
-# 多域名候选：host 只影响 热播榜(/api/jb/playback) + TOP250 静态 + Referer。
+# 旧域名 bbjavdb.emby.edu.kg 已从公共 DNS 注销（NXDOMAIN），默认改用可用镜像。
+HOST = "https://catembylegacy.fastcdn.dpdns.org"
+# 多域名候选：host 只影响 热播榜(/api/jb/playback) + TOP250 静态 + 预览反代 + Referer。
 # 数据 API 在 jdforrepam、图片在 tp.spfcas，均与 host 无关，故这里只做 host 层自动切换。
 # 逐个请求热播 JSON 端点：能连上 + 能出 JSON 的优先，最快者胜；返回 HTML 的（如
 # catembylegacy 前端副本）自动跳过，永不切到坏域名。可用 extend.hosts 覆盖。
 HOST_CANDIDATES = [
-    "https://bbjavdb.emby.edu.kg",
     "https://catembylegacy.fastcdn.dpdns.org",
+    "https://bbjavdb.emby.edu.kg",
 ]
 API_BASE = "https://jdforrepam.com/api"
+
+# 未登录详情/搜索 HTML 降级源（对齐官方前端 movieService 的 javdb580/javdb 兜底）
+HTML_HOSTS = ["https://javdb580.com", "https://javdb.com"]
+# 未登录预览：DMM 官方免费预告反代（挂在 host 上）
+PREVIEW_API = "/api/dmm/preview"
+# 预览伪链前缀（与 OFF_PREFIX_115 同构，真正地址在播放时逐候选探测）
+PREVIEW_PREFIX = "http://javdbpv/"
 
 # API 签名常量（从前端 JS bundle 逆出）
 JD_SALT = "lpw6vgqzsp"
@@ -568,7 +578,13 @@ class Spider:
                                            if _to_text(x)][:50]
         except Exception:
             pass
-        self._vid_title = {}
+        self._vid_meta = {}       # id -> {number,title,pic,duration,release_date,score}
+        self._html_cache = {}     # id -> (ts, detail|None)
+        self._magnets_cache = {}  # id -> (ts, [magnet])
+        self._dmm_cache = {}      # number -> (ts, [candidate])；空列表=确定无预览
+        self._api_action = ""
+        self.html_hosts = list(HTML_HOSTS)
+        self.preview_api = PREVIEW_API
         self._cache_filters = {}
         self._host_locked = False
         self._probed = False
@@ -625,6 +641,13 @@ class Spider:
             self._host_locked = True
         if extend.get("api"):
             self.api = str(extend["api"]).rstrip("/")
+        # 未登录详情 HTML 兜底源（可指向其它 javdb 镜像）
+        dh = extend.get("detailHost") or extend.get("htmlHost")
+        if dh:
+            dh = str(dh).rstrip("/")
+            self.html_hosts = [dh] + [h for h in self.html_hosts if h != dh]
+        if extend.get("previewApi"):
+            self.preview_api = str(extend["previewApi"]).strip()
         # 多域名候选（list 或 逗号分隔字符串）：host 层自动切换用
         hv = extend.get("hosts") or extend.get("hostList") or extend.get("hostCandidates")
         if hv:
@@ -729,15 +752,20 @@ class Spider:
 
     # ---------- JavDB API ----------
     def _api_get(self, path, params=None, timeout=None):
-        """GET API_BASE + path → data dict（失败返回 {}）"""
+        """GET API_BASE + path → data dict（失败返回 {}）
+        失败时把上游 action（如 JWTVerificationError）记进 self._api_action，
+        供上层区分「需要登录」与「真失败」；返回值语义不变。"""
         if not requests:
             return {}
+        self._api_action = ""
         url = self.api + path
         headers = {
             "Accept": "application/json",
             "jdsignature": _jd_signature(),
             "Referer": self.host + "/",
         }
+        if _to_text(self.cookie):
+            headers["Cookie"] = self.cookie
         t = timeout or self.timeout
         for attempt in range(HTTP_RETRY + 1):
             try:
@@ -749,6 +777,8 @@ class Spider:
                 data = r.json()
                 if isinstance(data, dict) and data.get("success"):
                     return data.get("data") or {}
+                if isinstance(data, dict):
+                    self._api_action = _to_text(data.get("action") or "")
                 return {}
             except Exception:
                 if attempt < HTTP_RETRY:
@@ -806,6 +836,16 @@ class Spider:
             remark_parts.append("磁力%d" % magnets)
         if score:
             remark_parts.append("★%s" % score)
+        # 列表期顺手缓存 id → 番号/标题/封面：详情接口被 JWT 拦截、或 HTML 详情
+        # 被登录墙挡住（无码/FC2）时，详情页仍能显示标题、时长、番号。
+        self._vid_meta[mid] = {
+            "number": number,
+            "title": title,
+            "pic": pic,
+            "duration": _safe_int(m.get("duration"), 0),
+            "release_date": date,
+            "score": score,
+        }
         return {
             "vod_id": mid,
             "vod_name": title,
@@ -1285,6 +1325,12 @@ class Spider:
             self.host = best[1]  # 切到最快能出 JSON 的 host
             lst = self._movies_to_list((best[2].get("data") or [])[:50])
         if not lst:
+            # host 上的 /api/jb/playback 已失效（旧域名 NXDOMAIN、新镜像回 HTML）
+            # → 回退公开的播放榜，实测未登录返回 60 条
+            data = self._api_get("/v1/rankings/playback",
+                                 {"filter_by": "all", "period": "daily"})
+            lst = self._movies_to_list((data.get("movies") or [])[:50])
+        if not lst:
             data = self._api_get("/v1/movies/recommend")
             lst = self._movies_to_list(data.get("movies"))
         return lst
@@ -1505,6 +1551,323 @@ class Spider:
         return self._latest_list(fs, page)
 
     # ---------- 详情 ----------
+    # ---------- 未登录取数：HTML 详情 / 公开磁力 / DMM 预览 ----------
+    _DIV_TAG = re.compile(r"<div\b[^>]*>|</div>", re.I)
+
+    @staticmethod
+    def _html_text(s):
+        # 先剥标签再解实体：反过来会把 &lt;div&gt; 这类文本误当标签吃掉
+        s = re.sub(r"<script\b.*?</script>", " ", _to_text(s), flags=re.S | re.I)
+        s = re.sub(r"<[^>]+>", " ", s)
+        s = html_mod.unescape(s)          # &nbsp; &amp; &#8230; 等
+        return re.sub(r"\s+", " ", s).strip()
+
+    @classmethod
+    def _div_block(cls, html, start):
+        """从 start 处的 <div 起做标签平衡匹配，返回完整块（防非贪婪截断嵌套）。"""
+        depth = 0
+        for m in cls._DIV_TAG.finditer(html, start):
+            depth += -1 if m.group(0).startswith("</") else 1
+            if depth == 0:
+                return html[start:m.end()]
+        return html[start:start + 4000]
+
+    def _html_get(self, url, params=None, timeout=None):
+        if not requests or self.s is None:
+            return ""
+        try:
+            r = self.s.get(url, params=params or {},
+                           headers={"User-Agent": self.ua,
+                                    "Accept": "text/html,application/xhtml+xml",
+                                    "Accept-Language": "zh-CN,zh;q=0.9"},
+                           timeout=timeout or self.timeout, verify=self.verify)
+            if r.status_code != 200:
+                return ""
+            return r.text or ""
+        except Exception:
+            return ""
+
+    def _html_detail(self, mid):
+        """javdb HTML 详情 → dict；登录墙返回 {"login": True}；失败返回 None。
+        /v2|/v4/movies 已强制登录，这里是未登录时的元数据主源。300s 缓存。"""
+        now = time.time()
+        hit = self._html_cache.get(mid)
+        if hit and now - hit[0] < 300:
+            return hit[1]
+        html, out = "", None
+        for base in self.html_hosts:
+            html = self._html_get(base + "/v/" + quote(mid, safe=""))
+            if html:
+                break
+        if html:
+            m = re.search(r'<h2\b[^>]*class="[^"]*\btitle\b[^"]*"[^>]*>',
+                          html, re.I)
+            if m:
+                out = self._parse_html_detail(html, m)
+            else:
+                t = re.search(r"<title>(.*?)</title>", html, re.S | re.I)
+                if t and re.search(r"登入|登录|sign\s*in", t.group(1), re.I):
+                    out = {"login": True}   # 无码/FC2 详情页跳登录，属预期
+        self._html_cache[mid] = (now, out)
+        return out
+
+    def _parse_html_detail(self, html, h2):
+        out = {"number": "", "title": "", "cover": "", "date": "", "duration": 0,
+               "director": "", "maker": "", "series": "", "score": "",
+               "tags": [], "actors": [], "magnets": [], "preview_images": []}
+        blk = self._div_block(html, h2.start())
+        for sm in re.finditer(r"<strong\b([^>]*)>(.*?)</strong>", blk,
+                              re.S | re.I):
+            if re.search(r"current-title", sm.group(1), re.I):
+                continue
+            out["number"] = self._html_text(sm.group(2))
+            break
+        ct = re.search(r'<strong\b[^>]*class="[^"]*current-title[^"]*"[^>]*>'
+                       r"(.*?)</strong>", blk, re.S | re.I)
+        if ct:
+            out["title"] = self._html_text(ct.group(1))
+        if not out["title"]:
+            ot = re.search(r'<span\b[^>]*class="[^"]*origin-title[^"]*"[^>]*>'
+                           r"(.*?)</span>", blk, re.S | re.I)
+            if ot:
+                out["title"] = self._html_text(ot.group(1))
+        if not out["title"]:
+            tm = re.search(r"<title>(.*?)</title>", html, re.S | re.I)
+            if tm:
+                out["title"] = re.sub(r"\s*\|\s*JavDB.*$", "",
+                                      self._html_text(tm.group(1)),
+                                      flags=re.I).strip()
+
+        # panel-block：第一个 <strong> 去掉结尾冒号作 key，首见生效
+        pan = {}
+        for pm in re.finditer(
+                r'<div\b[^>]*class="[^"]*\bpanel-block\b[^"]*"[^>]*>',
+                html, re.I):
+            b = self._div_block(html, pm.start())
+            km = re.search(r"<strong\b[^>]*>(.*?)</strong>", b, re.S | re.I)
+            if not km:
+                continue
+            k = re.sub(r"[:：]\s*$", "", self._html_text(km.group(1))).strip()
+            if k and k not in pan:
+                pan[k] = b
+
+        def _val(*keys):
+            for k in keys:
+                b = pan.get(k)
+                if not b:
+                    continue
+                txt = self._html_text(b)
+                return re.sub(r"^%s\s*[:：]?\s*" % re.escape(k), "", txt).strip()
+            return ""
+
+        out["date"] = _val("日期")
+        dm = re.search(r"(\d+)", _val("時長", "时长"))
+        out["duration"] = int(dm.group(1)) if dm else 0
+        out["director"] = _val("導演", "导演")
+        out["maker"] = _val("片商")
+        out["series"] = _val("系列")
+        sm = re.search(r"([\d.]+)\s*分", _val("評分", "评分"))
+        out["score"] = sm.group(1) if sm else ""
+
+        def _links(key, href_re):
+            b = pan.get(key)
+            if not b:
+                return []
+            got = []
+            for a in re.finditer(r'<a\b[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
+                                 b, re.S | re.I):
+                if not re.search(href_re, a.group(1)):
+                    continue
+                t = self._html_text(a.group(2))
+                if t and t not in got:
+                    got.append(t)
+            return got
+
+        out["tags"] = _links("類別", r"/tags") or _links("类别", r"/tags")
+        out["actors"] = _links("演員", r"/actors/") or _links("演员", r"/actors/")
+
+        cm = re.search(r'<img\b[^>]*class="[^"]*\bvideo-cover\b[^"]*"[^>]*>',
+                       html, re.I)
+        if cm:
+            src = re.search(r'src="([^"]+)"', cm.group(0), re.I)
+            if src:
+                out["cover"] = src.group(1)
+        for am in re.finditer(r'<a\b[^>]*class="[^"]*tile-item[^"]*"[^>]*>',
+                              html, re.I):
+            href = re.search(r'href="([^"]+)"', am.group(0), re.I)
+            if href and "/samples/" in href.group(1):
+                out["preview_images"].append(href.group(1))
+
+        # 磁力兜底（HTML 里 data-size 单位就是 MB，与 API 一致）
+        for im in re.finditer(r'<div\b[^>]*data-size="(\d+)"[^>]*>', html, re.I):
+            seg = self._div_block(html, im.start())
+            hm = re.search(r'href="(magnet:[^"]+)"', seg, re.I)
+            if not hm:
+                continue
+            h = re.search(r"urn:btih:([A-Za-z0-9]+)", hm.group(1))
+            if not h:
+                continue
+            nm = re.search(r'<span\b[^>]*class="[^"]*\bname\b[^"]*"[^>]*>'
+                           r"(.*?)</span>", seg, re.S | re.I)
+            tgs = [self._html_text(x) for x in re.findall(
+                r'<span\b[^>]*class="[^"]*\btag\b[^"]*"[^>]*>(.*?)</span>',
+                seg, re.S | re.I)]
+            df = re.search(r'data-files="(\d+)"', im.group(0))
+            dd = re.search(r'data-date="(\d{8})"', im.group(0))
+            created = ""
+            if dd:
+                d = dd.group(1)
+                created = "%s-%s-%s" % (d[:4], d[4:6], d[6:8])
+            if not created:
+                tm = re.search(r'class="time">(.*?)</span>', seg, re.S | re.I)
+                created = self._html_text(tm.group(1)) if tm else ""
+            out["magnets"].append({
+                "hash": h.group(1),
+                "name": self._html_text(nm.group(1)) if nm else h.group(1),
+                "size": int(im.group(1)),
+                "files_count": int(df.group(1)) if df else 0,
+                "hd": any(("高清" in x) or x.upper().startswith("HD")
+                          for x in tgs),
+                "cnsub": any("字幕" in x for x in tgs),
+                "created_at": created,
+            })
+        return out
+
+    def _movie_magnets(self, mid):
+        """公开磁力接口（未登录可用）：/v1/movies/{id}/magnets，120s 缓存。
+        字段 hash/size/cnsub/hd/files_count 与详情接口一致，下游可直接复用。"""
+        now = time.time()
+        hit = self._magnets_cache.get(mid)
+        if hit and now - hit[0] < 120:
+            return hit[1]
+        data = self._api_get("/v1/movies/" + quote(mid, safe="") + "/magnets")
+        mags = data.get("magnets") if isinstance(data, dict) else None
+        mags = [g for g in (mags or []) if isinstance(g, dict) and g.get("hash")]
+        self._magnets_cache[mid] = (now, mags)
+        return mags
+
+    def _dmm_candidates(self, number):
+        """DMM 官方免费预告候选（只做存在性检查，不逐个探测）。3600s 缓存。
+        404/400 = 该番号 DMM 不收录（无码/FC2 稳定 404）→ 缓存空；
+        网络异常 → 不缓存，下次重试。"""
+        number = _to_text(number).strip()
+        if not number or not requests or self.s is None:
+            return []
+        now = time.time()
+        hit = self._dmm_cache.get(number)
+        if hit and now - hit[0] < 3600:
+            return hit[1]
+        out, definitive = [], False
+        try:
+            r = self.s.get(self.host + self.preview_api, params={"code": number},
+                           headers={"User-Agent": self.ua,
+                                    "Accept": "application/json",
+                                    "Referer": self.host + "/"},
+                           timeout=12, verify=self.verify)
+            if r.status_code == 200:
+                data = r.json()
+                for c in (data.get("urls") or []):
+                    if not isinstance(c, dict):
+                        continue
+                    u = _to_text(c.get("url") or "")
+                    if not u.startswith("https://"):
+                        continue
+                    typ = _to_text(c.get("type") or "")
+                    if typ not in ("mp4", "hls"):
+                        typ = "hls" if ".m3u8" in u.lower() else "mp4"
+                    out.append({"url": u, "type": typ,
+                                "via": _to_text(c.get("via") or "")})
+                definitive = True
+            elif r.status_code in (400, 404):
+                definitive = True
+        except Exception:
+            definitive = False
+        if definitive:
+            self._dmm_cache[number] = (now, out)
+        return out
+
+    def _probe_preview(self, number):
+        """播放时逐候选探测 DMM 预告。候选可用性会抖动（同番号重试结果不同），
+        故不缓存探测结果；对齐官方前端：总预算 10s、单个 4s、按 API 返回顺序。"""
+        cands = self._dmm_candidates(number)
+        if not cands or self.s is None:
+            return ""
+        headers = {"User-Agent": self.ua, "Referer": self.host + "/",
+                   "Accept": "*/*"}
+        deadline = time.time() + 10
+        for c in cands:
+            remain = deadline - time.time()
+            if remain <= 0:
+                break
+            t = min(4, remain)
+            try:
+                if c.get("type") == "hls":
+                    r = self.s.get(c["url"], headers=headers, timeout=t,
+                                   verify=self.verify)
+                    ok = r.status_code in (200, 206) and \
+                        r.content[:32].lstrip().startswith(b"#EXTM3U")
+                else:
+                    r = self.s.get(c["url"], headers=headers, timeout=t,
+                                   stream=True, verify=self.verify)
+                    try:
+                        ok = r.status_code in (200, 206)
+                    finally:
+                        r.close()
+                if ok:
+                    return c["url"]
+            except Exception:
+                continue
+        return ""
+
+    def _html_search(self, key, page):
+        """未登录搜索兜底：/v2/search 已强制登录 → 抓 HTML 搜索页。
+        返回 (list, has_more)。"""
+        html = ""
+        for base in self.html_hosts:
+            html = self._html_get(base + "/search",
+                                  {"q": key, "f": "all", "page": page})
+            if html:
+                break
+        if not html:
+            return [], False
+        out, seen = [], set()
+        for im in re.finditer(
+                r'<div\b[^>]*class="[^"]*\bitem\b[^"]*"[^>]*>', html, re.I):
+            seg = self._div_block(html, im.start())
+            hm = re.search(r'<a\b[^>]*href="/v/([A-Za-z0-9]+)"', seg, re.I)
+            if not hm or hm.group(1) in seen:
+                continue
+            mid = hm.group(1)
+            seen.add(mid)
+            nm = re.search(r"<strong\b[^>]*>(.*?)</strong>", seg, re.S | re.I)
+            number = self._html_text(nm.group(1)) if nm else ""
+            tm = re.search(r'<div\b[^>]*class="[^"]*video-title[^"]*"[^>]*>'
+                           r"(.*?)</div>", seg, re.S | re.I)
+            title = self._html_text(tm.group(1)) if tm else ""
+            if number and title.startswith(number):
+                title = title[len(number):].strip()
+            cm = re.search(r'<img\b[^>]*src="([^"]+)"', seg, re.I)
+            dm = re.search(r'<div\b[^>]*class="[^"]*\bmeta\b[^"]*"[^>]*>'
+                           r"(.*?)</div>", seg, re.S | re.I)
+            date = self._html_text(dm.group(1)) if dm else ""
+            pic = self._proxy_pic(cm.group(1) if cm else "")
+            name = title or number or mid
+            out.append({"vod_id": mid, "vod_name": name, "vod_pic": pic,
+                        "vod_remarks": " ".join(x for x in (number, date[:10])
+                                                if x),
+                        "type_name": number})
+            self._vid_meta[mid] = {"number": number, "title": name, "pic": pic,
+                                   "duration": 0, "release_date": date[:10],
+                                   "score": ""}
+        has_more = False
+        for am in re.finditer(r"<a\b[^>]*>", html, re.I):
+            tag = am.group(0)
+            if "pagination-next" in tag and "href=" in tag \
+                    and not re.search(r"disabled", tag, re.I):
+                has_more = True
+                break
+        return out, has_more
+
     def detailContent(self, ids):
         vid = str(ids[0]) if isinstance(ids, (list, tuple)) and ids else str(ids or "")
         if not vid:
@@ -1513,24 +1876,52 @@ class Spider:
         # 注：actor_/series_/maker_ 现为 vod_tag=folder，点击进 categoryContent 的下一层海报网格，
         # 不再走 detailContent（避免误出「选集」）。
 
-        data = self._api_get("/v2/movies/" + quote(vid, safe=""))
-        movie = data.get("movie") if isinstance(data, dict) else None
-        if not isinstance(movie, dict):
-            return {"list": []}
+        # 详情数据三层降级（未登录时 /v2|/v4/movies 返回 JWTVerificationError）：
+        #   官方 API(仅配了 cookie) → javdb580 HTML → 列表期缓存；
+        # 磁力走公开 /v1/movies/{id}/magnets，预览走 /api/dmm/preview。
+        movie = {}
+        if _to_text(self.cookie):
+            raw = self._api_get("/v4/movies/" + quote(vid, safe=""))
+            if isinstance(raw, dict) and isinstance(raw.get("movie"), dict):
+                movie = raw["movie"]
+        detail = self._html_detail(vid) or {}
+        if detail.get("login"):
+            detail = {}
+        cache = self._vid_meta.get(vid) or {}
 
-        title = _to_text(movie.get("title") or movie.get("number") or "")
-        number = _to_text(movie.get("number") or "")
-        pic = self._proxy_pic(
-            _to_text(movie.get("cover_url") or movie.get("thumb_url") or ""))
-        date = _to_text(movie.get("release_date") or "")
-        score = _to_text(movie.get("score") or "")
-        dur = _safe_int(movie.get("duration"), 0)
-        maker = _to_text(movie.get("maker_name") or "")
-        director = _to_text(movie.get("director_name") or "")
-        series = _to_text(movie.get("series_name") or "")
-        tags = [t.get("name") for t in (movie.get("tags") or []) if isinstance(t, dict)]
-        actors = [a.get("name") for a in (movie.get("actors") or []) if isinstance(a, dict)]
-        magnets = movie.get("magnets") or []
+        magnets = self._movie_magnets(vid) or []
+        if not magnets:
+            magnets = movie.get("magnets") or []
+        if not magnets:
+            magnets = detail.get("magnets") or []
+
+        title = _to_text(movie.get("title") or detail.get("title")
+                         or cache.get("title") or vid)
+        number = _to_text(movie.get("number") or detail.get("number")
+                          or cache.get("number") or "")
+        if not number and magnets:
+            cm = re.search(r"\b([A-Za-z]{2,10}[-_]?\d{2,5})\b",
+                           _to_text(magnets[0].get("name") or ""))
+            if cm:
+                number = cm.group(1).replace("_", "-")
+        pic = self._proxy_pic(_to_text(
+            movie.get("cover_url") or movie.get("thumb_url")
+            or detail.get("cover") or cache.get("pic") or ""))
+        date = _to_text(movie.get("release_date") or detail.get("date")
+                        or cache.get("release_date") or "")
+        score = _to_text(movie.get("score") or detail.get("score")
+                         or cache.get("score") or "")
+        dur = (_safe_int(movie.get("duration"), 0)
+               or _safe_int(detail.get("duration"), 0)
+               or _safe_int(cache.get("duration"), 0))
+        maker = _to_text(movie.get("maker_name") or detail.get("maker") or "")
+        director = _to_text(movie.get("director_name") or detail.get("director")
+                            or "")
+        series = _to_text(movie.get("series_name") or detail.get("series") or "")
+        tags = [t.get("name") for t in (movie.get("tags") or [])
+                if isinstance(t, dict)] or list(detail.get("tags") or [])
+        actors = [a.get("name") for a in (movie.get("actors") or [])
+                  if isinstance(a, dict)] or list(detail.get("actors") or [])
 
         info_lines = []
         if number:
@@ -1566,11 +1957,16 @@ class Spider:
         play_from = []
         play_url = []
 
-        # 预览片（m3u8，网页端置顶）
+        # 预览片（网页端置顶）：登录态用官方 preview_video_url 直链；
+        # 未登录只做 0.3s 存在性检查决定「要不要显示」，地址写成伪链，
+        # 真正的可用地址在 playerContent 里逐候选探测（候选可用性会抖动）。
         pv = _to_text(movie.get("preview_video_url") or "")
         if pv:
             play_from.append("預覽")
             play_url.append("預覽$%s" % _sanitize_play(pv))
+        elif number and self._dmm_candidates(number):
+            play_from.append("預覽")
+            play_url.append("預覽$%s" % _sanitize_play(PREVIEW_PREFIX + number))
 
         # 磁力源（直链，交给 App 的磁力播放器）
         if self.enable_magnet and magnets:
@@ -1672,8 +2068,12 @@ class Spider:
             "q": keyword, "page": page, "type": "movie", "limit": self.search_limit,
         })
         lst = self._movies_to_list(data.get("movies"))
+        has_more = bool(lst)
+        if not lst:
+            # /v2/search 与详情接口同因被 JWT 拦（JWTVerificationError）→ HTML 兜底
+            lst, has_more = self._html_search(keyword, page)
         return {"list": lst, "page": page,
-                "pagecount": page + 1 if lst else page,
+                "pagecount": page + 1 if (lst and has_more) else page,
                 "limit": len(lst), "total": len(lst)}
 
     # ==================== 115 离线 ====================
@@ -2771,6 +3171,19 @@ class Spider:
         if vid.startswith("115off:"):
             return self._play_offline_safe(vid[len("115off:"):].strip())
 
+        # 预览伪链：详情页只存番号，真正地址在这里逐候选探测（每次重新探测，
+        # 因为 mirror_proxy/proxy/direct 的可用性会随时间漂移）
+        if vid.startswith(PREVIEW_PREFIX):
+            code = vid[len(PREVIEW_PREFIX):].strip()
+            url = self._probe_preview(code) if code else ""
+            if url:
+                return {
+                    "parse": 0, "jx": 0, "playUrl": "", "url": url,
+                    "header": {"User-Agent": self.ua,
+                               "Referer": self.host + "/", "Accept": "*/*"},
+                }
+            return _play_err("预览暂不可用（DMM 候选全部失效），请稍后重试或改用磁力")
+
         if vid.startswith("magnet:"):
             m = _normalize_magnet(vid)
             return {
@@ -2966,6 +3379,8 @@ class Spider:
         if u.startswith("magnet:"):
             return True
         if u.startswith(OFF_PREFIX_115) or u.startswith("115off:"):
+            return True
+        if u.startswith(PREVIEW_PREFIX):
             return True
         u = u.split("?")[0]
         return u.endswith((".mp4", ".m3u8", ".flv", ".mkv", ".ts", ".avi"))
