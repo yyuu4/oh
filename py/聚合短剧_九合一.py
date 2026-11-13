@@ -1,78 +1,26 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  更新简介（按修复先后排列，最新一条在最后）
-#  1. 红果(HG)补设备注册 + 空模型旋转重试（设备对只落盘成功注册的对）；
-#     聚合(AG)好看线路 url 由 list 改为字符串
-#  2. 红果(HG)不能播放：播放链路对齐 h红果.py——本机 Range 流(206)优先、
-#     壳代理仅作回退（原为壳代理优先，且壳代理对 Range 请求也回 200 +
-#     整片，无 Content-Range，导致起播慢、暂停/拖动异常）
-#  3. 狂飙(KB)部分短剧播放不了、转圈：先探老直链 mp4，404 则抓播放页解
-#     playbackSession.exchange_token 取 rccdn.cc 真实媒体（新增
-#     _page_play_url()），再退 cdn 镜像、trailer 兜底；付费锁定集由
-#     playerContent 0 延迟返回空地址，不再长时间转圈
-#  4. 防卡死：新增单主机熔断（同域连接级失败后 60s 内直接快速失败，
-#     成功一次即清零），接入通用 _request 与黄果 getHtml——黄果单次
-#     请求 6×15s=90s 的卡死降为秒级快速失败
-#  5. 黄果引擎整体移植：死站 huangguoai.com → 活站 huangguoai.fit
-#     （参照 hhgdj.py），新增 9 个分类 + 8 组筛选（HGUO::root 统一下发、
-#     按分类清洗参数），保留 DoH / 熔断 / 本机代理(eng=hguo) 契约
-#  6. 黄果实机首页无图、播放转圈：代理改自建回环服务（端口 OS 分配，红果
-#     同款已在实机验证），不再依赖壳 /proxy?do=py 的 9978 顺位口与
-#     getProxyUrl 注入；非 HLS 地址(mp4)也入代理防直连转圈；代理参数兼容
-#     JSON 字符串形态
-#  7. 五五一/野果首页无图：两家封面接入自建回环服务（同第 6 条，handler 按
-#     eng 分发，eng=yeguo/wuyi）；野果 9978 兜底改自建服务；五一原图是
-#     01/upload 系 AES-128-CBC 密文（与野果同族同 MEDIA 键），_srv_pic 非图
-#     即解密+PKCS7 去填充后才回壳——此前直连回的是壳解不了的密文字节
-#  8. 四源连修：牛牛 ad_unlock 补 shortplay_id+index+lock_index（缺任一即
-#     params error，biz 锁集解锁后 HTTP200）；黄豆锁集(VIP/金币)由 status=n
-#     秒回 toast://服务端错误，不再落 _hls 404 死链；野果 play 接口认
-#     episode_id(分集自身 id)而非 sort 序号，detail 播放位改传分集 id——
-#     此前后续集全部映射回第一集；五五封面(category/detail/search)接入
-#     回环代理 eng=wuwu（实机直连 p.lztutu.com 取不到）
-#  9. 红果(HG)补弹幕：移植 h红果.py v1.7.0 弹幕子系统（x-ladon/x-argus 签名、
-#     30s 窗口取数、series_map 映射、B 站 XML 输出）。detailContent 落
-#     vid→series_id 映射，playerContent 挂本机 /hg_dm 地址并预热取数，
-#     _StreamHandler._serve 增加 /hg_dm 路由（与视频流独立连接，最多等
-#     _DM_WAIT 秒）；init 加载映射、destroy 释放弹幕缓存
-#  10. 河马(HM)付费章打通：api() 改走 freevideo.zqqds.cn portal（alg=HG45LKBS
-#     + 动态 datas 设备头 + AES/CBC Body），detail 付费章塞 lazy
-#     hm++bookId++chapterId，player 识别 hm++ 后调 portal/1139 取 mp4Url
-#     （免费章同走 1139；旧 1133 保留兜底）
-#  11. 牛牛(NN)详情/播放空列表：movieDetails 需 source=0→1 回退（部分剧
-#     source=0 返回 1012/空，如 39793 仅 source=1 有数据；76287 等相反），
-#     desc 空时 vod_name 回退 list_res.name；player free 直链同样双 source
-#     回退。封面维持 _dj_nn_pic 清空（OSS cattleduanju 已 UserDisable）
-#  12. 五五(WW)源站挂：duanju55.com 全站 nginx 默认页、/index.php 404，
-#     未发现新域名——分类/搜索空属上游死站，暂不改代码
-#  13. 河马(HM)全章可播：对齐 sun.json 参考实现 ShortHema——detail 全章
-#     一律 lazy hm++bookId++chapterId（不再内嵌 SSR 免费直链，该链会间歇
-#     403）；SSR chapterList 空时回退 portal/1131；player 统一 1139 取源，
-#     1139 失败再试 1133。实测免费/付费章均 206 可播
-#  14. 五一(51)整站改版修复：旧 /new-theater-category、/play/{id}/{ep}/ 全 404。
-#     列表改 /newest、/recommend、/ai-duanju、/ai-huanlian、/ai-mogai（SSR 卡片，
-#     /{path}/{page}/ 翻页）；详情/播放改 /video/{id}/、/video/{id}/ep-{n}/，
-#     解析内嵌 videoInitialData（trackingEpisodes 全部分集 + epPlaySrcs/videoSrc
-#     m3u8 直链）；搜索改 /search/?keyword=（302 → /search/video/{kw}/）。
-#     封面仍走回环代理 eng=wuyi（pic.gyezbp.cn 仍为 AES 密文，_srv_pic 可解）
-#  15. 红果(HG)取流修复：multi_video_model 上游已弃用旧 gorgon/medusa 签名
-#     （200 空包→502），_video_model 改走弹幕同款 SM3/SIMON Argus+Ladon 新签名
-#     与 7.3.9.32 App query（复用本文件 _dm_sign_headers/_dm_query，先序列化
-#     body 再签 x-ss-stub）；分类/详情/搜索/弹幕不动
-#  16. 红果(HG)筛选失效：官网分类页改版为路径式 /category/{内容类型}/{分类项}?page=N，
-#     旧查询参数（tab/sort_type/gender/topic/background/setting/time）被官网 301
-#     丢弃（实测仅 page/tab 与个别 background 遗留 id 幸存）。home_meta 筛选组改为
-#     题材/更多题材两组 slug 值（对齐 h红果.py；单组≤20 防 OK影视 截断；
-#     action-adventure 官网仍空载故不暴露）；categoryContent/_category_loader 改拼
-#     路径式 URL，404/空载回退同内容类型“全部”；旧 tid（all/latest/hot/male/female/
-#     ai_comic/manju/comic 等）别名映射到新路由，历史书签不受影响；官网已下线的
-#     排序/时间/男频女频筛选随之移除
-#  17. 两修既有上游破损：① 红果(HG)搜索空——官网搜索迁 /api/search/*+字节反爬后
-#     SSR 页恒空壳，移植 h红果.py 的「扫分类页按标题命中」兜底 + 45s 负缓存
-#     （_hg_search_scan/_search_neg_*），searchContent 空结果时自动扫四内容分类；
-#     ② 狂飙(KB)列表空——主站 ai.dramarush.tv 被 DNS 污染(31.13.112.9 黑洞)，
-#     _KB_HOST 改指未污染的 https://dramarush.tv（同站 tRPC/播放页实测全通，
-#     kbApiBase 壳配置仍可再覆盖）
+#  更新简介（按修复先后排列，最新一条在最上面）
+#  21. 红果(HG)对照 h红果.py v1.7.4 全文审查修复移植（甄别 11 项 → 适用 7 项）：
+#     ① _hg_cache_cleanup 重构：原「无 mp4 即 return」致孤儿 .tmp/.part 永不清（写失败
+#     残片只增不减）→ 清理无条件执行；.tmp 只删 mtime>60s（防误杀 _hg_cache_put 活跃
+#     写入，误删会让 os.replace 失败、整片缓存静默丢失）、.part>3600s；
+#     ② _search_neg_put/hit 加 _SEARCH_NEG_LOCK 串行化并消除 key 双次计算；
+#     ③ _xmxor 空/短输入 IndexError 守卫；④ _text(bytes) 走 utf-8 解码（原 str() 得
+#     "b'...'" repr）；⑤ _parse_track 畸形 moov 的 sample/chunk/entry/aux count 可达
+#     0xFFFFFFFF 致 [x]*count 直接 OOM，补 _MAX_TRACK_ENTRIES=10^6 上限超限回 None；
+#     ⑥ _dm_page 每请求新建 Session 不关闭（32 位 FD 泄漏）补 try/finally；
+#     ⑦ _dm_push_local 后台推送 Session 同样补 finally 关闭。
+#     不适用甄别 3 项：无 _PAGE_CACHE（本文件无页缓存）、无通用 _retry（重试入参全 int
+#     且已 max(1,attempts) 钳制）、_video_model_rotating 已是 dict(config or {}) 合并写法。
+#  20. 西饭(AG::西饭)个别集 playerContent 返回 url="None" 播放 NETERR：上游
+#     episodeList 该集 playUrl 为 null，"%s$%s" 拼接把 None 变成字面量 "None"
+#     传给播放器；detail 拼分集时跳过无 playUrl 的项，列表全空回退
+#     「暂无播放地址$0」，不再产出 "None" 播放 id
+#  19. 西饭(AG::西饭)搜索畸形出「西饭@None#None」：解析直读 elements[].duanjuVo，
+#     而真实结构是 elements[].contents[].duanjuVo（顶层无该字段），改为与分类解析
+#     同构的双层遍历并跳过无 duanjuId 的空项；实测搜索「爱」出 10 条西饭结果，
+#     标题/封面(heytapimage 200)/id 全正常、畸形项 0
 #  18. 2048短剧(MD)分类空、全部播不了：站点 mdcmai4.xyz 已死（DNS 落停放 IP、
 #     连接超时），整站迁 madouai.xyz。实测新站 /api/v1/categories、short-dramas、
 #     short-dramas/{id}、videos、videos/search、m3u8 与 image 中转全 200，且
@@ -81,14 +29,78 @@
 #     封面 /uploads/ 直链、其余相对路径走 image 中转，均随 apiBase 自动切新域；
 #     另留 _MD_API_BASES 备用域(mdcmai.xyz/mdcmai5.xyz)，壳未指定 apiBase 时
 #     init 探活失败自动换域(进程内只探一次)，下次再换域不必改代码
-#  19. 西饭(AG::西饭)搜索畸形出「西饭@None#None」：解析直读 elements[].duanjuVo，
-#     而真实结构是 elements[].contents[].duanjuVo（顶层无该字段），改为与分类解析
-#     同构的双层遍历并跳过无 duanjuId 的空项；实测搜索「爱」出 10 条西饭结果，
-#     标题/封面(heytapimage 200)/id 全正常、畸形项 0
-#  20. 西饭(AG::西饭)个别集 playerContent 返回 url="None" 播放 NETERR：上游
-#     episodeList 该集 playUrl 为 null，"%s$%s" 拼接把 None 变成字面量 "None"
-#     传给播放器；detail 拼分集时跳过无 playUrl 的项，列表全空回退
-#     「暂无播放地址$0」，不再产出 "None" 播放 id
+#  17. 两修既有上游破损：① 红果(HG)搜索空——官网搜索迁 /api/search/*+字节反爬后
+#     SSR 页恒空壳，移植 h红果.py 的「扫分类页按标题命中」兜底 + 45s 负缓存
+#     （_hg_search_scan/_search_neg_*），searchContent 空结果时自动扫四内容分类；
+#     ② 狂飙(KB)列表空——主站 ai.dramarush.tv 被 DNS 污染(31.13.112.9 黑洞)，
+#     _KB_HOST 改指未污染的 https://dramarush.tv（同站 tRPC/播放页实测全通，
+#     kbApiBase 壳配置仍可再覆盖）
+#  16. 红果(HG)筛选失效：官网分类页改版为路径式 /category/{内容类型}/{分类项}?page=N，
+#     旧查询参数（tab/sort_type/gender/topic/background/setting/time）被官网 301
+#     丢弃（实测仅 page/tab 与个别 background 遗留 id 幸存）。home_meta 筛选组改为
+#     题材/更多题材两组 slug 值（对齐 h红果.py；单组≤20 防 OK影视 截断；
+#     action-adventure 官网仍空载故不暴露）；categoryContent/_category_loader 改拼
+#     路径式 URL，404/空载回退同内容类型“全部”；旧 tid（all/latest/hot/male/female/
+#     ai_comic/manju/comic 等）别名映射到新路由，历史书签不受影响；官网已下线的
+#     排序/时间/男频女频筛选随之移除
+#  15. 红果(HG)取流修复：multi_video_model 上游已弃用旧 gorgon/medusa 签名
+#     （200 空包→502），_video_model 改走弹幕同款 SM3/SIMON Argus+Ladon 新签名
+#     与 7.3.9.32 App query（复用本文件 _dm_sign_headers/_dm_query，先序列化
+#     body 再签 x-ss-stub）；分类/详情/搜索/弹幕不动
+#  14. 五一(51)整站改版修复：旧 /new-theater-category、/play/{id}/{ep}/ 全 404。
+#     列表改 /newest、/recommend、/ai-duanju、/ai-huanlian、/ai-mogai（SSR 卡片，
+#     /{path}/{page}/ 翻页）；详情/播放改 /video/{id}/、/video/{id}/ep-{n}/，
+#     解析内嵌 videoInitialData（trackingEpisodes 全部分集 + epPlaySrcs/videoSrc
+#     m3u8 直链）；搜索改 /search/?keyword=（302 → /search/video/{kw}/）。
+#     封面仍走回环代理 eng=wuyi（pic.gyezbp.cn 仍为 AES 密文，_srv_pic 可解）
+#  13. 河马(HM)全章可播：对齐 sun.json 参考实现 ShortHema——detail 全章
+#     一律 lazy hm++bookId++chapterId（不再内嵌 SSR 免费直链，该链会间歇
+#     403）；SSR chapterList 空时回退 portal/1131；player 统一 1139 取源，
+#     1139 失败再试 1133。实测免费/付费章均 206 可播
+#  12. 五五(WW)源站挂：duanju55.com 全站 nginx 默认页、/index.php 404，
+#     未发现新域名——分类/搜索空属上游死站，暂不改代码
+#  11. 牛牛(NN)详情/播放空列表：movieDetails 需 source=0→1 回退（部分剧
+#     source=0 返回 1012/空，如 39793 仅 source=1 有数据；76287 等相反），
+#     desc 空时 vod_name 回退 list_res.name；player free 直链同样双 source
+#     回退。封面维持 _dj_nn_pic 清空（OSS cattleduanju 已 UserDisable）
+#  10. 河马(HM)付费章打通：api() 改走 freevideo.zqqds.cn portal（alg=HG45LKBS
+#     + 动态 datas 设备头 + AES/CBC Body），detail 付费章塞 lazy
+#     hm++bookId++chapterId，player 识别 hm++ 后调 portal/1139 取 mp4Url
+#     （免费章同走 1139；旧 1133 保留兜底）
+#  9. 红果(HG)补弹幕：移植 h红果.py v1.7.0 弹幕子系统（x-ladon/x-argus 签名、
+#     30s 窗口取数、series_map 映射、B 站 XML 输出）。detailContent 落
+#     vid→series_id 映射，playerContent 挂本机 /hg_dm 地址并预热取数，
+#     _StreamHandler._serve 增加 /hg_dm 路由（与视频流独立连接，最多等
+#     _DM_WAIT 秒）；init 加载映射、destroy 释放弹幕缓存
+#  8. 四源连修：牛牛 ad_unlock 补 shortplay_id+index+lock_index（缺任一即
+#     params error，biz 锁集解锁后 HTTP200）；黄豆锁集(VIP/金币)由 status=n
+#     秒回 toast://服务端错误，不再落 _hls 404 死链；野果 play 接口认
+#     episode_id(分集自身 id)而非 sort 序号，detail 播放位改传分集 id——
+#     此前后续集全部映射回第一集；五五封面(category/detail/search)接入
+#     回环代理 eng=wuwu（实机直连 p.lztutu.com 取不到）
+#  7. 五五一/野果首页无图：两家封面接入自建回环服务（同第 6 条，handler 按
+#     eng 分发，eng=yeguo/wuyi）；野果 9978 兜底改自建服务；五一原图是
+#     01/upload 系 AES-128-CBC 密文（与野果同族同 MEDIA 键），_srv_pic 非图
+#     即解密+PKCS7 去填充后才回壳——此前直连回的是壳解不了的密文字节
+#  6. 黄果实机首页无图、播放转圈：代理改自建回环服务（端口 OS 分配，红果
+#     同款已在实机验证），不再依赖壳 /proxy?do=py 的 9978 顺位口与
+#     getProxyUrl 注入；非 HLS 地址(mp4)也入代理防直连转圈；代理参数兼容
+#     JSON 字符串形态
+#  5. 黄果引擎整体移植：死站 huangguoai.com → 活站 huangguoai.fit
+#     （参照 hhgdj.py），新增 9 个分类 + 8 组筛选（HGUO::root 统一下发、
+#     按分类清洗参数），保留 DoH / 熔断 / 本机代理(eng=hguo) 契约
+#  4. 防卡死：新增单主机熔断（同域连接级失败后 60s 内直接快速失败，
+#     成功一次即清零），接入通用 _request 与黄果 getHtml——黄果单次
+#     请求 6×15s=90s 的卡死降为秒级快速失败
+#  3. 狂飙(KB)部分短剧播放不了、转圈：先探老直链 mp4，404 则抓播放页解
+#     playbackSession.exchange_token 取 rccdn.cc 真实媒体（新增
+#     _page_play_url()），再退 cdn 镜像、trailer 兜底；付费锁定集由
+#     playerContent 0 延迟返回空地址，不再长时间转圈
+#  2. 红果(HG)不能播放：播放链路对齐 h红果.py——本机 Range 流(206)优先、
+#     壳代理仅作回退（原为壳代理优先，且壳代理对 Range 请求也回 200 +
+#     整片，无 Content-Range，导致起播慢、暂停/拖动异常）
+#  1. 红果(HG)补设备注册 + 空模型旋转重试（设备对只落盘成功注册的对）；
+#     聚合(AG)好看线路 url 由 list 改为字符串
 # =====================================================================
 #  聚合短剧 · 九合一
 #     (红果 + 黄豆 + 黄果 + 野果 + 禁果 + 红果黄剧 + 聚合短剧[短] + 2048短剧 + 狂飙短剧)
@@ -965,33 +977,43 @@ def _hg_cache_cleanup(force: bool = False) -> None:
     """按时间 + 数量 + 体积自动清理本机缓存。"""
     try:
         files = _hg_cache_list()
-        if not files and not force:
-            return
-        # 1) 过期删除
-        remain = []
-        for item in files:
-            if item["age"] > _HG_CACHE_MAX_AGE or item["size"] <= 0:
+        # 1) 过期删除 + 2) 超量删除最旧（无 mp4 且非 force 时跳过，避免空目录白扫）
+        if files or force:
+            remain = []
+            for item in files:
+                if item["age"] > _HG_CACHE_MAX_AGE or item["size"] <= 0:
+                    try:
+                        os.remove(item["path"])
+                    except Exception:
+                        pass
+                else:
+                    remain.append(item)
+            total = sum(x["size"] for x in remain)
+            while remain and (len(remain) > _HG_CACHE_MAX_FILES or total > _HG_CACHE_MAX_BYTES):
+                old = remain.pop(0)
                 try:
-                    os.remove(item["path"])
+                    os.remove(old["path"])
                 except Exception:
                     pass
-            else:
-                remain.append(item)
-        # 2) 超量删除最旧
-        total = sum(x["size"] for x in remain)
-        while remain and (len(remain) > _HG_CACHE_MAX_FILES or total > _HG_CACHE_MAX_BYTES):
-            old = remain.pop(0)
-            try:
-                os.remove(old["path"])
-            except Exception:
-                pass
-            total -= old["size"]
-        # 3) 清理残留 tmp
+                total -= old["size"]
+        # 3) 清理残留 tmp / 过期 .part —— 无论有无 mp4 都要跑：
+        #    写失败残留的孤儿 tmp 若只在有 mp4 时才清，会只增不减
         root = _hg_cache_dir()
+        now = time.time()
         for name in os.listdir(root):
+            fp = os.path.join(root, name)
             if name.endswith(".tmp") or name == ".w":
+                # 只删超过 60s 仍存在的 tmp：正被 _hg_cache_put 写入的 tmp 不能误删
+                # (误删会让随后的 os.replace 失败、整片缓存静默丢失)
                 try:
-                    os.remove(os.path.join(root, name))
+                    if now - os.stat(fp).st_mtime > 60:
+                        os.remove(fp)
+                except Exception:
+                    pass
+            elif name.endswith(".part"):
+                try:
+                    if now - os.stat(fp).st_mtime > 3600:
+                        os.remove(fp)
                 except Exception:
                     pass
     except Exception:
@@ -1205,6 +1227,12 @@ class HongguoPluginError(RuntimeError):
     pass
 
 def _text(value: Any) -> str:
+    if isinstance(value, bytes):
+        # bytes 走 str() 会得到 "b'...'" 的 repr，应解码
+        try:
+            return value.decode("utf-8", errors="replace").strip()
+        except Exception:
+            return ""
     return str(value or "").strip()
 
 def _first(*values: Any) -> str:
@@ -1343,8 +1371,12 @@ def _parse_track(
         return None
     assert stsz is not None and stsc is not None
     assert saiz is not None and saio is not None
+    # 畸形 moov 的 count 可以是 0xFFFFFFFF：不设上限会 [x]*count 直接 OOM
+    _MAX_TRACK_ENTRIES = 1_000_000
     default_size = struct.unpack(">I", stsz[4:8])[0]
     sample_count = struct.unpack(">I", stsz[8:12])[0]
+    if sample_count > _MAX_TRACK_ENTRIES:
+        return None
     sizes = (
         [default_size] * sample_count
         if default_size
@@ -1356,6 +1388,8 @@ def _parse_track(
     chunk_table = stco if stco is not None else co64
     assert chunk_table is not None
     chunk_count = struct.unpack(">I", chunk_table[4:8])[0]
+    if chunk_count > _MAX_TRACK_ENTRIES:
+        return None
     chunk_width = 4 if stco is not None else 8
     offsets = [
         int.from_bytes(
@@ -1367,6 +1401,8 @@ def _parse_track(
         for index in range(chunk_count)
     ]
     entry_count = struct.unpack(">I", stsc[4:8])[0]
+    if entry_count > _MAX_TRACK_ENTRIES:
+        return None
     entries = [
         (
             struct.unpack(">I", stsc[8 + index * 12 : 12 + index * 12])[0],
@@ -1385,6 +1421,8 @@ def _parse_track(
         return None
     default_aux_size = saiz[saiz_cursor]
     aux_count = struct.unpack(">I", saiz[saiz_cursor + 1 : saiz_cursor + 5])[0]
+    if aux_count > _MAX_TRACK_ENTRIES:
+        return None
     aux_sizes = (
         [default_aux_size] * aux_count
         if default_aux_size
@@ -4183,7 +4221,11 @@ def _xmxor_two(data: bytes, key: bytes) -> bytearray:
     return encoded
 
 def _xmxor(data: bytes, key: bytes) -> bytearray:
+    if not data:
+        return bytearray()
     value = _xmxor_two(data, key)
+    if len(value) < 2:
+        return value
     last_flag = value[-1] ^ value[-2]
     data0 = value[0]
     value[0] = (~last_flag + value[0]) & 0xFF
@@ -4809,6 +4851,7 @@ def _search_by_keywords(keywords, page: int) -> dict:
 _SEARCH_NEG_TTL = 45.0
 _SEARCH_NEG_MAX = 512
 _SEARCH_NEG: dict = {}
+_SEARCH_NEG_LOCK = threading.Lock()
 
 
 def _search_neg_key(key, page) -> str:
@@ -4816,25 +4859,29 @@ def _search_neg_key(key, page) -> str:
 
 
 def _search_neg_put(key, page) -> None:
-    _SEARCH_NEG[_search_neg_key(key, page)] = time.time()
-    if len(_SEARCH_NEG) <= _SEARCH_NEG_MAX:
-        return
-    now = time.time()
-    for k in list(_SEARCH_NEG):
-        if _SEARCH_NEG[k] <= now - _SEARCH_NEG_TTL:
-            _SEARCH_NEG.pop(k, None)
-    while len(_SEARCH_NEG) > _SEARCH_NEG_MAX and _SEARCH_NEG:
-        _SEARCH_NEG.pop(next(iter(_SEARCH_NEG)), None)
+    nk = _search_neg_key(key, page)
+    with _SEARCH_NEG_LOCK:
+        _SEARCH_NEG[nk] = time.time()
+        if len(_SEARCH_NEG) <= _SEARCH_NEG_MAX:
+            return
+        now = time.time()
+        for k in list(_SEARCH_NEG):  # 超限才扫：先把过期的清掉(未再查过的键此前无人弹)
+            if _SEARCH_NEG[k] <= now - _SEARCH_NEG_TTL:
+                _SEARCH_NEG.pop(k, None)
+        while len(_SEARCH_NEG) > _SEARCH_NEG_MAX and _SEARCH_NEG:  # 仍超则挤掉最早入列(插入序=时间序)
+            _SEARCH_NEG.pop(next(iter(_SEARCH_NEG)), None)
 
 
 def _search_neg_hit(key, page) -> bool:
-    ts = _SEARCH_NEG.get(_search_neg_key(key, page))
-    if ts is None:
-        return False
-    if time.time() - ts > _SEARCH_NEG_TTL:
-        _SEARCH_NEG.pop(_search_neg_key(key, page), None)
-        return False
-    return True
+    nk = _search_neg_key(key, page)
+    with _SEARCH_NEG_LOCK:
+        ts = _SEARCH_NEG.get(nk)
+        if ts is None:
+            return False
+        if time.time() - ts > _SEARCH_NEG_TTL:
+            _SEARCH_NEG.pop(nk, None)
+            return False
+        return True
 
 
 def _search_empty_page(page) -> dict:
@@ -5400,8 +5447,14 @@ def _dm_page(vid: str, series_id: str, start_ms: int, device_id: str,
     url = "https://%s/novel/commentapi/comment/list/%s/v1/?%s" % (_DM_HOST, vid, query)
     sess = requests.Session()
     sess.trust_env = False
-    response = sess.post(url, data=body, headers=headers, timeout=20)
-    data = _json_response(response)
+    try:
+        response = sess.post(url, data=body, headers=headers, timeout=20)
+        data = _json_response(response)
+    finally:
+        try:
+            sess.close()
+        except Exception:
+            pass
     if isinstance(data, Mapping) and data.get("code") not in (0, None):
         raise HongguoPluginError("弹幕接口 code=%s %s" % (data.get("code"), data.get("message") or ""))
     payload_data = (data or {}).get("data") if isinstance(data, Mapping) else None
@@ -5682,6 +5735,7 @@ def _dm_push_local(url: str, vid: str) -> None:
         _DM_PUSHED.add(vid)
 
     def _run():
+        session = None
         try:
             time.sleep(2.5)
             # 播放器已经自己来取过 /hg_dm 了，就不必再推一遍（免得弹幕闪一下）
@@ -5694,6 +5748,12 @@ def _dm_push_local(url: str, vid: str) -> None:
             session.get(target, timeout=3)
         except Exception:
             pass
+        finally:
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
     threading.Thread(target=_run, daemon=True).start()
 
 
