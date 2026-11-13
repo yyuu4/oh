@@ -585,6 +585,10 @@ class Spider:
         self._api_action = ""
         self.html_hosts = list(HTML_HOSTS)
         self.preview_api = PREVIEW_API
+        # 搜索频控（对齐官方前端 movieService：间隔 1.5s / 限流退避 60s / 缓存 300s）
+        self._search_cache = {}        # "kw|page" -> (ts, list, has_more)
+        self._search_last = 0.0
+        self._search_block_until = 0.0
         self._cache_filters = {}
         self._host_locked = False
         self._probed = False
@@ -1821,14 +1825,31 @@ class Spider:
 
     def _html_search(self, key, page):
         """未登录搜索兜底：/v2/search 已强制登录 → 抓 HTML 搜索页。
-        返回 (list, has_more)。"""
+        上游对搜索有频控（官方前端 movieService 同款：最小间隔 1.5s、命中限流
+        退避 60s、结果缓存 300s）。命中登录墙时判为「暂时限流」而非「搜不到」，
+        置退避标记后返回空，避免反复 hammer 把自己封死。返回 (list, has_more)。"""
+        ck = "%s|%d" % (_to_text(key), page)
+        now = time.time()
+        if now < self._search_block_until:
+            return [], False
+        hit = self._search_cache.get(ck)
+        if hit and now - hit[0] < 300:
+            return hit[1], hit[2]
+        gap = 1.5 - (now - self._search_last)
+        if gap > 0:
+            time.sleep(gap)
         html = ""
         for base in self.html_hosts:
             html = self._html_get(base + "/search",
                                   {"q": key, "f": "all", "page": page})
             if html:
                 break
+        self._search_last = time.time()
         if not html:
+            return [], False
+        if re.search(r"<title>\s*登入", html, re.I) or "登入 | JavDB" in html:
+            # 上游限流（官方前端同样报「搜索暂时被上游限流」）→ 退避 60 秒
+            self._search_block_until = time.time() + 60
             return [], False
         out, seen = [], set()
         for im in re.finditer(
@@ -1866,6 +1887,9 @@ class Spider:
                     and not re.search(r"disabled", tag, re.I):
                 has_more = True
                 break
+        if len(self._search_cache) > 64:
+            self._search_cache.clear()
+        self._search_cache[ck] = (now, out, has_more)
         return out, has_more
 
     def detailContent(self, ids):
