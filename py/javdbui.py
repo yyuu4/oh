@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.5.2"
-# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商海报网格加「可用性」筛选——网页原样筛选（网页 EntityMoviesPage 实体页只有这一组：全部/可播放/含磁链/含字幕；filter_by 第4段；盒子上先在列表选好再点进实体即生效）+修复「全部」分类排序筛选失效（_latest_list 补传 sort_by）；v1.4.17，实体网格筛选补全为可用性+时长+标签组（标签取四类并集修跨类型返空；时长客户端过滤+按(base,dur)缓存）；v1.4.18，未登录三播放源修复——详情接口被 JWT 拦截后降级 javdb580 HTML + /v1/movies/{id}/magnets 磁力 + /api/dmm/preview 预览（伪链播放时逐候选探测），列表期补 id→番号/标题缓存，搜索 HTML 兜底，热播回退 /v1/rankings/playback，HOST 换 catembylegacy；v1.5.0，新增「AI栏目」「LTX破解」两个分类（排在热播前面，与网页端 /drama、/ltx 对齐）——AI走 /api/v/drama/{categories,feed,详情}，选集 dramap_ 播放时 playlist→play 逐级取链，封面 AES-128-CBC 解码（cryptography/PyCryptodome/纯 Python 三级兜底）；LTX 走 /api/ltx/list，有 javdbId 直接复用 JavDB 详情三播放源，纯 magnet 给磁力+115，纯 ed2k 不生成播放项（网页同样只给复制）；v1.5.1，更新说明补记备用镜像域名：https://javdb.com、https://javdb581.com、https://javdb582.com；v1.5.2，修复AI栏目列表封面不出图——删 img_proxy 短路（外部反代拿到AES密文只会坏图），出图改走 localProxy 优先（有 siteKey 或本地代理为 http:// 形式即生成 token URL，不再把 siteKey 当前提），两者都没有时列表允许内联 data URI 并按模式分流页宽（localProxy 24 / 内联默认6，ext dramaPageSize 可配1-24，单图超700KB留空防JSON撑爆），解密失败留空不回传密文地址；
+VERSION = "1.5.3"
+# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商海报网格加「可用性」筛选——网页原样筛选（网页 EntityMoviesPage 实体页只有这一组：全部/可播放/含磁链/含字幕；filter_by 第4段；盒子上先在列表选好再点进实体即生效）+修复「全部」分类排序筛选失效（_latest_list 补传 sort_by）；v1.4.17，实体网格筛选补全为可用性+时长+标签组（标签取四类并集修跨类型返空；时长客户端过滤+按(base,dur)缓存）；v1.4.18，未登录三播放源修复——详情接口被 JWT 拦截后降级 javdb580 HTML + /v1/movies/{id}/magnets 磁力 + /api/dmm/preview 预览（伪链播放时逐候选探测），列表期补 id→番号/标题缓存，搜索 HTML 兜底，热播回退 /v1/rankings/playback，HOST 换 catembylegacy；v1.5.0，新增「AI栏目」「LTX破解」两个分类（排在热播前面，与网页端 /drama、/ltx 对齐）——AI走 /api/v/drama/{categories,feed,详情}，选集 dramap_ 播放时 playlist→play 逐级取链，封面 AES-128-CBC 解码（cryptography/PyCryptodome/纯 Python 三级兜底）；LTX 走 /api/ltx/list，有 javdbId 直接复用 JavDB 详情三播放源，纯 magnet 给磁力+115，纯 ed2k 不生成播放项（网页同样只给复制）；v1.5.1，更新说明补记备用镜像域名：https://javdb.com、https://javdb581.com、https://javdb582.com；v1.5.2，修复AI栏目列表封面不出图——删 img_proxy 短路（外部反代拿到AES密文只会坏图），出图改走 localProxy 优先（有 siteKey 或本地代理为 http:// 形式即生成 token URL，不再把 siteKey 当前提），两者都没有时列表允许内联 data URI 并按模式分流页宽（localProxy 24 / 内联默认6，ext dramaPageSize 可配1-24，单图超700KB留空防JSON撑爆），解密失败留空不回传密文地址；v1.5.3，AI栏目封面根修——①纯Python AES-128-CBC 换 T-table 实现（Td0-3 预计算+轮密钥预混，单张 272KB 约 3.7s→2.4s；实测纯Python 上限约 110KB/s，deepseek 预估的 20-40x 在 CPython 达不到）；②密文超限不解直接留空（AES-CBC 等长，2MB PNG 白解 19s 省掉）+ 纯后端内联页宽自动收到 4 防 15s 超时；③localProxy 只认 http(s) base（siteKey 降为拼参，AT 上 proxy://do=py 兜底不再当图片地址返回）；④_fetch_pic 缓存键去 ?auth_key= + 成品落盘 ~/.javdbui_pic_cache（冷启动二次进入不再重解）；
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 import os
 import re
@@ -125,6 +125,8 @@ DEFAULT_COOKIE_115 = ("UID=7090991_R1_1785487771; CID=3c1a3ab03cfc92b0b7c80db6ef
 OFF_PREFIX_115 = "http://115off/"
 OFF_TRACE_FILE = os.path.join(os.path.expanduser("~"), "javbus_off_trace.txt")
 OFF_PENDING_FILE = os.path.join(os.path.expanduser("~"), "javbus_off_pending.json")
+# AI 封面解码成品磁盘缓存（跨重启，避免冷启动重解密；键=去 auth_key 后 URL 的 md5）
+PIC_DISK_DIR = os.path.join(os.path.expanduser("~"), ".javdbui_pic_cache")
 
 
 def _trace_write(text):
@@ -622,6 +624,8 @@ def _aes_expand(key):
 
 
 _AES_MUL_TBL = {}
+_AES_TD = None          # (Td0, Td1, Td2, Td3) 懒构建
+_AES_TD_CACHE = {}      # key(16B) → (rk, td, rk_mix)
 
 
 def _aes_mul_tbl():
@@ -631,46 +635,135 @@ def _aes_mul_tbl():
     return _AES_MUL_TBL
 
 
-def _aes_dec_block(rk, blk):
-    """单块 AES-128 解密：AddRoundKey(10) → 9 轮(InvShift/InvSub/AddKey/InvMix) → 末轮。"""
-    s = [blk[i] ^ rk[160 + i] for i in range(16)]
-    t = _aes_mul_tbl()
+def _aes_td_tables():
+    """Td0..Td3：InvSubBytes+InvMixColumns 折叠成 4 张 256 项 32 位表（懒构建一次）。"""
+    global _AES_TD
+    if _AES_TD is None:
+        t = _aes_mul_tbl()
+        m9, m11, m13, m14 = t[9], t[11], t[13], t[14]
+        inv = _AES_INV_SBOX
+        Td0 = [0] * 256
+        Td1 = [0] * 256
+        Td2 = [0] * 256
+        Td3 = [0] * 256
+        for x in range(256):
+            s = inv[x]
+            # InvMixColumns 矩阵 [0e 0b 0d 09 / 09 0e 0b 0d / 0d 09 0e 0b / 0b 0d 09 0e]
+            Td0[x] = (m14[s] | (m9[s] << 8) | (m13[s] << 16) | (m11[s] << 24))
+            Td1[x] = (m11[s] | (m14[s] << 8) | (m9[s] << 16) | (m13[s] << 24))
+            Td2[x] = (m13[s] | (m11[s] << 8) | (m14[s] << 16) | (m9[s] << 24))
+            Td3[x] = (m9[s] | (m13[s] << 8) | (m11[s] << 16) | (m14[s] << 24))
+        _AES_TD = (Td0, Td1, Td2, Td3)
+    return _AES_TD
+
+
+def _aes_inv_mix4(col, t):
+    """单列 4 字节 InvMixColumns。"""
     m9, m11, m13, m14 = t[9], t[11], t[13], t[14]
-    for rnd in range(9, 0, -1):
-        # InvShiftRows：行 r 右移 r（new[i] = old[(i-r) mod 4]）
-        s[1], s[5], s[9], s[13] = s[13], s[1], s[5], s[9]
-        s[2], s[6], s[10], s[14] = s[10], s[14], s[2], s[6]
-        s[3], s[7], s[11], s[15] = s[7], s[11], s[15], s[3]
-        s = [_AES_INV_SBOX[x] for x in s]
-        k = rnd * 16
-        s = [s[i] ^ rk[k + i] for i in range(16)]
-        out = [0] * 16
+    a, b, c, d = col
+    return (m14[a] ^ m11[b] ^ m13[c] ^ m9[d],
+            m9[a] ^ m14[b] ^ m11[c] ^ m13[d],
+            m13[a] ^ m9[b] ^ m14[c] ^ m11[d],
+            m11[a] ^ m13[b] ^ m9[c] ^ m14[d])
+
+
+def _aes_prep(key):
+    """展开轮密钥 + Td 表 + 预混轮密钥（InvMixColumns 线性，可提前混好）。"""
+    rk = _aes_expand(key)
+    td = _aes_td_tables()
+    t = _aes_mul_tbl()
+    rk_mix = [None] * 10          # 1..9 用
+    for rnd in range(1, 10):
+        k = rk[rnd * 16:(rnd + 1) * 16]
+        mixed = []
         for c in range(4):
-            i = c * 4
-            a, b, c2, d = s[i], s[i + 1], s[i + 2], s[i + 3]
-            out[i] = m14[a] ^ m11[b] ^ m13[c2] ^ m9[d]
-            out[i + 1] = m9[a] ^ m14[b] ^ m11[c2] ^ m13[d]
-            out[i + 2] = m13[a] ^ m9[b] ^ m14[c2] ^ m11[d]
-            out[i + 3] = m11[a] ^ m13[b] ^ m9[c2] ^ m14[d]
-        s = out
-    s[1], s[5], s[9], s[13] = s[13], s[1], s[5], s[9]
-    s[2], s[6], s[10], s[14] = s[10], s[14], s[2], s[6]
-    s[3], s[7], s[11], s[15] = s[7], s[11], s[15], s[3]
-    s = [_AES_INV_SBOX[x] for x in s]
-    return [s[i] ^ rk[i] for i in range(16)]
+            mixed.extend(_aes_inv_mix4(k[c * 4:c * 4 + 4], t))
+        rk_mix[rnd] = mixed
+    return rk, td, rk_mix
+
+
+def _aes_get_prep(key):
+    cached = _AES_TD_CACHE.get(key)
+    if cached is None:
+        cached = _aes_prep(key)
+        if len(_AES_TD_CACHE) > 8:
+            _AES_TD_CACHE.clear()
+        _AES_TD_CACHE[key] = cached
+    return cached
+
+
+def _aes_dec_block(rk, td, rk_mix, blk):
+    """T-table 单块解密：AddRoundKey(10) → 9 轮 Td 查表+预混轮密钥 → 末轮。"""
+    Td0, Td1, Td2, Td3 = td
+    s0 = blk[0] ^ rk[160]; s1 = blk[1] ^ rk[161]
+    s2 = blk[2] ^ rk[162]; s3 = blk[3] ^ rk[163]
+    s4 = blk[4] ^ rk[164]; s5 = blk[5] ^ rk[165]
+    s6 = blk[6] ^ rk[166]; s7 = blk[7] ^ rk[167]
+    s8 = blk[8] ^ rk[168]; s9 = blk[9] ^ rk[169]
+    s10 = blk[10] ^ rk[170]; s11 = blk[11] ^ rk[171]
+    s12 = blk[12] ^ rk[172]; s13 = blk[13] ^ rk[173]
+    s14 = blk[14] ^ rk[174]; s15 = blk[15] ^ rk[175]
+    for rnd in range(9, 0, -1):
+        # InvShiftRows
+        s1, s5, s9, s13 = s13, s1, s5, s9
+        s2, s6, s10, s14 = s10, s14, s2, s6
+        s3, s7, s11, s15 = s7, s11, s15, s3
+        km = rk_mix[rnd]
+        # 列 0
+        t = Td0[s0] ^ Td1[s1] ^ Td2[s2] ^ Td3[s3]
+        s0 = (t & 0xFF) ^ km[0]; s1 = ((t >> 8) & 0xFF) ^ km[1]
+        s2 = ((t >> 16) & 0xFF) ^ km[2]; s3 = ((t >> 24) & 0xFF) ^ km[3]
+        # 列 1
+        t = Td0[s4] ^ Td1[s5] ^ Td2[s6] ^ Td3[s7]
+        s4 = (t & 0xFF) ^ km[4]; s5 = ((t >> 8) & 0xFF) ^ km[5]
+        s6 = ((t >> 16) & 0xFF) ^ km[6]; s7 = ((t >> 24) & 0xFF) ^ km[7]
+        # 列 2
+        t = Td0[s8] ^ Td1[s9] ^ Td2[s10] ^ Td3[s11]
+        s8 = (t & 0xFF) ^ km[8]; s9 = ((t >> 8) & 0xFF) ^ km[9]
+        s10 = ((t >> 16) & 0xFF) ^ km[10]; s11 = ((t >> 24) & 0xFF) ^ km[11]
+        # 列 3
+        t = Td0[s12] ^ Td1[s13] ^ Td2[s14] ^ Td3[s15]
+        s12 = (t & 0xFF) ^ km[12]; s13 = ((t >> 8) & 0xFF) ^ km[13]
+        s14 = ((t >> 16) & 0xFF) ^ km[14]; s15 = ((t >> 24) & 0xFF) ^ km[15]
+    # 末轮：InvShiftRows + InvSubBytes + AddRoundKey(0)
+    s1, s5, s9, s13 = s13, s1, s5, s9
+    s2, s6, s10, s14 = s10, s14, s2, s6
+    s3, s7, s11, s15 = s7, s11, s15, s3
+    inv = _AES_INV_SBOX
+    return [inv[s0] ^ rk[0], inv[s1] ^ rk[1],
+            inv[s2] ^ rk[2], inv[s3] ^ rk[3],
+            inv[s4] ^ rk[4], inv[s5] ^ rk[5],
+            inv[s6] ^ rk[6], inv[s7] ^ rk[7],
+            inv[s8] ^ rk[8], inv[s9] ^ rk[9],
+            inv[s10] ^ rk[10], inv[s11] ^ rk[11],
+            inv[s12] ^ rk[12], inv[s13] ^ rk[13],
+            inv[s14] ^ rk[14], inv[s15] ^ rk[15]]
 
 
 def _aes_pure_decrypt(data, key, iv):
-    """纯 Python AES-128-CBC 解密（padding none），逐块与前块异或。"""
-    rk = _aes_expand(key)
+    """纯 Python AES-128-CBC 解密（padding none），T-table 加速，逐块与前块异或。"""
+    rk, td, rk_mix = _aes_get_prep(key)
     out = bytearray(len(data))
-    prev = list(iv)
-    for off in range(0, len(data), 16):
-        blk = list(data[off:off + 16])
-        dec = _aes_dec_block(rk, blk)
-        for i in range(16):
-            out[off + i] = dec[i] ^ prev[i]
-        prev = blk
+    prev0, prev1, prev2, prev3 = iv[0], iv[1], iv[2], iv[3]
+    prev4, prev5, prev6, prev7 = iv[4], iv[5], iv[6], iv[7]
+    prev8, prev9, prev10, prev11 = iv[8], iv[9], iv[10], iv[11]
+    prev12, prev13, prev14, prev15 = iv[12], iv[13], iv[14], iv[15]
+    n = len(data)
+    for off in range(0, n, 16):
+        blk = data[off:off + 16]
+        dec = _aes_dec_block(rk, td, rk_mix, blk)
+        out[off] = dec[0] ^ prev0; out[off + 1] = dec[1] ^ prev1
+        out[off + 2] = dec[2] ^ prev2; out[off + 3] = dec[3] ^ prev3
+        out[off + 4] = dec[4] ^ prev4; out[off + 5] = dec[5] ^ prev5
+        out[off + 6] = dec[6] ^ prev6; out[off + 7] = dec[7] ^ prev7
+        out[off + 8] = dec[8] ^ prev8; out[off + 9] = dec[9] ^ prev9
+        out[off + 10] = dec[10] ^ prev10; out[off + 11] = dec[11] ^ prev11
+        out[off + 12] = dec[12] ^ prev12; out[off + 13] = dec[13] ^ prev13
+        out[off + 14] = dec[14] ^ prev14; out[off + 15] = dec[15] ^ prev15
+        prev0, prev1, prev2, prev3 = blk[0], blk[1], blk[2], blk[3]
+        prev4, prev5, prev6, prev7 = blk[4], blk[5], blk[6], blk[7]
+        prev8, prev9, prev10, prev11 = blk[8], blk[9], blk[10], blk[11]
+        prev12, prev13, prev14, prev15 = blk[12], blk[13], blk[14], blk[15]
     return bytes(out)
 
 
@@ -1737,8 +1830,12 @@ class Spider:
         if sort not in ("new", "hot"):
             sort = "new"
         # 页宽按出图模式分流：localProxy 模式 JSON 只放 URL 用 24；
-        # 内联 data URI 模式用小页宽（默认 6，ext dramaPageSize 可配）防 JSON 撑爆
+        # 内联 data URI 模式用小页宽（默认 6，ext dramaPageSize 可配）防 JSON 撑爆。
+        # 纯 Python 后端（TVBox 无 cryptography）解密约 110KB/s，6 张≈10s 易撞
+        # 宿主 15s 超时 → 自动收到 4 张（ext dramaPageSize 可再调小）。
         size = 24 if self._drama_use_localproxy() else self._drama_inline_size
+        if size > 4 and _aes_backend() == "pure" and not self._drama_use_localproxy():
+            size = 4
         data = self._site_api("/api/v/drama/feed", {
             "cate": cate, "page": page, "size": size, "sort": sort})
         items = data.get("items") if isinstance(data, dict) else None
@@ -1782,43 +1879,45 @@ class Spider:
         }
 
     def _drama_use_localproxy(self):
-        """AI封面能否走 localProxy：有 siteKey，或本地代理是 http:// 形式
-        （Proxy.getPort()>0 时 AT/pg 都能取；siteKey 只是鉴权参数，不是前提）。"""
-        if self._site_key():
-            return True
+        """AI封面走 localProxy 的前提：base 必须是 http(s)（App 直接取）。
+        siteKey 只是拼进 URL 的鉴权参数，不是可用性前提——否则 AT 上
+        _pic_proxy_base() 兜底成 proxy://do=py 时会把 App 不加载的协议
+        当图片地址整栏返回，表现就是 AI 栏目全空白。"""
         return self._pic_proxy_base().startswith(("http://", "https://"))
 
     def _drama_pic(self, url, allow_inline=False, max_inline=DRAMA_INLINE_MAX):
         """AI 封面是 AES 密文（pic.drleao.cn，Content-Type: binary/octet-stream），
         外部图片反代拿到的同样是密文只会出坏图，所以不走 img_proxy，只走本插件
         自己的解密链路。出图优先级：
-        1. localProxy 可用（有 siteKey 或本地代理 http:// 形式）→ 返回 token URL，
-           JSON 只放地址，列表 24 张不内联；
-        2. 否则（AT 且拿不到 http 端口）→ allow_inline 时下载解码内联成 data URI
+        1. localProxy base 为 http(s) → 返回 token URL，JSON 只放地址；
+        2. 否则（AT 拿不到 http 端口）→ allow_inline 时下载解码内联成 data URI
            （列表页由 _drama_list 用 dramaPageSize 小页宽控制体积，单图超
            max_inline 留空；详情页单张传 0 不封顶）；
-        3. 都不行 → 留空（不把密文 URL 塞给 App 出坏图）。
+        3. 都不行 → 留空（不把密文/proxy:// URL 塞给 App 出坏图）。
         """
         if not url:
             return ""
+        # localProxy：仅 base 为 http(s) 才走；proxy:// 兜底不产出图片地址
         if self._drama_use_localproxy():
             try:
-                tok = base64.urlsafe_b64encode(
-                    url.encode("utf-8")).decode("ascii").rstrip("=")
-                q = self._pic_proxy_base()          # 已含 do=py
-                key = self._site_key()
-                if key and "siteKey=" not in q:
-                    q += "&siteKey=%s" % quote(key)
-                return q + "&kind=image&token=%s" % quote(tok, safe="")
+                q = self._pic_proxy_base()
+                if q.startswith(("http://", "https://")):
+                    tok = base64.urlsafe_b64encode(
+                        url.encode("utf-8")).decode("ascii").rstrip("=")
+                    key = self._site_key()
+                    if key and "siteKey=" not in q:
+                        q += "&siteKey=%s" % quote(key)
+                    return q + "&kind=image&token=%s" % quote(tok, safe="")
             except Exception:
-                return ""
+                pass                        # 落到内联分支
         if not allow_inline or _aes_backend() is None:
             return ""
-        data, mime = self._fetch_pic(url)
+        # max_inline>0 时下传给 _fetch_pic：密文等长，超限不解直接留空
+        data, mime = self._fetch_pic(url, max_raw=max_inline or 0)
         if not data:
-            return ""                       # 下载/解码失败 → 留空，不回传密文
+            return ""                       # 下载/解码失败/超限 → 留空，不回传密文
         if max_inline and len(data) > max_inline:
-            return ""                       # 超大图（多MB PNG）→ 留空防 JSON 撑爆
+            return ""                       # 磁盘缓存命中但超限（防御）
         return "data:%s;base64,%s" % (
             mime or "image/jpeg",
             base64.b64encode(data).decode("ascii"))
@@ -3897,21 +3996,44 @@ class Spider:
             }]
         return [404, "text/plain", b"Not Found", {}]
 
-    def _fetch_pic(self, url):
-        """下载封面并解码 XOR 加密（localProxy kind=image 用；带内存缓存）"""
+    def _fetch_pic(self, url, max_raw=0):
+        """下载封面并解码 XOR/AES 加密（localProxy kind=image 用；带内存+磁盘缓存）。
+        - 缓存键去掉 ?auth_key= 查询串——cover 的 auth_key 会轮换，
+          带着它做键会导致每次冷启动都重新下载+重新解密。
+        - max_raw>0 时密文超限直接返回：AES-CBC padding-none 等长，
+          2MB PNG 解完也超预算，先跳过可省掉十几秒白解。"""
         if not requests or not url.startswith(("http://", "https://")):
             return b"", ""
         cache = getattr(self, "_pic_cache", None)
         if not isinstance(cache, dict):
             cache = {}
             self._pic_cache = cache
-        hit = cache.get(url)
+        ckey = url.split("?", 1)[0]
+        hit = cache.get(ckey)
         now = time.time()
         if hit and now - hit[0] <= 1800:
             # LRU touch
-            del cache[url]
-            cache[url] = hit
+            del cache[ckey]
+            cache[ckey] = hit
             return hit[1], hit[2]
+        # 磁盘缓存（跨重启；键=ckey 的 md5）
+        dkey = hashlib.md5(ckey.encode("utf-8")).hexdigest()
+        dpath = os.path.join(PIC_DISK_DIR, dkey)
+        if max_raw <= 0 or True:            # 磁盘命中不受 max_raw 限制（已解码成品）
+            try:
+                if os.path.isfile(dpath):
+                    with open(dpath, "rb") as f:
+                        blob = f.read()
+                    # 文件头 4 字节存 mime 长度+mime，其余为图片数据
+                    if len(blob) > 4:
+                        mlen = blob[0]
+                        mime = blob[1:1 + mlen].decode("ascii", "ignore")
+                        body = blob[1 + mlen:]
+                        if body:
+                            cache[ckey] = (now, body, mime)
+                            return body, mime
+            except Exception:
+                pass
         headers = {
             "User-Agent": WEB_UA,
             "Referer": self.host + "/",
@@ -3927,12 +4049,24 @@ class Spider:
             return b"", ""
         if r.status_code != 200 or not r.content:
             return b"", ""
+        raw = r.content
+        if max_raw and len(raw) > max_raw:
+            # 密文等长于明文 → 解完也超限，不解直接留空
+            return b"", ""
         body, mime = self._decode_pic(
-            r.content, _to_text(r.headers.get("Content-Type") or ""))
+            raw, _to_text(r.headers.get("Content-Type") or ""))
         if body:
-            cache[url] = (now, body, mime)
+            cache[ckey] = (now, body, mime)
             while len(cache) > 64:
                 cache.pop(next(iter(cache)), None)
+            try:
+                if not os.path.isdir(PIC_DISK_DIR):
+                    os.makedirs(PIC_DISK_DIR, exist_ok=True)
+                mb = (mime or "image/jpeg").encode("ascii", "ignore")[:200]
+                with open(dpath, "wb") as f:
+                    f.write(bytes([len(mb)]) + mb + body)
+            except Exception:
+                pass
         return body, mime
 
     @staticmethod
