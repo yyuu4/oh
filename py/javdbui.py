@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.5.1"
-# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商海报网格加「可用性」筛选——网页原样筛选（网页 EntityMoviesPage 实体页只有这一组：全部/可播放/含磁链/含字幕；filter_by 第4段；盒子上先在列表选好再点进实体即生效）+修复「全部」分类排序筛选失效（_latest_list 补传 sort_by）；v1.4.17，实体网格筛选补全为可用性+时长+标签组（标签取四类并集修跨类型返空；时长客户端过滤+按(base,dur)缓存）；v1.4.18，未登录三播放源修复——详情接口被 JWT 拦截后降级 javdb580 HTML + /v1/movies/{id}/magnets 磁力 + /api/dmm/preview 预览（伪链播放时逐候选探测），列表期补 id→番号/标题缓存，搜索 HTML 兜底，热播回退 /v1/rankings/playback，HOST 换 catembylegacy；v1.5.0，新增「AI栏目」「LTX破解」两个分类（排在热播前面，与网页端 /drama、/ltx 对齐）——AI走 /api/v/drama/{categories,feed,详情}，选集 dramap_ 播放时 playlist→play 逐级取链，封面 AES-128-CBC 解码（cryptography/PyCryptodome/纯 Python 三级兜底）；LTX 走 /api/ltx/list，有 javdbId 直接复用 JavDB 详情三播放源，纯 magnet 给磁力+115，纯 ed2k 不生成播放项（网页同样只给复制）；v1.5.1，更新说明补记备用镜像域名：https://javdb.com、https://javdb581.com、https://javdb582.com；
+VERSION = "1.5.2"
+# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商海报网格加「可用性」筛选——网页原样筛选（网页 EntityMoviesPage 实体页只有这一组：全部/可播放/含磁链/含字幕；filter_by 第4段；盒子上先在列表选好再点进实体即生效）+修复「全部」分类排序筛选失效（_latest_list 补传 sort_by）；v1.4.17，实体网格筛选补全为可用性+时长+标签组（标签取四类并集修跨类型返空；时长客户端过滤+按(base,dur)缓存）；v1.4.18，未登录三播放源修复——详情接口被 JWT 拦截后降级 javdb580 HTML + /v1/movies/{id}/magnets 磁力 + /api/dmm/preview 预览（伪链播放时逐候选探测），列表期补 id→番号/标题缓存，搜索 HTML 兜底，热播回退 /v1/rankings/playback，HOST 换 catembylegacy；v1.5.0，新增「AI栏目」「LTX破解」两个分类（排在热播前面，与网页端 /drama、/ltx 对齐）——AI走 /api/v/drama/{categories,feed,详情}，选集 dramap_ 播放时 playlist→play 逐级取链，封面 AES-128-CBC 解码（cryptography/PyCryptodome/纯 Python 三级兜底）；LTX 走 /api/ltx/list，有 javdbId 直接复用 JavDB 详情三播放源，纯 magnet 给磁力+115，纯 ed2k 不生成播放项（网页同样只给复制）；v1.5.1，更新说明补记备用镜像域名：https://javdb.com、https://javdb581.com、https://javdb582.com；v1.5.2，修复AI栏目列表封面不出图——删 img_proxy 短路（外部反代拿到AES密文只会坏图），出图改走 localProxy 优先（有 siteKey 或本地代理为 http:// 形式即生成 token URL，不再把 siteKey 当前提），两者都没有时列表允许内联 data URI 并按模式分流页宽（localProxy 24 / 内联默认6，ext dramaPageSize 可配1-24，单图超700KB留空防JSON撑爆），解密失败留空不回传密文地址；
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 import os
 import re
@@ -86,6 +86,9 @@ LTX_PREFIX = "ltx_"                # 列表 vod_id：ltx_{番号}
 # padding none，input raw-bytes）——兜底常量与线上一致。
 DRAMA_COVER_KEY = "f5d965df75336270"
 DRAMA_COVER_IV = "97b60394abc2fbe1"
+# 列表内联 data URI 的单图上限：JPEG 封面 ~150-300KB 放行，多 MB 的 PNG 超限
+# 留空（个别封面缺图好过整页 JSON 被撑到十几 MB）
+DRAMA_INLINE_MAX = 700 * 1024
 
 # API 签名常量（从前端 JS bundle 逆出）
 JD_SALT = "lpw6vgqzsp"
@@ -746,6 +749,7 @@ class Spider:
         self._dmm_cache = {}      # number -> (ts, [candidate])；空列表=确定无预览
         self._ltx_items = {}      # 番号 -> LTX 条目（列表期缓存，详情页复用）
         self._site_api_ok = None  # (ts, host) AI/LTX 接口可用的站点 host
+        self._drama_inline_size = 6  # AI封面内联模式的列表页宽（ext dramaPageSize 可配）
         self._api_action = ""
         self.html_hosts = list(HTML_HOSTS)
         self.preview_api = PREVIEW_API
@@ -839,6 +843,11 @@ class Spider:
             # 图片代理 siteKey 兜底：宿主没注入 siteKey 时用 ext 里配置的站点 key
             self._ext_site_key = str(
                 extend.get("key") or extend.get("siteKey") or "").strip()
+        if extend.get("dramaPageSize"):
+            # AI封面内联模式页宽（仅无 localProxy 时生效；localProxy 模式固定 24）
+            n = _safe_int(extend.get("dramaPageSize"), 0)
+            if 1 <= n <= 24:
+                self._drama_inline_size = n
         if extend.get("cookie"):
             self.cookie = str(extend["cookie"])
         if extend.get("lang"):
@@ -1727,8 +1736,11 @@ class Spider:
         sort = _to_text(fs.get("sort") or "new")
         if sort not in ("new", "hot"):
             sort = "new"
+        # 页宽按出图模式分流：localProxy 模式 JSON 只放 URL 用 24；
+        # 内联 data URI 模式用小页宽（默认 6，ext dramaPageSize 可配）防 JSON 撑爆
+        size = 24 if self._drama_use_localproxy() else self._drama_inline_size
         data = self._site_api("/api/v/drama/feed", {
-            "cate": cate, "page": page, "size": 24, "sort": sort})
+            "cate": cate, "page": page, "size": size, "sort": sort})
         items = data.get("items") if isinstance(data, dict) else None
         out = []
         for it in items or []:
@@ -1762,37 +1774,54 @@ class Spider:
         return {
             "vod_id": "%s%d" % (DRAMA_PREFIX, iid),
             "vod_name": title,
-            "vod_pic": self._drama_pic(_to_text(it.get("cover") or "")),
+            "vod_pic": self._drama_pic(
+                _to_text(it.get("cover") or ""), allow_inline=True),
             "vod_remarks": " ".join(parts),
             "vod_year": created[:4],
             "type_name": _to_text(dict(DRAMA_CATES).get(cate) or "AI"),
         }
 
-    def _drama_pic(self, url, allow_inline=False):
-        """AI 封面是 AES 密文（pic.drleao.cn，Content-Type: binary/octet-stream）。
-        - 已配 img_proxy：外部代理拿到的同样是密文，只会出坏图 → 留空
-        - 有 siteKey：走 localProxy 解密，JSON 只放 URL（列表页 20 张不内联）
-        - 无 siteKey（AT）：localProxy 路由不中 → 只有详情页单张允许内联成 data URI，
-          列表页一律留空，否则 20×268KB 会把列表 JSON 撑到 7MB+
+    def _drama_use_localproxy(self):
+        """AI封面能否走 localProxy：有 siteKey，或本地代理是 http:// 形式
+        （Proxy.getPort()>0 时 AT/pg 都能取；siteKey 只是鉴权参数，不是前提）。"""
+        if self._site_key():
+            return True
+        return self._pic_proxy_base().startswith(("http://", "https://"))
+
+    def _drama_pic(self, url, allow_inline=False, max_inline=DRAMA_INLINE_MAX):
+        """AI 封面是 AES 密文（pic.drleao.cn，Content-Type: binary/octet-stream），
+        外部图片反代拿到的同样是密文只会出坏图，所以不走 img_proxy，只走本插件
+        自己的解密链路。出图优先级：
+        1. localProxy 可用（有 siteKey 或本地代理 http:// 形式）→ 返回 token URL，
+           JSON 只放地址，列表 24 张不内联；
+        2. 否则（AT 且拿不到 http 端口）→ allow_inline 时下载解码内联成 data URI
+           （列表页由 _drama_list 用 dramaPageSize 小页宽控制体积，单图超
+           max_inline 留空；详情页单张传 0 不封顶）；
+        3. 都不行 → 留空（不把密文 URL 塞给 App 出坏图）。
         """
         if not url:
             return ""
-        if _to_text(self.img_proxy):
-            return ""
-        key = self._site_key()
-        if key:
+        if self._drama_use_localproxy():
             try:
                 tok = base64.urlsafe_b64encode(
                     url.encode("utf-8")).decode("ascii").rstrip("=")
                 q = self._pic_proxy_base()          # 已含 do=py
-                if "siteKey=" not in q:
+                key = self._site_key()
+                if key and "siteKey=" not in q:
                     q += "&siteKey=%s" % quote(key)
                 return q + "&kind=image&token=%s" % quote(tok, safe="")
             except Exception:
                 return ""
         if not allow_inline or _aes_backend() is None:
             return ""
-        return self._pic_data_uri(url)
+        data, mime = self._fetch_pic(url)
+        if not data:
+            return ""                       # 下载/解码失败 → 留空，不回传密文
+        if max_inline and len(data) > max_inline:
+            return ""                       # 超大图（多MB PNG）→ 留空防 JSON 撑爆
+        return "data:%s;base64,%s" % (
+            mime or "image/jpeg",
+            base64.b64encode(data).decode("ascii"))
 
     def _ltx_list(self, fs, page):
         """LTX破解列表：/api/ltx/list（sort=date 是默认值，上游不收该参数）。"""
@@ -2451,7 +2480,8 @@ class Spider:
         vod = {
             "vod_id": DRAMA_PREFIX + str(iid),
             "vod_name": title,
-            "vod_pic": self._drama_pic(cover, allow_inline=True),
+            "vod_pic": self._drama_pic(cover, allow_inline=True,
+                                        max_inline=0),
             "vod_content": "\n".join(info),
             "vod_blurb": desc[:120],
             "vod_desc": "\n".join(info),
