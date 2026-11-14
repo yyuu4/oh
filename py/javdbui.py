@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.5.3"
-# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商海报网格加「可用性」筛选——网页原样筛选（网页 EntityMoviesPage 实体页只有这一组：全部/可播放/含磁链/含字幕；filter_by 第4段；盒子上先在列表选好再点进实体即生效）+修复「全部」分类排序筛选失效（_latest_list 补传 sort_by）；v1.4.17，实体网格筛选补全为可用性+时长+标签组（标签取四类并集修跨类型返空；时长客户端过滤+按(base,dur)缓存）；v1.4.18，未登录三播放源修复——详情接口被 JWT 拦截后降级 javdb580 HTML + /v1/movies/{id}/magnets 磁力 + /api/dmm/preview 预览（伪链播放时逐候选探测），列表期补 id→番号/标题缓存，搜索 HTML 兜底，热播回退 /v1/rankings/playback，HOST 换 catembylegacy；v1.5.0，新增「AI栏目」「LTX破解」两个分类（排在热播前面，与网页端 /drama、/ltx 对齐）——AI走 /api/v/drama/{categories,feed,详情}，选集 dramap_ 播放时 playlist→play 逐级取链，封面 AES-128-CBC 解码（cryptography/PyCryptodome/纯 Python 三级兜底）；LTX 走 /api/ltx/list，有 javdbId 直接复用 JavDB 详情三播放源，纯 magnet 给磁力+115，纯 ed2k 不生成播放项（网页同样只给复制）；v1.5.1，更新说明补记备用镜像域名：https://javdb.com、https://javdb581.com、https://javdb582.com；v1.5.2，修复AI栏目列表封面不出图——删 img_proxy 短路（外部反代拿到AES密文只会坏图），出图改走 localProxy 优先（有 siteKey 或本地代理为 http:// 形式即生成 token URL，不再把 siteKey 当前提），两者都没有时列表允许内联 data URI 并按模式分流页宽（localProxy 24 / 内联默认6，ext dramaPageSize 可配1-24，单图超700KB留空防JSON撑爆），解密失败留空不回传密文地址；v1.5.3，AI栏目封面根修——①纯Python AES-128-CBC 换 T-table 实现（Td0-3 预计算+轮密钥预混，单张 272KB 约 3.7s→2.4s；实测纯Python 上限约 110KB/s，deepseek 预估的 20-40x 在 CPython 达不到）；②密文超限不解直接留空（AES-CBC 等长，2MB PNG 白解 19s 省掉）+ 纯后端内联页宽自动收到 4 防 15s 超时；③localProxy 只认 http(s) base（siteKey 降为拼参，AT 上 proxy://do=py 兜底不再当图片地址返回）；④_fetch_pic 缓存键去 ?auth_key= + 成品落盘 ~/.javdbui_pic_cache（冷启动二次进入不再重解）；
+VERSION = "1.5.4"
+# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商海报网格加「可用性」筛选——网页原样筛选（网页 EntityMoviesPage 实体页只有这一组：全部/可播放/含磁链/含字幕；filter_by 第4段；盒子上先在列表选好再点进实体即生效）+修复「全部」分类排序筛选失效（_latest_list 补传 sort_by）；v1.4.17，实体网格筛选补全为可用性+时长+标签组（标签取四类并集修跨类型返空；时长客户端过滤+按(base,dur)缓存）；v1.4.18，未登录三播放源修复——详情接口被 JWT 拦截后降级 javdb580 HTML + /v1/movies/{id}/magnets 磁力 + /api/dmm/preview 预览（伪链播放时逐候选探测），列表期补 id→番号/标题缓存，搜索 HTML 兜底，热播回退 /v1/rankings/playback，HOST 换 catembylegacy；v1.5.0，新增「AI栏目」「LTX破解」两个分类（排在热播前面，与网页端 /drama、/ltx 对齐）——AI走 /api/v/drama/{categories,feed,详情}，选集 dramap_ 播放时 playlist→play 逐级取链，封面 AES-128-CBC 解码（cryptography/PyCryptodome/纯 Python 三级兜底）；LTX 走 /api/ltx/list，有 javdbId 直接复用 JavDB 详情三播放源，纯 magnet 给磁力+115，纯 ed2k 不生成播放项（网页同样只给复制）；v1.5.1，更新说明补记备用镜像域名：https://javdb.com、https://javdb581.com、https://javdb582.com；v1.5.2，修复AI栏目列表封面不出图——删 img_proxy 短路（外部反代拿到AES密文只会坏图），出图改走 localProxy 优先（有 siteKey 或本地代理为 http:// 形式即生成 token URL，不再把 siteKey 当前提），两者都没有时列表允许内联 data URI 并按模式分流页宽（localProxy 24 / 内联默认6，ext dramaPageSize 可配1-24，单图超700KB留空防JSON撑爆），解密失败留空不回传密文地址；v1.5.4，AI栏目封面补全 deepseek 方案遗漏——①整页 base64 预算（ext dramaBudget 单位KB，默认1536KB，超预算条目留空不整页丢）；②ext dramaBigPic=1 放开列表单图700KB上限；③drama_pic 打 trace（raw/b64/ms + FAIL/SKIP）+ __main__ 强制 pure 后端自检（出图数/耗时/proxy泄漏）；
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 import os
 import re
@@ -87,8 +87,11 @@ LTX_PREFIX = "ltx_"                # 列表 vod_id：ltx_{番号}
 DRAMA_COVER_KEY = "f5d965df75336270"
 DRAMA_COVER_IV = "97b60394abc2fbe1"
 # 列表内联 data URI 的单图上限：JPEG 封面 ~150-300KB 放行，多 MB 的 PNG 超限
-# 留空（个别封面缺图好过整页 JSON 被撑到十几 MB）
+# 留空（个别封面缺图好过整页 JSON 被撑到十几 MB）；ext dramaBigPic=1 可放开
 DRAMA_INLINE_MAX = 700 * 1024
+# 内联模式整页 base64 预算（deepseek 方案③）：超预算的条目本轮留空、不整页丢弃。
+# 4 张 JPEG ≈ 1.4MB b64，默认 1536KB 能装下 4 张常规封面；ext dramaBudget 可配（单位 KB）。
+DRAMA_INLINE_BUDGET = 1536 * 1024
 
 # API 签名常量（从前端 JS bundle 逆出）
 JD_SALT = "lpw6vgqzsp"
@@ -843,6 +846,8 @@ class Spider:
         self._ltx_items = {}      # 番号 -> LTX 条目（列表期缓存，详情页复用）
         self._site_api_ok = None  # (ts, host) AI/LTX 接口可用的站点 host
         self._drama_inline_size = 6  # AI封面内联模式的列表页宽（ext dramaPageSize 可配）
+        self._drama_inline_budget = DRAMA_INLINE_BUDGET  # 整页 base64 预算（ext dramaBudget KB）
+        self._drama_big_pic = False  # 列表放开单图 700KB 上限（ext dramaBigPic=1）
         self._api_action = ""
         self.html_hosts = list(HTML_HOSTS)
         self.preview_api = PREVIEW_API
@@ -941,6 +946,14 @@ class Spider:
             n = _safe_int(extend.get("dramaPageSize"), 0)
             if 1 <= n <= 24:
                 self._drama_inline_size = n
+        if extend.get("dramaBudget"):
+            # 整页 base64 预算，单位 KB（deepseek 方案③：超预算留空不整页丢）
+            n = _safe_int(extend.get("dramaBudget"), 0)
+            if 256 <= n <= 16384:
+                self._drama_inline_budget = n * 1024
+        if "dramaBigPic" in extend:
+            # 列表放开单图 700KB 上限（T-table 解密后才安全；默认关）
+            self._drama_big_pic = bool(extend.get("dramaBigPic"))
         if extend.get("cookie"):
             self.cookie = str(extend["cookie"])
         if extend.get("lang"):
@@ -1840,10 +1853,20 @@ class Spider:
             "cate": cate, "page": page, "size": size, "sort": sort})
         items = data.get("items") if isinstance(data, dict) else None
         out = []
+        # 内联模式整页 base64 预算：超预算的条目 vod_pic 留空，列表项仍保留
+        budget = 0 if self._drama_use_localproxy() else self._drama_inline_budget
+        used = 0
         for it in items or []:
             v = self._drama_item(it, cate)
-            if v:
-                out.append(v)
+            if not v:
+                continue
+            pic = _to_text(v.get("vod_pic") or "")
+            if budget and pic.startswith("data:"):
+                if used + len(pic) > budget:
+                    v["vod_pic"] = ""   # 超预算本轮留空，不整页丢弃
+                else:
+                    used += len(pic)
+            out.append(v)
         pc = _safe_int(data.get("pages"), 0)
         if not pc:
             pc = page + 1 if out else page
@@ -1912,15 +1935,23 @@ class Spider:
                 pass                        # 落到内联分支
         if not allow_inline or _aes_backend() is None:
             return ""
-        # max_inline>0 时下传给 _fetch_pic：密文等长，超限不解直接留空
-        data, mime = self._fetch_pic(url, max_raw=max_inline or 0)
+        # 单图上限：列表默认 700KB，dramaBigPic=1 放开；详情页 max_inline=0 不封顶
+        cap = 0 if (self._drama_big_pic or max_inline == 0) else max_inline
+        t0 = time.time()
+        # max_raw>0 时下传给 _fetch_pic：密文等长，超限不解直接留空
+        data, mime = self._fetch_pic(url, max_raw=cap or 0)
+        ms = int((time.time() - t0) * 1000)
         if not data:
+            _trace_write("drama_pic FAIL url=%s ms=%d" % (url.split("?")[0][-40:], ms))
             return ""                       # 下载/解码失败/超限 → 留空，不回传密文
-        if max_inline and len(data) > max_inline:
+        if cap and len(data) > cap:
+            _trace_write("drama_pic SKIP over cap=%d got=%d ms=%d" % (
+                cap, len(data), ms))
             return ""                       # 磁盘缓存命中但超限（防御）
-        return "data:%s;base64,%s" % (
-            mime or "image/jpeg",
-            base64.b64encode(data).decode("ascii"))
+        b64 = base64.b64encode(data).decode("ascii")
+        _trace_write("drama_pic ok raw=%d b64=%d ms=%d" % (
+            len(data), len(b64), ms))
+        return "data:%s;base64,%s" % (mime or "image/jpeg", b64)
 
     def _ltx_list(self, fs, page):
         """LTX破解列表：/api/ltx/list（sort=date 是默认值，上游不收该参数）。"""
@@ -4176,3 +4207,26 @@ if __name__ == "__main__":
         print("search", len((sp.searchContent("三上") or {}).get("list") or []))
     except Exception as e:
         print("search ERR", type(e).__name__, str(e)[:60])
+    # pure 后端出图自检（deepseek 方案⑤）：强制纯 Python AES 跑 AI 列表
+    try:
+        _AES_BACKEND[:] = ["pure"]
+        sp2 = Spider()
+        sp2.init("")
+        t0 = time.time()
+        lst = (sp2.categoryContent("drama", "1",
+                                   {"cate": "duanju", "sort": "new"},
+                                   {}) or {}).get("list") or []
+        dt = time.time() - t0
+        n_pic = sum(1 for x in lst if (x.get("vod_pic") or "").startswith("data:"))
+        n_proxy = sum(1 for x in lst if (x.get("vod_pic") or "").startswith("proxy://"))
+        max_b64 = max((len(x.get("vod_pic") or "") for x in lst), default=0)
+        print("pure_drama items=%d pic=%d proxy=%d max_pic=%dKB %.2fs" % (
+            len(lst), n_pic, n_proxy, max_b64 // 1024, dt))
+        if n_proxy:
+            print("pure_drama FAIL: proxy:// leaked")
+        elif dt > 15:
+            print("pure_drama FAIL: over 15s host timeout")
+        else:
+            print("pure_drama OK")
+    except Exception as e:
+        print("pure_drama ERR", type(e).__name__, str(e)[:80])
