@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.5.7"
-# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商海报网格加「可用性」筛选——网页原样筛选（网页 EntityMoviesPage 实体页只有这一组：全部/可播放/含磁链/含字幕；filter_by 第4段；盒子上先在列表选好再点进实体即生效）+修复「全部」分类排序筛选失效（_latest_list 补传 sort_by）；v1.4.17，实体网格筛选补全为可用性+时长+标签组（标签取四类并集修跨类型返空；时长客户端过滤+按(base,dur)缓存）；v1.4.18，未登录三播放源修复——详情接口被 JWT 拦截后降级 javdb580 HTML + /v1/movies/{id}/magnets 磁力 + /api/dmm/preview 预览（伪链播放时逐候选探测），列表期补 id→番号/标题缓存，搜索 HTML 兜底，热播回退 /v1/rankings/playback，HOST 换 catembylegacy；v1.5.0，新增「AI栏目」「LTX破解」两个分类（排在热播前面，与网页端 /drama、/ltx 对齐）——AI走 /api/v/drama/{categories,feed,详情}，选集 dramap_ 播放时 playlist→play 逐级取链，封面 AES-128-CBC 解码（cryptography/PyCryptodome/纯 Python 三级兜底）；LTX 走 /api/ltx/list，有 javdbId 直接复用 JavDB 详情三播放源，纯 magnet 给磁力+115，纯 ed2k 不生成播放项（网页同样只给复制）；v1.5.1，更新说明补记备用镜像域名：https://javdb.com、https://javdb581.com、https://javdb582.com；v1.5.2，修复AI栏目列表封面不出图——删 img_proxy 短路（外部反代拿到AES密文只会坏图），出图改走 localProxy 优先（有 siteKey 或本地代理为 http:// 形式即生成 token URL，不再把 siteKey 当前提），两者都没有时列表允许内联 data URI 并按模式分流页宽（localProxy 24 / 内联默认6，ext dramaPageSize 可配1-24，单图超700KB留空防JSON撑爆），解密失败留空不回传密文地址；v1.5.4，AI栏目封面补全 deepseek 方案遗漏——①整页 base64 预算（ext dramaBudget 单位KB，默认1536KB，超预算条目留空不整页丢）；②ext dramaBigPic=1 放开列表单图700KB上限；③drama_pic 打 trace（raw/b64/ms + FAIL/SKIP）+ __main__ 强制 pure 后端自检（出图数/耗时/proxy泄漏）；v1.5.5，修复AI栏目整片无图（真机根因=解密太慢被超时掐掉）——AES后端新增 Android/TVBox（Chaquopy）javax.crypto native 实现并置于首位（270KB封面毫秒级解密，失败回落纯Python），纯Python仅作最后兜底；内联模式页宽改按 base64 预算反推（默认1536KB≈4张，防前几张吃光预算后几张留空），纯后端再压到4张；v1.5.6，AI栏目封面彻底绕开宿主取图链路——①新增自建图片 HTTP 服务（标准库 ThreadingHTTPServer，仅监听 127.0.0.1，路径 /pic/<token>.jpg），vod_pic 直接给短 http 地址，不再依赖 ?do=py 路由或 data URI 支持；②Android 端用 android.graphics 把 1440x1920 封面原生降采样到 ≤540px 再交付/缓存（原图单张位图约11MB，一屏十几张在电视盒子上直接解码失败=整栏白图），磁盘缓存加 v2 后缀强制重建；③图片会话为空时退化为直连，destroy 后重建实例仍可取图；v1.5.7，出图链路加固——①服务探活改走 ProxyHandler({}) 绕开系统 http_proxy（否则配了代理又没写 no_proxy 时 127.0.0.1 被丢给代理，会误判服务不可用而白白退化）；②降采样目标改为 720px 并修正 inSampleSize 取 2 的幂的判断（原写法实际只降一半，位图仍 2.7MB/张）；③单张取图异常只回 404，不再打死服务线程；④磁盘缓存按 mtime 裁到 400 条（约 32MB 封顶）；⑤清掉 `if max_raw <= 0 or True`、`_aes_backend() is None` 两处死代码；
+VERSION = "1.5.8"
+# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商海报网格加「可用性」筛选——网页原样筛选（网页 EntityMoviesPage 实体页只有这一组：全部/可播放/含磁链/含字幕；filter_by 第4段；盒子上先在列表选好再点进实体即生效）+修复「全部」分类排序筛选失效（_latest_list 补传 sort_by）；v1.4.17，实体网格筛选补全为可用性+时长+标签组（标签取四类并集修跨类型返空；时长客户端过滤+按(base,dur)缓存）；v1.4.18，未登录三播放源修复——详情接口被 JWT 拦截后降级 javdb580 HTML + /v1/movies/{id}/magnets 磁力 + /api/dmm/preview 预览（伪链播放时逐候选探测），列表期补 id→番号/标题缓存，搜索 HTML 兜底，热播回退 /v1/rankings/playback，HOST 换 catembylegacy；v1.5.0，新增「AI栏目」「LTX破解」两个分类（排在热播前面，与网页端 /drama、/ltx 对齐）——AI走 /api/v/drama/{categories,feed,详情}，选集 dramap_ 播放时 playlist→play 逐级取链，封面 AES-128-CBC 解码（cryptography/PyCryptodome/纯 Python 三级兜底）；LTX 走 /api/ltx/list，有 javdbId 直接复用 JavDB 详情三播放源，纯 magnet 给磁力+115，纯 ed2k 不生成播放项（网页同样只给复制）；v1.5.1，更新说明补记备用镜像域名：https://javdb.com、https://javdb581.com、https://javdb582.com；v1.5.2，修复AI栏目列表封面不出图——删 img_proxy 短路（外部反代拿到AES密文只会坏图），出图改走 localProxy 优先（有 siteKey 或本地代理为 http:// 形式即生成 token URL，不再把 siteKey 当前提），两者都没有时列表允许内联 data URI 并按模式分流页宽（localProxy 24 / 内联默认6，ext dramaPageSize 可配1-24，单图超700KB留空防JSON撑爆），解密失败留空不回传密文地址；v1.5.4，AI栏目封面补全 deepseek 方案遗漏——①整页 base64 预算（ext dramaBudget 单位KB，默认1536KB，超预算条目留空不整页丢）；②ext dramaBigPic=1 放开列表单图700KB上限；③drama_pic 打 trace（raw/b64/ms + FAIL/SKIP）+ __main__ 强制 pure 后端自检（出图数/耗时/proxy泄漏）；v1.5.5，修复AI栏目整片无图（真机根因=解密太慢被超时掐掉）——AES后端新增 Android/TVBox（Chaquopy）javax.crypto native 实现并置于首位（270KB封面毫秒级解密，失败回落纯Python），纯Python仅作最后兜底；内联模式页宽改按 base64 预算反推（默认1536KB≈4张，防前几张吃光预算后几张留空），纯后端再压到4张；v1.5.6，AI栏目封面彻底绕开宿主取图链路——①新增自建图片 HTTP 服务（标准库 ThreadingHTTPServer，仅监听 127.0.0.1，路径 /pic/<token>.jpg），vod_pic 直接给短 http 地址，不再依赖 ?do=py 路由或 data URI 支持；②Android 端用 android.graphics 把 1440x1920 封面原生降采样到 ≤540px 再交付/缓存（原图单张位图约11MB，一屏十几张在电视盒子上直接解码失败=整栏白图），磁盘缓存加 v2 后缀强制重建；③图片会话为空时退化为直连，destroy 后重建实例仍可取图；v1.5.7，出图链路加固——①服务探活改走 ProxyHandler({}) 绕开系统 http_proxy（否则配了代理又没写 no_proxy 时 127.0.0.1 被丢给代理，会误判服务不可用而白白退化）；②降采样目标改为 720px 并修正 inSampleSize 取 2 的幂的判断（原写法实际只降一半，位图仍 2.7MB/张）；③单张取图异常只回 404，不再打死服务线程；④磁盘缓存按 mtime 裁到 400 条（约 32MB 封顶）；⑤清掉 `if max_raw <= 0 or True`、`_aes_backend() is None` 两处死代码；v1.5.8，修复「LTX破解」「排行榜」两分类空列表——①LTX 实时接口 /api/ltx/list 被镜像 D1 日读配额打挂（500 ltx_query_failed）→ 回退官方 LtxPage 同款静态快照 /data/ltx/{date|update}/page-N.json（index.json 索引 300s 缓存），失败后 _ltx_api_dead 冷却 300s 免每页白等整轮 host 探活，详情冷却期内跳过 q= 实时查询；②排行榜 /v1/rankings{/playback} 上游转登录墙（JWTVerificationError）→ playback 模式降级站点公开榜 /api/hot（period 日/周/月→day/week/month），类型榜先 /api/hot 按 video_type 过滤、窗口内无该类型条目（如欧美）再兜 /v1/movies/latest?type=N（四类公开实测可取）；TOP250 静态快照路径不变；
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 import os
 import re
@@ -1032,6 +1032,8 @@ class Spider:
         self._dmm_cache = {}      # number -> (ts, [candidate])；空列表=确定无预览
         self._ltx_items = {}      # 番号 -> LTX 条目（列表期缓存，详情页复用）
         self._site_api_ok = None  # (ts, host) AI/LTX 接口可用的站点 host
+        self._ltx_api_dead = 0.0  # /api/ltx/list 失败时刻：300s 内不再打实时接口
+        self._ltx_idx_cache = None  # (ts, dict) /data/ltx/index.json 分页索引
         self._drama_inline_size = 6  # AI封面内联模式的列表页宽（ext dramaPageSize 可配）
         self._drama_inline_budget = DRAMA_INLINE_BUDGET  # 整页 base64 预算（ext dramaBudget KB）
         self._drama_big_pic = False  # 列表放开单图 700KB 上限（ext dramaBigPic=1）
@@ -1759,12 +1761,52 @@ class Spider:
                                  {"type": TYPE_NUM.get(mode, "0"),
                                   "period": period})
             lst = self._movies_to_list(data.get("movies"))
+            if not lst:
+                # /v1/rankings 被 JWT 拦（上游把类型榜转登录墙）→ 降级站点
+                # 公开榜 /api/hot 按 video_type 过滤（网页「本站热播」同款数据）
+                lst = self._hot_rank_list(period, TYPE_NUM.get(mode, "0"))
+            if not lst:
+                # /api/hot 窗口内可能没有该类型条目（如欧美档）→ 最终兜底
+                # /v1/movies/latest?type=N（公开，四类实测均可未登录取数）
+                data = self._api_get("/v1/movies/latest",
+                                     {"page": 1, "limit": 50,
+                                      "type": TYPE_NUM.get(mode, "0")})
+                lst = self._movies_to_list(data.get("movies"))
         else:
             fb = _to_text(fs.get("filterBy") or "all")
             data = self._api_get("/v1/rankings/playback",
                                  {"filter_by": fb, "period": period})
             lst = self._movies_to_list(data.get("movies"))
+            if not lst:
+                # 播放榜同样转登录墙 → 降级站点公开播放榜 /api/hot
+                lst = self._hot_rank_list(period, None)
         return self._page_result(lst, 1, one_page=True)
+
+    def _hot_rank_list(self, period, vtype=None):
+        """公开榜降级：站点 /api/hot（网页「本站热播」site 模式数据源，无需登录）。
+        period daily|weekly|monthly → day|week|month（网页 Fe 映射同款）；
+        vtype 非空时按条目 video_type 客户端过滤（0有码/1无码/2欧美/3FC2）。"""
+        p = {"daily": "day", "weekly": "week", "monthly": "month"}.get(
+            _to_text(period or "daily"), "day")
+        data = self._site_api("/api/hot", {"period": p, "limit": 50})
+        rows = data.get("items") if isinstance(data, dict) else None
+        movies = []
+        for x in rows or []:
+            if not isinstance(x, dict):
+                continue
+            if vtype is not None and _safe_int(x.get("video_type"), -1) != _safe_int(vtype, -2):
+                continue
+            # /api/hot 条目字段对齐 movie 对象（code/cover → number/cover_url）
+            movies.append({
+                "id": x.get("id"),
+                "number": x.get("code"),
+                "title": x.get("title"),
+                "cover_url": x.get("cover"),
+                "release_date": x.get("release_date"),
+                "duration": x.get("duration"),
+                "score": x.get("score"),
+            })
+        return self._movies_to_list(movies)
 
     def _host_pool(self):
         """候选 host 池：当前 host + 内置/extend 候选，去重保序；
@@ -2150,17 +2192,30 @@ class Spider:
         return "data:%s;base64,%s" % (mime or "image/jpeg", b64)
 
     def _ltx_list(self, fs, page):
-        """LTX破解列表：/api/ltx/list（sort=date 是默认值，上游不收该参数）。"""
+        """LTX破解列表：/api/ltx/list（sort=date 是默认值，上游不收该参数）。
+        实时接口挂掉（镜像 D1 配额 500 / SPA 回 HTML）→ 回退官方 LtxPage 同款
+        静态快照 /data/ltx/{date|update}/page-N.json，索引读 /data/ltx/index.json。
+        实时接口失败后 _ltx_api_dead 冷却 300s，期间直走静态，免得每次都白等探活。"""
         sort = _to_text(fs.get("sort") or "date")
         if sort not in ("date", "update"):
             sort = "date"
         params = {"page": page, "page_size": 24}
         if sort != "date":
             params["sort"] = sort
-        data = self._site_api("/api/ltx/list", params)
-        items = data.get("items") if isinstance(data, dict) else None
+        data = None
+        now = time.time()
+        if now - self._ltx_api_dead >= 300:
+            data = self._site_api("/api/ltx/list", params)
+            if not (isinstance(data, dict) and data.get("items")):
+                # 实时接口不可用 → 记冷却，本轮回退静态
+                if not isinstance(data, dict) or "error" in data or not data:
+                    self._ltx_api_dead = now
+                data = None
+        if data is None:
+            return self._ltx_static_list(sort, page)
+        items = data.get("items") or []
         out = []
-        for it in items or []:
+        for it in items:
             v = self._ltx_item(it)
             if v:
                 out.append(v)
@@ -2170,6 +2225,37 @@ class Spider:
         if not pc:
             pc = page + 1 if out else page
         return {"list": out, "page": page, "pagecount": pc,
+                "limit": len(out), "total": total or len(out)}
+
+    def _ltx_static_list(self, sort, page):
+        """LTX 静态快照兜底（网页 LtxPage 同款路径）：
+        /data/ltx/index.json 给 total/pageCount 与 date|update 分页文件表，
+        /data/ltx/{sort}/page-N.json 每页 24 条，字段与实时接口一致
+        （number/title/publishDate/coverUrl/javdbId/ed2k/...），_ltx_item 直接复用。"""
+        idx = None
+        hit = self._ltx_idx_cache
+        if isinstance(hit, tuple) and time.time() - hit[0] < 300:
+            idx = hit[1]
+        if idx is None:
+            idx = self._site_api("/data/ltx/index.json")
+            if not isinstance(idx, dict) or not idx.get("date"):
+                # 索引也拿不到（静态路径不存在/网络断）→ 保持原实时接口空结果语义
+                return {"list": [], "page": page, "pagecount": page,
+                        "limit": 0, "total": 0}
+            self._ltx_idx_cache = (time.time(), idx)
+        files = idx.get(sort) if sort in ("date", "update") else None
+        if not isinstance(files, list) or not files:
+            files = idx.get("date") or []
+        pc = len(files)
+        out = []
+        if 1 <= page <= pc:
+            data = self._site_api("/data/ltx/%s/%s" % (sort, files[page - 1]))
+            for it in (data.get("items") if isinstance(data, dict) else None) or []:
+                v = self._ltx_item(it)
+                if v:
+                    out.append(v)
+        total = _safe_int(idx.get("total"), 0)
+        return {"list": out, "page": page, "pagecount": pc or page,
                 "limit": len(out), "total": total or len(out)}
 
     def _ltx_item(self, it):
@@ -2828,7 +2914,9 @@ class Spider:
         if not number:
             return {"list": []}
         it = self._ltx_items.get(number)
-        if not it:
+        if not it and time.time() - self._ltx_api_dead >= 300:
+            # 实时接口冷却期内不再探活（每次白等整轮 host 超时）；列表期
+            # 已把条目缓存进 _ltx_items，正常点进详情不走这里。
             data = self._site_api("/api/ltx/list",
                                   {"page": 1, "page_size": 24, "q": number})
             rows = data.get("items") if isinstance(data, dict) else None
