@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.5.8"
-# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商海报网格加「可用性」筛选——网页原样筛选（网页 EntityMoviesPage 实体页只有这一组：全部/可播放/含磁链/含字幕；filter_by 第4段；盒子上先在列表选好再点进实体即生效）+修复「全部」分类排序筛选失效（_latest_list 补传 sort_by）；v1.4.17，实体网格筛选补全为可用性+时长+标签组（标签取四类并集修跨类型返空；时长客户端过滤+按(base,dur)缓存）；v1.4.18，未登录三播放源修复——详情接口被 JWT 拦截后降级 javdb580 HTML + /v1/movies/{id}/magnets 磁力 + /api/dmm/preview 预览（伪链播放时逐候选探测），列表期补 id→番号/标题缓存，搜索 HTML 兜底，热播回退 /v1/rankings/playback，HOST 换 catembylegacy；v1.5.0，新增「AI栏目」「LTX破解」两个分类（排在热播前面，与网页端 /drama、/ltx 对齐）——AI走 /api/v/drama/{categories,feed,详情}，选集 dramap_ 播放时 playlist→play 逐级取链，封面 AES-128-CBC 解码（cryptography/PyCryptodome/纯 Python 三级兜底）；LTX 走 /api/ltx/list，有 javdbId 直接复用 JavDB 详情三播放源，纯 magnet 给磁力+115，纯 ed2k 不生成播放项（网页同样只给复制）；v1.5.1，更新说明补记备用镜像域名：https://javdb.com、https://javdb581.com、https://javdb582.com；v1.5.2，修复AI栏目列表封面不出图——删 img_proxy 短路（外部反代拿到AES密文只会坏图），出图改走 localProxy 优先（有 siteKey 或本地代理为 http:// 形式即生成 token URL，不再把 siteKey 当前提），两者都没有时列表允许内联 data URI 并按模式分流页宽（localProxy 24 / 内联默认6，ext dramaPageSize 可配1-24，单图超700KB留空防JSON撑爆），解密失败留空不回传密文地址；v1.5.4，AI栏目封面补全 deepseek 方案遗漏——①整页 base64 预算（ext dramaBudget 单位KB，默认1536KB，超预算条目留空不整页丢）；②ext dramaBigPic=1 放开列表单图700KB上限；③drama_pic 打 trace（raw/b64/ms + FAIL/SKIP）+ __main__ 强制 pure 后端自检（出图数/耗时/proxy泄漏）；v1.5.5，修复AI栏目整片无图（真机根因=解密太慢被超时掐掉）——AES后端新增 Android/TVBox（Chaquopy）javax.crypto native 实现并置于首位（270KB封面毫秒级解密，失败回落纯Python），纯Python仅作最后兜底；内联模式页宽改按 base64 预算反推（默认1536KB≈4张，防前几张吃光预算后几张留空），纯后端再压到4张；v1.5.6，AI栏目封面彻底绕开宿主取图链路——①新增自建图片 HTTP 服务（标准库 ThreadingHTTPServer，仅监听 127.0.0.1，路径 /pic/<token>.jpg），vod_pic 直接给短 http 地址，不再依赖 ?do=py 路由或 data URI 支持；②Android 端用 android.graphics 把 1440x1920 封面原生降采样到 ≤540px 再交付/缓存（原图单张位图约11MB，一屏十几张在电视盒子上直接解码失败=整栏白图），磁盘缓存加 v2 后缀强制重建；③图片会话为空时退化为直连，destroy 后重建实例仍可取图；v1.5.7，出图链路加固——①服务探活改走 ProxyHandler({}) 绕开系统 http_proxy（否则配了代理又没写 no_proxy 时 127.0.0.1 被丢给代理，会误判服务不可用而白白退化）；②降采样目标改为 720px 并修正 inSampleSize 取 2 的幂的判断（原写法实际只降一半，位图仍 2.7MB/张）；③单张取图异常只回 404，不再打死服务线程；④磁盘缓存按 mtime 裁到 400 条（约 32MB 封顶）；⑤清掉 `if max_raw <= 0 or True`、`_aes_backend() is None` 两处死代码；v1.5.8，修复「LTX破解」「排行榜」两分类空列表——①LTX 实时接口 /api/ltx/list 被镜像 D1 日读配额打挂（500 ltx_query_failed）→ 回退官方 LtxPage 同款静态快照 /data/ltx/{date|update}/page-N.json（index.json 索引 300s 缓存），失败后 _ltx_api_dead 冷却 300s 免每页白等整轮 host 探活，详情冷却期内跳过 q= 实时查询；②排行榜 /v1/rankings{/playback} 上游转登录墙（JWTVerificationError）→ playback 模式降级站点公开榜 /api/hot（period 日/周/月→day/week/month），类型榜先 /api/hot 按 video_type 过滤、窗口内无该类型条目（如欧美）再兜 /v1/movies/latest?type=N（四类公开实测可取）；TOP250 静态快照路径不变；③自检出图断言改走 _pic_mime（上游封面已出现 PNG，原 JPEG 魔数硬断言把合法 PNG 误报 FAIL）；
+VERSION = "1.5.9"
+# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商海报网格加「可用性」筛选——网页原样筛选（网页 EntityMoviesPage 实体页只有这一组：全部/可播放/含磁链/含字幕；filter_by 第4段；盒子上先在列表选好再点进实体即生效）+修复「全部」分类排序筛选失效（_latest_list 补传 sort_by）；v1.4.17，实体网格筛选补全为可用性+时长+标签组（标签取四类并集修跨类型返空；时长客户端过滤+按(base,dur)缓存）；v1.4.18，未登录三播放源修复——详情接口被 JWT 拦截后降级 javdb580 HTML + /v1/movies/{id}/magnets 磁力 + /api/dmm/preview 预览（伪链播放时逐候选探测），列表期补 id→番号/标题缓存，搜索 HTML 兜底，热播回退 /v1/rankings/playback，HOST 换 catembylegacy；v1.5.0，新增「AI栏目」「LTX破解」两个分类（排在热播前面，与网页端 /drama、/ltx 对齐）——AI走 /api/v/drama/{categories,feed,详情}，选集 dramap_ 播放时 playlist→play 逐级取链，封面 AES-128-CBC 解码（cryptography/PyCryptodome/纯 Python 三级兜底）；LTX 走 /api/ltx/list，有 javdbId 直接复用 JavDB 详情三播放源，纯 magnet 给磁力+115，纯 ed2k 不生成播放项（网页同样只给复制）；v1.5.1，更新说明补记备用镜像域名：https://javdb.com、https://javdb581.com、https://javdb582.com；v1.5.2，修复AI栏目列表封面不出图——删 img_proxy 短路（外部反代拿到AES密文只会坏图），出图改走 localProxy 优先（有 siteKey 或本地代理为 http:// 形式即生成 token URL，不再把 siteKey 当前提），两者都没有时列表允许内联 data URI 并按模式分流页宽（localProxy 24 / 内联默认6，ext dramaPageSize 可配1-24，单图超700KB留空防JSON撑爆），解密失败留空不回传密文地址；v1.5.4，AI栏目封面补全 deepseek 方案遗漏——①整页 base64 预算（ext dramaBudget 单位KB，默认1536KB，超预算条目留空不整页丢）；②ext dramaBigPic=1 放开列表单图700KB上限；③drama_pic 打 trace（raw/b64/ms + FAIL/SKIP）+ __main__ 强制 pure 后端自检（出图数/耗时/proxy泄漏）；v1.5.5，修复AI栏目整片无图（真机根因=解密太慢被超时掐掉）——AES后端新增 Android/TVBox（Chaquopy）javax.crypto native 实现并置于首位（270KB封面毫秒级解密，失败回落纯Python），纯Python仅作最后兜底；内联模式页宽改按 base64 预算反推（默认1536KB≈4张，防前几张吃光预算后几张留空），纯后端再压到4张；v1.5.6，AI栏目封面彻底绕开宿主取图链路——①新增自建图片 HTTP 服务（标准库 ThreadingHTTPServer，仅监听 127.0.0.1，路径 /pic/<token>.jpg），vod_pic 直接给短 http 地址，不再依赖 ?do=py 路由或 data URI 支持；②Android 端用 android.graphics 把 1440x1920 封面原生降采样到 ≤540px 再交付/缓存（原图单张位图约11MB，一屏十几张在电视盒子上直接解码失败=整栏白图），磁盘缓存加 v2 后缀强制重建；③图片会话为空时退化为直连，destroy 后重建实例仍可取图；v1.5.7，出图链路加固——①服务探活改走 ProxyHandler({}) 绕开系统 http_proxy（否则配了代理又没写 no_proxy 时 127.0.0.1 被丢给代理，会误判服务不可用而白白退化）；②降采样目标改为 720px 并修正 inSampleSize 取 2 的幂的判断（原写法实际只降一半，位图仍 2.7MB/张）；③单张取图异常只回 404，不再打死服务线程；④磁盘缓存按 mtime 裁到 400 条（约 32MB 封顶）；⑤清掉 `if max_raw <= 0 or True`、`_aes_backend() is None` 两处死代码；v1.5.8，修复「LTX破解」「排行榜」两分类空列表——①LTX 实时接口 /api/ltx/list 被镜像 D1 日读配额打挂（500 ltx_query_failed）→ 回退官方 LtxPage 同款静态快照 /data/ltx/{date|update}/page-N.json（index.json 索引 300s 缓存），失败后 _ltx_api_dead 冷却 300s 免每页白等整轮 host 探活，详情冷却期内跳过 q= 实时查询；②排行榜 /v1/rankings{/playback} 上游转登录墙（JWTVerificationError）→ playback 模式降级站点公开榜 /api/hot（period 日/周/月→day/week/month），类型榜先 /api/hot 按 video_type 过滤、窗口内无该类型条目（如欧美）再兜 /v1/movies/latest?type=N（四类公开实测可取）；TOP250 静态快照路径不变；③自检出图断言改走 _pic_mime（上游封面已出现 PNG，原 JPEG 魔数硬断言把合法 PNG 误报 FAIL）；v1.5.9，未登录播放源补全——①LTX破解 javdbId 详情被登录墙/磁力 JWT 拦成空壳时不再早退，回落 LTX 自带 magnet/ed2k 补播放项（保留 JavDB 元数据/预览）；②纯 ed2k 条目生成115离线（115 add 收任意 URL 含 ed2k://）+ ed2k 直链播放项（网页有链接客户端即显示，TVBox 播不了 ed2k 协议仅供复制）；③列表期缓存 magnets_count，详情磁力为空时提示「网页有N条磁力，未登录不返回」；
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 import os
 import re
@@ -1317,6 +1317,7 @@ class Spider:
             "duration": _safe_int(m.get("duration"), 0),
             "release_date": date,
             "score": score,
+            "magnets_count": magnets,
         }
         return {
             "vod_id": mid,
@@ -2756,6 +2757,12 @@ class Spider:
             info_lines.append("演员: %s" % "、".join(actors))
         if tags:
             info_lines.append("类别: %s" % "、".join(tags))
+        if not magnets:
+            _mc = _safe_int(cache.get("magnets_count"), 0)
+            if _mc:
+                # 未登录时磁力接口被 JWT 拦、HTML 详情登录墙 → 至少告知网页有几条
+                info_lines.append(
+                    "网页有%d条磁力，未登录不返回（配置有效JavDB Cookie后可见）" % _mc)
         # 相关区块（对齐网页）：TA还出演过 / 相关推荐 / 相关清单（均为文字；TVBox 详情页不支持可点海报网格）
         for _rl in (
             self._movie_refs_line(movie.get("actor_movies"), "TA还出演过"),
@@ -2932,22 +2939,29 @@ class Spider:
         if not isinstance(it, dict):
             return {"list": []}
 
+        ed2k = _to_text(it.get("ed2k") or "")
         javdb_id = _to_text(it.get("javdbId") or "")
+        base = None
         if javdb_id:
             try:
                 d = self.detailContent([javdb_id])
                 lst = d.get("list") if isinstance(d, dict) else None
                 if lst:
-                    return {"list": lst}
+                    base = lst[0]
+                    # 未登录时 JavDB 详情常被登录墙/磁力 JWT 拦成「只有标题壳」
+                    # （无播放源或仅预览）→ 不早退，落到下面用 LTX 自带
+                    # magnet/ed2k 补播放项，网页有链接客户端才不会空白。
+                    pf = _to_text(base.get("vod_play_from") or "")
+                    if not ed2k or "磁力" in pf or "115离线" in pf:
+                        return {"list": [base]}
             except Exception:
-                pass
+                base = None
 
         title = _to_text(it.get("title") or "")
         name = "[%s] %s" % (number, title) if title else number
         cover = _to_text(it.get("coverUrl") or it.get("thumbUrl") or "")
         date = _to_text(it.get("publishDate") or "")
         size = _safe_int(it.get("sizeBytes"), 0)
-        ed2k = _to_text(it.get("ed2k") or "")
         tags = [t for t in (it.get("tags") or []) if isinstance(t, str)]
 
         info = ["番号: %s" % number]
@@ -2964,8 +2978,7 @@ class Spider:
 
         play_from, play_url = [], []
         if ed2k.startswith("magnet:"):
-            # 网页本身也不播放 LTX：有 magnet 就给磁力/115两条源，
-            # 纯 ed2k:// 条目 TVBox 播不了（115 也未验证收 ed2k）→ 不生成播放项。
+            # 网页本身也不播放 LTX：有 magnet 就给磁力/115两条源。
             if self.enable_magnet:
                 play_from.append("磁力")
                 play_url.append("磁力$%s" % _sanitize_play(ed2k))
@@ -2975,6 +2988,35 @@ class Spider:
                 play_url.append("115离线$%s%s%s?t=%d" % (
                     _sanitize_play("LTX " + number), OFF_PREFIX_115, b64,
                     int(time.time())))
+        elif ed2k.startswith("ed2k://"):
+            # 纯 ed2k：网页给了链接客户端就显示（只考虑未登录场景）——
+            # ①115离线（115 add 接口收任意 URL，含 ed2k://）
+            # ②ed2k 直链项（TVBox 播不了该协议，供复制/第三方播放器）
+            if self.enable_offline_115:
+                b64 = _off_id_encode(ed2k, name, "LTX", number)
+                play_from.append("115离线")
+                play_url.append("115离线$%s%s%s?t=%d" % (
+                    _sanitize_play("LTX " + number), OFF_PREFIX_115, b64,
+                    int(time.time())))
+            if self.enable_magnet:
+                play_from.append("ed2k")
+                play_url.append("ed2k$%s" % _sanitize_play(ed2k))
+
+        if base is not None:
+            # JavDB 壳条目（未登录拿不到磁力）：保留其元数据/预览，补 LTX 播放项
+            if play_from:
+                bf = [x for x in _to_text(base.get("vod_play_from") or "")
+                      .split("$$$") if x]
+                bu = [x for x in _to_text(base.get("vod_play_url") or "")
+                      .split("$$$") if x]
+                base["vod_play_from"] = "$$$".join(bf + play_from)
+                base["vod_play_url"] = "$$$".join(bu + play_url)
+                if ed2k and not ed2k.startswith("magnet:"):
+                    extra = "链接: %s" % ed2k
+                    for _k in ("vod_content", "vod_desc"):
+                        _v = _to_text(base.get(_k) or "")
+                        base[_k] = (_v + "\n" + extra) if _v else extra
+            return {"list": [base]}
 
         vod = {
             "vod_id": LTX_PREFIX + number,
