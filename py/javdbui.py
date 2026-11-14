@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.5.4"
-# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商海报网格加「可用性」筛选——网页原样筛选（网页 EntityMoviesPage 实体页只有这一组：全部/可播放/含磁链/含字幕；filter_by 第4段；盒子上先在列表选好再点进实体即生效）+修复「全部」分类排序筛选失效（_latest_list 补传 sort_by）；v1.4.17，实体网格筛选补全为可用性+时长+标签组（标签取四类并集修跨类型返空；时长客户端过滤+按(base,dur)缓存）；v1.4.18，未登录三播放源修复——详情接口被 JWT 拦截后降级 javdb580 HTML + /v1/movies/{id}/magnets 磁力 + /api/dmm/preview 预览（伪链播放时逐候选探测），列表期补 id→番号/标题缓存，搜索 HTML 兜底，热播回退 /v1/rankings/playback，HOST 换 catembylegacy；v1.5.0，新增「AI栏目」「LTX破解」两个分类（排在热播前面，与网页端 /drama、/ltx 对齐）——AI走 /api/v/drama/{categories,feed,详情}，选集 dramap_ 播放时 playlist→play 逐级取链，封面 AES-128-CBC 解码（cryptography/PyCryptodome/纯 Python 三级兜底）；LTX 走 /api/ltx/list，有 javdbId 直接复用 JavDB 详情三播放源，纯 magnet 给磁力+115，纯 ed2k 不生成播放项（网页同样只给复制）；v1.5.1，更新说明补记备用镜像域名：https://javdb.com、https://javdb581.com、https://javdb582.com；v1.5.2，修复AI栏目列表封面不出图——删 img_proxy 短路（外部反代拿到AES密文只会坏图），出图改走 localProxy 优先（有 siteKey 或本地代理为 http:// 形式即生成 token URL，不再把 siteKey 当前提），两者都没有时列表允许内联 data URI 并按模式分流页宽（localProxy 24 / 内联默认6，ext dramaPageSize 可配1-24，单图超700KB留空防JSON撑爆），解密失败留空不回传密文地址；v1.5.4，AI栏目封面补全 deepseek 方案遗漏——①整页 base64 预算（ext dramaBudget 单位KB，默认1536KB，超预算条目留空不整页丢）；②ext dramaBigPic=1 放开列表单图700KB上限；③drama_pic 打 trace（raw/b64/ms + FAIL/SKIP）+ __main__ 强制 pure 后端自检（出图数/耗时/proxy泄漏）；
+VERSION = "1.5.5"
+# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商海报网格加「可用性」筛选——网页原样筛选（网页 EntityMoviesPage 实体页只有这一组：全部/可播放/含磁链/含字幕；filter_by 第4段；盒子上先在列表选好再点进实体即生效）+修复「全部」分类排序筛选失效（_latest_list 补传 sort_by）；v1.4.17，实体网格筛选补全为可用性+时长+标签组（标签取四类并集修跨类型返空；时长客户端过滤+按(base,dur)缓存）；v1.4.18，未登录三播放源修复——详情接口被 JWT 拦截后降级 javdb580 HTML + /v1/movies/{id}/magnets 磁力 + /api/dmm/preview 预览（伪链播放时逐候选探测），列表期补 id→番号/标题缓存，搜索 HTML 兜底，热播回退 /v1/rankings/playback，HOST 换 catembylegacy；v1.5.0，新增「AI栏目」「LTX破解」两个分类（排在热播前面，与网页端 /drama、/ltx 对齐）——AI走 /api/v/drama/{categories,feed,详情}，选集 dramap_ 播放时 playlist→play 逐级取链，封面 AES-128-CBC 解码（cryptography/PyCryptodome/纯 Python 三级兜底）；LTX 走 /api/ltx/list，有 javdbId 直接复用 JavDB 详情三播放源，纯 magnet 给磁力+115，纯 ed2k 不生成播放项（网页同样只给复制）；v1.5.1，更新说明补记备用镜像域名：https://javdb.com、https://javdb581.com、https://javdb582.com；v1.5.2，修复AI栏目列表封面不出图——删 img_proxy 短路（外部反代拿到AES密文只会坏图），出图改走 localProxy 优先（有 siteKey 或本地代理为 http:// 形式即生成 token URL，不再把 siteKey 当前提），两者都没有时列表允许内联 data URI 并按模式分流页宽（localProxy 24 / 内联默认6，ext dramaPageSize 可配1-24，单图超700KB留空防JSON撑爆），解密失败留空不回传密文地址；v1.5.4，AI栏目封面补全 deepseek 方案遗漏——①整页 base64 预算（ext dramaBudget 单位KB，默认1536KB，超预算条目留空不整页丢）；②ext dramaBigPic=1 放开列表单图700KB上限；③drama_pic 打 trace（raw/b64/ms + FAIL/SKIP）+ __main__ 强制 pure 后端自检（出图数/耗时/proxy泄漏）；v1.5.5，修复AI栏目整片无图（真机根因=解密太慢被超时掐掉）——AES后端新增 Android/TVBox（Chaquopy）javax.crypto native 实现并置于首位（270KB封面毫秒级解密，失败回落纯Python），纯Python仅作最后兜底；内联模式页宽改按 base64 预算反推（默认1536KB≈4张，防前几张吃光预算后几张留空），纯后端再压到4张；
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 import os
 import re
@@ -92,6 +92,9 @@ DRAMA_INLINE_MAX = 700 * 1024
 # 内联模式整页 base64 预算（deepseek 方案③）：超预算的条目本轮留空、不整页丢弃。
 # 4 张 JPEG ≈ 1.4MB b64，默认 1536KB 能装下 4 张常规封面；ext dramaBudget 可配（单位 KB）。
 DRAMA_INLINE_BUDGET = 1536 * 1024
+# 单张封面 base64 后的经验体积（实测 190~375KB，取 380KB）：内联模式按预算反推页宽，
+# 免得预算被前几张吃光、后几张封面留空。
+DRAMA_INLINE_B64_EST = 380 * 1024
 
 # API 签名常量（从前端 JS bundle 逆出）
 JD_SALT = "lpw6vgqzsp"
@@ -579,19 +582,27 @@ for _i, _v in enumerate(_AES_SBOX):
 
 
 def _aes_backend():
-    """可用的 AES-128-CBC 后端名；探测一次后缓存（纯 Python 恒可用）。"""
+    """可用的 AES-128-CBC 后端名；探测一次后缓存（纯 Python 恒可用）。
+    顺序：Android/TVBox（Chaquopy）的 javax.crypto → cryptography → PyCryptodome
+    → 纯 Python。盒子/电视上前两者通常都没有，纯 Python 约 110KB/s，一张 270KB
+    封面要 2.5s，一页 6 张直接撞宿主 15s 超时 → AI 栏目整片无图；走 Java 侧
+    native AES 只要几毫秒，是 AI 封面在真机上唯一能稳稳出图的路径。"""
     if _AES_BACKEND:
         return _AES_BACKEND[0]
     name = "pure"
     try:
-        from cryptography.hazmat.primitives.ciphers import Cipher  # noqa: F401
-        name = "cryptography"
+        from javax.crypto import Cipher  # noqa: F401
+        name = "java"
     except Exception:
         try:
-            from Crypto.Cipher import AES  # noqa: F401
-            name = "crypto"
+            from cryptography.hazmat.primitives.ciphers import Cipher  # noqa: F401
+            name = "cryptography"
         except Exception:
-            name = "pure"
+            try:
+                from Crypto.Cipher import AES  # noqa: F401
+                name = "crypto"
+            except Exception:
+                name = "pure"
     _AES_BACKEND.append(name)
     return name
 
@@ -778,6 +789,21 @@ def _aes128_cbc_decrypt(data, key, iv):
     if not data or len(data) % 16 or len(key) != 16 or len(iv) != 16:
         return b""
     backend = _aes_backend()
+    if backend == "java":
+        # Chaquopy：Java 侧 native AES，GIL 还会在此期间释放，多图并发不吃亏；
+        # 失败（个别 ROM 缺 provider）就回落到纯 Python，不能直接返回空图。
+        try:
+            from javax.crypto import Cipher
+            from javax.crypto.spec import SecretKeySpec, IvParameterSpec
+            c = Cipher.getInstance("AES/CBC/NoPadding")
+            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"),
+                   IvParameterSpec(iv))
+            out = c.doFinal(data)
+            if isinstance(out, (bytes, bytearray)):
+                return bytes(out)
+            return bytes(bytearray(out))     # jarray('b') 兜底
+        except Exception:
+            return _aes_pure_decrypt(data, key, iv)
     try:
         if backend == "cryptography":
             from cryptography.hazmat.primitives.ciphers import (
@@ -788,7 +814,7 @@ def _aes128_cbc_decrypt(data, key, iv):
             from Crypto.Cipher import AES
             return AES.new(key, AES.MODE_CBC, iv).decrypt(data)
     except Exception:
-        return b""
+        return _aes_pure_decrypt(data, key, iv)
     return _aes_pure_decrypt(data, key, iv)
 
 
@@ -1843,12 +1869,16 @@ class Spider:
         if sort not in ("new", "hot"):
             sort = "new"
         # 页宽按出图模式分流：localProxy 模式 JSON 只放 URL 用 24；
-        # 内联 data URI 模式用小页宽（默认 6，ext dramaPageSize 可配）防 JSON 撑爆。
-        # 纯 Python 后端（TVBox 无 cryptography）解密约 110KB/s，6 张≈10s 易撞
-        # 宿主 15s 超时 → 自动收到 4 张（ext dramaPageSize 可再调小）。
-        size = 24 if self._drama_use_localproxy() else self._drama_inline_size
-        if size > 4 and _aes_backend() == "pure" and not self._drama_use_localproxy():
-            size = 4
+        # 内联 data URI 模式由预算反推页宽（默认 1536KB 能装 4 张），避免前几张
+        # 吃光预算、后几张留空；纯 Python 后端（盒子 ~110KB/s）再压到 4 张，
+        # 否则整页要 10s+ 会撞宿主 15s 超时 → 整栏无图。
+        if self._drama_use_localproxy():
+            size = 24
+        else:
+            size = min(self._drama_inline_size,
+                       max(1, self._drama_inline_budget // DRAMA_INLINE_B64_EST))
+            if _aes_backend() == "pure":
+                size = min(size, 4)
         data = self._site_api("/api/v/drama/feed", {
             "cate": cate, "page": page, "size": size, "sort": sort})
         items = data.get("items") if isinstance(data, dict) else None
