@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.5.6"
-# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商海报网格加「可用性」筛选——网页原样筛选（网页 EntityMoviesPage 实体页只有这一组：全部/可播放/含磁链/含字幕；filter_by 第4段；盒子上先在列表选好再点进实体即生效）+修复「全部」分类排序筛选失效（_latest_list 补传 sort_by）；v1.4.17，实体网格筛选补全为可用性+时长+标签组（标签取四类并集修跨类型返空；时长客户端过滤+按(base,dur)缓存）；v1.4.18，未登录三播放源修复——详情接口被 JWT 拦截后降级 javdb580 HTML + /v1/movies/{id}/magnets 磁力 + /api/dmm/preview 预览（伪链播放时逐候选探测），列表期补 id→番号/标题缓存，搜索 HTML 兜底，热播回退 /v1/rankings/playback，HOST 换 catembylegacy；v1.5.0，新增「AI栏目」「LTX破解」两个分类（排在热播前面，与网页端 /drama、/ltx 对齐）——AI走 /api/v/drama/{categories,feed,详情}，选集 dramap_ 播放时 playlist→play 逐级取链，封面 AES-128-CBC 解码（cryptography/PyCryptodome/纯 Python 三级兜底）；LTX 走 /api/ltx/list，有 javdbId 直接复用 JavDB 详情三播放源，纯 magnet 给磁力+115，纯 ed2k 不生成播放项（网页同样只给复制）；v1.5.1，更新说明补记备用镜像域名：https://javdb.com、https://javdb581.com、https://javdb582.com；v1.5.2，修复AI栏目列表封面不出图——删 img_proxy 短路（外部反代拿到AES密文只会坏图），出图改走 localProxy 优先（有 siteKey 或本地代理为 http:// 形式即生成 token URL，不再把 siteKey 当前提），两者都没有时列表允许内联 data URI 并按模式分流页宽（localProxy 24 / 内联默认6，ext dramaPageSize 可配1-24，单图超700KB留空防JSON撑爆），解密失败留空不回传密文地址；v1.5.4，AI栏目封面补全 deepseek 方案遗漏——①整页 base64 预算（ext dramaBudget 单位KB，默认1536KB，超预算条目留空不整页丢）；②ext dramaBigPic=1 放开列表单图700KB上限；③drama_pic 打 trace（raw/b64/ms + FAIL/SKIP）+ __main__ 强制 pure 后端自检（出图数/耗时/proxy泄漏）；v1.5.5，修复AI栏目整片无图（真机根因=解密太慢被超时掐掉）——AES后端新增 Android/TVBox（Chaquopy）javax.crypto native 实现并置于首位（270KB封面毫秒级解密，失败回落纯Python），纯Python仅作最后兜底；内联模式页宽改按 base64 预算反推（默认1536KB≈4张，防前几张吃光预算后几张留空），纯后端再压到4张；v1.5.6，AI栏目封面彻底绕开宿主取图链路——①新增自建图片 HTTP 服务（标准库 ThreadingHTTPServer，仅监听 127.0.0.1，路径 /pic/<token>.jpg），vod_pic 直接给短 http 地址，不再依赖 ?do=py 路由或 data URI 支持；②Android 端用 android.graphics 把 1440x1920 封面原生降采样到 ≤540px 再交付/缓存（原图单张位图约11MB，一屏十几张在电视盒子上直接解码失败=整栏白图），磁盘缓存加 v2 后缀强制重建；③图片会话为空时退化为直连，destroy 后重建实例仍可取图；
+VERSION = "1.5.7"
+# v1.4.6无代理，基础版，在at首页无图；v1.4.12，需代理显示图片；v1.4.13，更改了出图实现，在at首页头像若不出图需填代理；v1.4.14，转存文件名前增加了番号；v1.4.15，代码清理（搜索分页/删死代码/重复导入/verify可配/磁力label去重/自检入口）；v1.4.16，演员/系列/片商海报网格加「可用性」筛选——网页原样筛选（网页 EntityMoviesPage 实体页只有这一组：全部/可播放/含磁链/含字幕；filter_by 第4段；盒子上先在列表选好再点进实体即生效）+修复「全部」分类排序筛选失效（_latest_list 补传 sort_by）；v1.4.17，实体网格筛选补全为可用性+时长+标签组（标签取四类并集修跨类型返空；时长客户端过滤+按(base,dur)缓存）；v1.4.18，未登录三播放源修复——详情接口被 JWT 拦截后降级 javdb580 HTML + /v1/movies/{id}/magnets 磁力 + /api/dmm/preview 预览（伪链播放时逐候选探测），列表期补 id→番号/标题缓存，搜索 HTML 兜底，热播回退 /v1/rankings/playback，HOST 换 catembylegacy；v1.5.0，新增「AI栏目」「LTX破解」两个分类（排在热播前面，与网页端 /drama、/ltx 对齐）——AI走 /api/v/drama/{categories,feed,详情}，选集 dramap_ 播放时 playlist→play 逐级取链，封面 AES-128-CBC 解码（cryptography/PyCryptodome/纯 Python 三级兜底）；LTX 走 /api/ltx/list，有 javdbId 直接复用 JavDB 详情三播放源，纯 magnet 给磁力+115，纯 ed2k 不生成播放项（网页同样只给复制）；v1.5.1，更新说明补记备用镜像域名：https://javdb.com、https://javdb581.com、https://javdb582.com；v1.5.2，修复AI栏目列表封面不出图——删 img_proxy 短路（外部反代拿到AES密文只会坏图），出图改走 localProxy 优先（有 siteKey 或本地代理为 http:// 形式即生成 token URL，不再把 siteKey 当前提），两者都没有时列表允许内联 data URI 并按模式分流页宽（localProxy 24 / 内联默认6，ext dramaPageSize 可配1-24，单图超700KB留空防JSON撑爆），解密失败留空不回传密文地址；v1.5.4，AI栏目封面补全 deepseek 方案遗漏——①整页 base64 预算（ext dramaBudget 单位KB，默认1536KB，超预算条目留空不整页丢）；②ext dramaBigPic=1 放开列表单图700KB上限；③drama_pic 打 trace（raw/b64/ms + FAIL/SKIP）+ __main__ 强制 pure 后端自检（出图数/耗时/proxy泄漏）；v1.5.5，修复AI栏目整片无图（真机根因=解密太慢被超时掐掉）——AES后端新增 Android/TVBox（Chaquopy）javax.crypto native 实现并置于首位（270KB封面毫秒级解密，失败回落纯Python），纯Python仅作最后兜底；内联模式页宽改按 base64 预算反推（默认1536KB≈4张，防前几张吃光预算后几张留空），纯后端再压到4张；v1.5.6，AI栏目封面彻底绕开宿主取图链路——①新增自建图片 HTTP 服务（标准库 ThreadingHTTPServer，仅监听 127.0.0.1，路径 /pic/<token>.jpg），vod_pic 直接给短 http 地址，不再依赖 ?do=py 路由或 data URI 支持；②Android 端用 android.graphics 把 1440x1920 封面原生降采样到 ≤540px 再交付/缓存（原图单张位图约11MB，一屏十几张在电视盒子上直接解码失败=整栏白图），磁盘缓存加 v2 后缀强制重建；③图片会话为空时退化为直连，destroy 后重建实例仍可取图；v1.5.7，出图链路加固——①服务探活改走 ProxyHandler({}) 绕开系统 http_proxy（否则配了代理又没写 no_proxy 时 127.0.0.1 被丢给代理，会误判服务不可用而白白退化）；②降采样目标改为 720px 并修正 inSampleSize 取 2 的幂的判断（原写法实际只降一半，位图仍 2.7MB/张）；③单张取图异常只回 404，不再打死服务线程；④磁盘缓存按 mtime 裁到 400 条（约 32MB 封顶）；⑤清掉 `if max_raw <= 0 or True`、`_aes_backend() is None` 两处死代码；
 # javdbui.py —— JavDB Web UI (bbjavdb.emby.edu.kg) 爬虫 + 115 离线转存/直链播放
 import os
 import re
@@ -140,6 +140,22 @@ def _trace_write(text):
     try:
         with open(OFF_TRACE_FILE, "w", encoding="utf-8") as f:
             f.write(_to_text(text))
+    except Exception:
+        pass
+
+
+def _prune_pic_cache(keep=400):
+    """图片磁盘缓存按 mtime 裁到 keep 条：单张约 80KB，400 条约 32MB 封顶。"""
+    try:
+        paths = [os.path.join(PIC_DISK_DIR, n) for n in os.listdir(PIC_DISK_DIR)]
+        if len(paths) <= keep:
+            return
+        paths.sort(key=os.path.getmtime)      # 最旧在前
+        for p in paths[:len(paths) - keep]:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -868,7 +884,10 @@ def _pic_server_base(spider):
                         src = Spider._unpack_pic_token(tok)
                         cur = _PIC_SRV.get("spider")
                         if src and cur is not None:
-                            body, mime = cur._fetch_pic(src)
+                            try:
+                                body, mime = cur._fetch_pic(src)
+                            except Exception:
+                                body, mime = b"", ""   # 单张失败只回 404，别打死线程
                     if not body:
                         self.send_error(404)
                         return
@@ -894,11 +913,14 @@ def _pic_server_base(spider):
             t.daemon = True
             t.start()
             base = "http://127.0.0.1:%d" % httpd.server_address[1]
-            # 回环自检：个别运行时会「绑定成功但连不上」，探到 404 才算服务活着
+            # 回环自检：个别运行时会「绑定成功但连不上」，探到 404 才算服务活着。
+            # 必须绕开 http_proxy：配了系统代理又没写 no_proxy 时，urllib 会把
+            # 127.0.0.1 也丢给代理，探活会误判成「服务不可用」而白白退化。
             alive = False
             try:
                 import urllib.request as _urlreq
-                _urlreq.urlopen(base + "/pic/__probe__", timeout=3)
+                opener = _urlreq.build_opener(_urlreq.ProxyHandler({}))
+                opener.open(base + "/pic/__probe__", timeout=3)
             except Exception as e:
                 alive = getattr(e, "code", None) == 404
             if alive:
@@ -914,12 +936,14 @@ def _pic_server_base(spider):
         return _PIC_SRV["base"]
 
 
-def _shrink_pic(data, mime, max_w=540):
+def _shrink_pic(data, mime, max_w=720):
     """Android（Chaquopy）上把 1440x1920 的大封面原生降采样后再缓存/交付。
 
     实测 AI 封面明文是 1440x1920，一张解码后的位图约 11MB；列表一屏十几张，
     电视盒子的堆内存和解码器扛不住，典型表现就是「一栏封面全白」。电影封面
     （c0 明文小图）没这个问题，所以只针对这张链路。非 Android 环境原样返回。
+    inSampleSize 只能取 2 的幂，1440 → 720（位图 2.7MB、JPEG ~80KB），
+    既压住内存又保留海报清晰度。
     """
     if not data or not mime.startswith("image/jpeg"):
         return data, mime
@@ -933,7 +957,7 @@ def _shrink_pic(data, mime, max_w=540):
         if w <= 0 or w <= max_w:
             return data, mime
         sample = 1
-        while w // (sample * 2) >= max_w:
+        while (w // sample) > max_w:       # 取到「降完仍不超 max_w」的最小 2 的幂
             sample *= 2
         opts = BitmapFactory.Options()
         opts.inSampleSize = sample
@@ -2105,7 +2129,7 @@ class Spider:
                     return q + "&kind=image&token=%s" % quote(tok, safe="")
             except Exception:
                 pass                        # 落到内联分支
-        if not allow_inline or _aes_backend() is None:
+        if not allow_inline:
             return ""
         # 单图上限：列表默认 700KB，dramaBigPic=1 放开；详情页 max_inline=0 不封顶
         cap = 0 if (self._drama_big_pic or max_inline == 0) else max_inline
@@ -4223,21 +4247,21 @@ class Spider:
         # 1440x1920 原图，换键后自动重下重解成降采样小图，老缓存自然废弃。
         dkey = hashlib.md5((ckey + "|v2").encode("utf-8")).hexdigest()
         dpath = os.path.join(PIC_DISK_DIR, dkey)
-        if max_raw <= 0 or True:            # 磁盘命中不受 max_raw 限制（已解码成品）
-            try:
-                if os.path.isfile(dpath):
-                    with open(dpath, "rb") as f:
-                        blob = f.read()
-                    # 文件头 4 字节存 mime 长度+mime，其余为图片数据
-                    if len(blob) > 4:
-                        mlen = blob[0]
-                        mime = blob[1:1 + mlen].decode("ascii", "ignore")
-                        body = blob[1 + mlen:]
-                        if body:
-                            cache[ckey] = (now, body, mime)
-                            return body, mime
-            except Exception:
-                pass
+        # 磁盘里存的是解码后的成品，与 max_raw 无关，命中即回
+        try:
+            if os.path.isfile(dpath):
+                with open(dpath, "rb") as f:
+                    blob = f.read()
+                # 文件头 4 字节存 mime 长度+mime，其余为图片数据
+                if len(blob) > 4:
+                    mlen = blob[0]
+                    mime = blob[1:1 + mlen].decode("ascii", "ignore")
+                    body = blob[1 + mlen:]
+                    if body:
+                        cache[ckey] = (now, body, mime)
+                        return body, mime
+        except Exception:
+            pass
         headers = {
             "User-Agent": WEB_UA,
             "Referer": self.host + "/",
@@ -4276,6 +4300,10 @@ class Spider:
                 mb = (mime or "image/jpeg").encode("ascii", "ignore")[:200]
                 with open(dpath, "wb") as f:
                     f.write(bytes([len(mb)]) + mb + body)
+                # 缓存不设上限会一路涨（盒子存储有限），每 64 张清一次最旧的
+                self._pic_writes = getattr(self, "_pic_writes", 0) + 1
+                if self._pic_writes % 64 == 0:
+                    _prune_pic_cache()
             except Exception:
                 pass
         return body, mime
@@ -4405,13 +4433,18 @@ if __name__ == "__main__":
             len(lst), n_srv, n_inline, n_proxy, dt))
         got = b""
         first = next((x.get("vod_pic") for x in lst if x.get("vod_pic")), "")
-        if first.startswith("http://127.0.0.1") and requests:
+        if first.startswith("http://127.0.0.1"):
+            # 本地回环取图：用 urllib + 空 ProxyHandler，不依赖 requests 是否装着
             try:
-                r = requests.get(first, timeout=30, verify=False)
-                got = r.content if r.status_code == 200 else b""
+                import urllib.request as _urlreq
+                op = _urlreq.build_opener(_urlreq.ProxyHandler({}))
+                with op.open(first, timeout=30) as _r:
+                    got = _r.read()
             except Exception:
                 got = b""
-        if n_proxy:
+        if not lst:
+            print("drama SKIP: 列表为空（requests 未装或上游不可达）")
+        elif n_proxy:
             print("drama FAIL: proxy:// leaked")
         elif n_srv and got[:3] != b"\xff\xd8\xff":
             print("drama FAIL: pic server returned non-JPEG")
