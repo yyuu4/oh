@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
 #  更新简介（按修复先后排列，最新一条在最上面）
+#  22. pyflakes 全文静态扫描清理（无行为变化）：① 删死代码 _parse_ref——引用未定义
+#     _VIDEO_ID 且全库零调用方（h红果.py 源头亦无此函数，播放引用实际走
+#     _split_episode_token），一旦被调必 NameError；② 删重复定义 _aes_is_fast
+#     （L1096/L1100 两份逐字相同，后者遮蔽前者）；③ 删未使用的 quote_plus 导入；
+#     ④ 删 _dm_push_local 中多余的 global _DM_PUSHED（函数内只做 add/clear 方法
+#     调用、从不重新绑定名字，global 属冗余声明）。
 #  21. 红果(HG)对照 h红果.py v1.7.4 全文审查修复移植（甄别 11 项 → 适用 7 项）：
 #     ① _hg_cache_cleanup 重构：原「无 mp4 即 return」致孤儿 .tmp/.part 永不清（写失败
 #     残片只增不减）→ 清理无条件执行；.tmp 只删 mtime>60s（防误杀 _hg_cache_put 活跃
@@ -153,7 +159,7 @@ except Exception:
     class HTMLParser:
         pass
 from typing import Any
-from urllib.parse import parse_qs, quote, quote_plus, unquote, urlencode, urlparse, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse, urlsplit
 
 # ---- 单主机熔断（防卡死）----
 # 同一域名一旦出现连接级失败（超时/拒绝/SSL），60 秒内后续请求直接
@@ -1091,10 +1097,6 @@ def _hg_trace(msg: str) -> None:
             fh.write(line)
     except Exception:
         pass
-
-
-def _aes_is_fast() -> bool:
-    return AES_BACKEND in ("cryptography", "pycryptodome")
 
 
 def _aes_is_fast() -> bool:
@@ -4695,14 +4697,6 @@ def _decrypt_spade_url(value: str, key_seed: bytes) -> str:
             plaintext = plaintext[:-padding]
     return plaintext.rstrip(b"\0").decode("utf-8", errors="replace")
 
-def _parse_ref(value: str, prefix: str) -> str:
-    if not value.startswith(prefix):
-        raise HongguoPluginError("播放引用无效")
-    raw = value[len(prefix) :]
-    if not raw or not _VIDEO_ID.fullmatch(raw):
-        raise HongguoPluginError("播放引用格式无效")
-    return raw
-
 def _key_seed_from_model(model: Mapping[str, Any]) -> bytes:
     value = _text(model.get("key_seed"))
     if value:
@@ -5724,7 +5718,6 @@ def _dm_hit_touch(vid: str) -> None:
 
 def _dm_push_local(url: str, vid: str) -> None:
     """老壳可能不读 playerContent.danmaku，用壳自己的本地接口再推一次。"""
-    global _DM_PUSHED
     if not _DM_PUSH_LOCAL or not url:
         return
     with _DM_LOCKS:

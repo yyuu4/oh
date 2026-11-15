@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# 版本: 1.0.12
+# 版本: 1.0.13
 # 更新简介:
+#   v1.0.13
+#     - pyflakes 静态扫描清理: 删除未使用的 os / base64 导入 (全文件零引用,
+#       无行为变化)
 #   v1.0.12
 #     - 恢复 192.168.1.8:7144 自动探测 (代理优先); 仍须经真实请求校验,
 #       不再仅凭端口连通就采用
@@ -75,10 +78,8 @@
 # 约定: 以后每次更新递增版本号并在此追加一条更新简介 (最新在最上)
 
 import sys
-import os
 import re
 import json
-import base64
 import html as html_lib
 import urllib.request
 import urllib.parse

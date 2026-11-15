@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-VERSION = "1.7.4"
+VERSION = "1.7.5"
 VERSION_NOTE = (
+    "1.7.5 pyflakes 静态扫描清理：删 _dm_push_local 冗余 global _DM_PUSHED"
+    "（函数内只做 in/len/clear/add 方法调用、从不重新绑定名字，声明多余），无行为变化。"
     "1.7.4 全文审查两轮11修：① 资源泄漏两处——_dm_page 每请求新建 Session 不关闭、"
     "_dm_push_local 后台推送 Session 不关闭(32位 FD 泄漏)均补 try/finally 关闭；"
     "② 缓存竞态三处——_hg_cache_cleanup 原无条件删 .tmp 会误杀 _hg_cache_put 活跃写入"
@@ -5898,7 +5900,6 @@ def _dm_hit_touch(vid: str) -> None:
 
 def _dm_push_local(url: str, vid: str) -> None:
     """老壳可能不读 playerContent.danmaku，用壳自己的本地接口再推一次。"""
-    global _DM_PUSHED
     if not _DM_PUSH_LOCAL or not url:
         return
     with _DM_LOCKS:
