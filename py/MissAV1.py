@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# 版本: 1.0.10  (2026-11-11)
+# 版本: 1.0.12
 # 更新简介:
+#   v1.0.12
+#     - 恢复 192.168.1.8:7144 自动探测 (代理优先); 仍须经真实请求校验,
+#       不再仅凭端口连通就采用
+#   v1.0.11
+#     - 代理探测改为真实请求校验;
+#       坏代理返回 400/403/407/502/504 连续 2 次标死并直连重试
+#     - HEAD/OPTIONS 不再 501: HEAD 轻量返回路由头, OPTIONS 返回 Allow
+#     - 冷启动: 分类缓存单飞, /cat 与预热统一 5 页 (支持 ?pages=N),
+#       /all.m3u 只读已就绪缓存, 跳过 4 个纯文件夹分类
+#     - /seg 透传 Range, 支持 206/Content-Range 与本地切片兜底
+#     - ThreadingHTTPServer 3.6 回退; serve 捕获端口占用并明确提示
 #   v1.0.10 (2026-11-11)
 #     - 详情页线路扩为 4 条 (原序): 代理正片 / 正片专线 / 代理备用 / 备用线路
 #     - playerContent 按 flag 分流: 代理线清 _proxy_dead 再走反代, 不可用则回退直连;
@@ -160,6 +171,7 @@ class Spider(SpiderBase):
         self.baseHost = self.primaryHost
         self._proxy_ok = False
         self._proxy_dead = False   # 代理曾可用但连接层失败 → 改直连
+        self._proxy_fail = 0       # 代理出口连续 HTTP 错误计数 (400/403/407/502/504)
         self._prefer_direct = False
 
         self._ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -217,7 +229,8 @@ class Spider(SpiderBase):
         self.cj = http.cookiejar.CookieJar()
         self._build_opener()
 
-    # 局域网/本机常见代理端口, 依次探测, 通了就用 (抓取 missav.ws 需要; surrit CDN 播放不需要)
+    # 代理优先列表: 本机常见端口 + 指定的局域网 HTTP 代理。
+    # 端口连通只是候选, 还必须经 _proxy_works 真实请求通过才会采用。
     PROXY_PROBE = [
         ("127.0.0.1", 7890), ("127.0.0.1", 7897),
         ("127.0.0.1", 10172), ("127.0.0.1", 1072),
@@ -232,27 +245,40 @@ class Spider(SpiderBase):
         ]
         self._opener_direct = urllib.request.build_opener(*direct_handlers)
 
-        # 代理优先: ext 配置 {"proxy": "..."} > 探测列表
+        # 代理优先: ext 配置 {"proxy": "..."} > 本机探测 (真实请求校验)
         cfg_proxy = ""
         try:
             if isinstance(self.options, dict):
                 cfg_proxy = str(self.options.get("proxy") or "").strip()
         except Exception:
             pass
+
         proxy_url = cfg_proxy
         if not proxy_url:
-            import socket
-            for host, port in self.PROXY_PROBE:
-                try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.settimeout(0.3)
-                    if s.connect_ex((host, port)) == 0:
-                        proxy_url = "http://%s:%d" % (host, port)
+            now = _time.time()
+            with _PROXY_SELECTED_LOCK:
+                cached = dict(_PROXY_SELECTED)
+            if cached.get("done") and now - cached.get("ts", 0) < 60:
+                proxy_url = cached.get("url", "")
+            else:
+                import socket
+                for host, port in self.PROXY_PROBE:
+                    try:
+                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        s.settimeout(0.3)
+                        ok = s.connect_ex((host, port)) == 0
                         s.close()
-                        break
-                    s.close()
-                except Exception:
-                    pass
+                        if not ok:
+                            continue
+                        cand = "http://%s:%d" % (host, port)
+                        # 端口开着不等于 HTTP 代理: 必须经它真实抓一次页面
+                        if self._proxy_works(cand):
+                            proxy_url = cand
+                            break
+                    except Exception:
+                        pass
+                with _PROXY_SELECTED_LOCK:
+                    _PROXY_SELECTED.update({"ts": now, "url": proxy_url, "done": True})
 
         if proxy_url:
             self._proxy_ok = True
@@ -278,15 +304,40 @@ class Spider(SpiderBase):
             self.baseHost = self.primaryHost
             self._prefer_direct = True
 
+    def _proxy_works(self, proxy_url):
+        """自动探测到的端口必须真实可用: 经它抓一次站点页面才算代理。"""
+        try:
+            op = urllib.request.build_opener(
+                urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()),
+                urllib.request.HTTPSHandler(context=self.ctx),
+                urllib.request.ProxyHandler({'http': proxy_url, 'https': proxy_url}))
+        except Exception:
+            return False
+        for base in (self.PROXY_HOST, self.DIRECT_HOSTS[0]):
+            try:
+                req = urllib.request.Request(
+                    base + "/dm247/cn",
+                    headers={"User-Agent": self._ua, "Accept": "text/html",
+                             "Accept-Language": "zh-CN,zh;q=0.9"})
+                with op.open(req, timeout=3) as r:
+                    text = r.read(4096).decode("utf-8", "ignore")
+                    if (r.getcode() == 200 and len(text) > 500
+                            and "Just a moment" not in text):
+                        return True
+            except Exception:
+                continue
+        return False
+
     def _proxy_alive(self):
         """代理是否仍应使用: 已配置/探测到, 且未发生连接层死亡。"""
         return bool(self._proxy_ok and not self._proxy_dead and getattr(self, "_opener_proxy", None))
 
     def _mark_proxy_dead(self):
-        """代理连接层失败 → 本进程后续全部改直连 (隐藏 IP 优先, 连不上才降级)。"""
+        """代理连接层/出口异常 → 本进程后续全部改直连 (隐藏 IP 优先, 连不上才降级)。"""
         if self._proxy_ok and not self._proxy_dead:
             self._proxy_dead = True
             self._prefer_direct = True
+            self._proxy_fail = 0
             self.opener = getattr(self, "_opener_direct", None) or self.opener
 
     def _opener_for(self, host):
@@ -433,9 +484,17 @@ class Spider(SpiderBase):
                     except Exception:
                         raw = zlib.decompress(raw, -zlib.MAX_WBITS)
                 text = raw.decode("utf-8", errors="ignore")
+                self._proxy_fail = 0
                 return {"code": resp.getcode(), "text": text, "final_url": resp.geturl()}
         except urllib.error.HTTPError as e:
-            # HTTP 错误 = 代理已连通对端, 代理仍算存活
+            # HTTP 错误 = 代理已连通对端, 但 400/403/407/502/504 连续出现
+            # 说明代理自身/出口异常: 累计 2 次标死, 让 _fetch 用直连重试。
+            if self._proxy_alive() and e.code in (400, 403, 407, 502, 504):
+                self._proxy_fail += 1
+                if self._proxy_fail >= 2:
+                    self._mark_proxy_dead()
+            else:
+                self._proxy_fail = 0
             return {"code": e.code, "text": ""}
         except Exception as e:
             # 连接层失败 (拒绝/重置/超时) 才判代理死亡; HTTP 错误不算
@@ -1201,16 +1260,30 @@ class Spider(SpiderBase):
 import time as _time
 import threading as _threading
 import argparse as _argparse
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+try:
+    from http.server import ThreadingHTTPServer
+except ImportError:  # Python 3.6 (ThreadingHTTPServer 3.7 才加入)
+    class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+
 from urllib.parse import urljoin as _urljoin
 
 SRV_PAGES = 5        # 每块抓几页 (--pages), /all.m3u 用
-SRV_CAT_PAGES = 10     # /cat/ 单分类默认页数
+SRV_CAT_PAGES = 5    # /cat/ 单分类默认页数 (与预热对齐, 可用 ?pages=N 覆盖)
 SRV_CACHE_MINS = 30  # 分类列表缓存分钟数
 SRV_TIMEOUT = 15     # m3u8 下发超时秒数
 PROXY_HOP_TIMEOUT = 6  # 代理存活时首跳短超时: 快速标死并降级直连, 不让播放器干等
 SRV_VID_CACHE_SECS = 120  # 解析出的播放地址缓存秒数
 SRV_CACHE_MAX = 512  # _cat_cache/_vid_cache 最大条数, 超出按最旧淘汰
+
+# 纯文件夹导航分类: /all.m3u 与预热跳过 (无直接可播放条目, 抓了也是 0 条)
+M3U_SKIP = frozenset(("actresses", "actresses_ranking", "genres", "makers"))
+
+# 代理探测结果缓存: 端口开着不代表是 HTTP 代理, 首次真实请求校验后缓存 60s
+_PROXY_SELECTED = {"ts": 0.0, "url": "", "done": False}
+_PROXY_SELECTED_LOCK = _threading.Lock()
 
 # 合法筛选值 (与网页 option 对齐); 非法值在 categoryContent 中按 all 忽略
 _VIDEO_SORTS = frozenset((
@@ -1236,6 +1309,7 @@ M3U_ORIGIN = "https://missav.fans"
 
 _spider_local = _threading.local()  # 每线程独立 Spider, 避免共享 opener/cookiejar 竞态
 _cat_cache = {}   # (tid, chunk) -> (ts, [(vod_id, vod_name, vod_pic)])
+_cat_inflight = {}  # key -> threading.Event: 同一分类只抓一次, 预热与请求共享结果
 _vid_cache = {}   # raw_id -> (ts, play_url)
 _cache_lock = _threading.Lock()
 
@@ -1294,7 +1368,6 @@ def _m3u_header_attrs():
 
 
 def cached_category(tid, chunk=1, pages=None):
-    sp = get_spider()
     pages = SRV_PAGES if pages is None else pages
     chunk = max(1, int(chunk))
     start = (chunk - 1) * pages + 1   # 第 chunk 块: start..end 页, 块之间不重叠
@@ -1305,26 +1378,57 @@ def cached_category(tid, chunk=1, pages=None):
         hit = _cat_cache.get(key)
         if hit and now - hit[0] < SRV_CACHE_MINS * 60:
             return hit[1]
+        ev = _cat_inflight.get(key)
+        owner = ev is None
+        if owner:
+            ev = _threading.Event()
+            _cat_inflight[key] = ev
+    if not owner:
+        # 预热/并发请求已在抓同一分类: 等它完成, 不再重复抓
+        ev.wait(timeout=90)
+        with _cache_lock:
+            hit = _cat_cache.get(key)
+        return hit[1] if hit else []
+
     videos = []
-    _log("[%s] 开始抓取 chunk%d (%d页)..." % (tid, chunk, pages))
-    for pg in range(start, end + 1):
-        try:
-            data = sp.categoryContent(tid, pg, {}, {})
-        except Exception as e:
-            _log("  [%s] 第%d页 列表抓取失败: %s" % (tid, pg, e))
-            break
-        vids = data.get("list", []) if isinstance(data, dict) else []
-        if not vids:
-            break
-        for v in vids:
-            vid = str(v.get("vod_id", "") or "")
-            if not vid or vid.startswith("folder@"):
-                continue  # 女优/类型/发行商等文件夹条目不可直接播放, 跳过
-            videos.append((vid, v.get("vod_name", ""), v.get("vod_pic", "")))
-    _log("[%s] 抓取完成, 共 %d 条" % (tid, len(videos)))
+    try:
+        sp = get_spider()
+        _log("[%s] 开始抓取 chunk%d (%d页)..." % (tid, chunk, pages))
+        for pg in range(start, end + 1):
+            try:
+                data = sp.categoryContent(tid, pg, {}, {})
+            except Exception as e:
+                _log("  [%s] 第%d页 列表抓取失败: %s" % (tid, pg, e))
+                break
+            vids = data.get("list", []) if isinstance(data, dict) else []
+            if not vids:
+                break
+            for v in vids:
+                vid = str(v.get("vod_id", "") or "")
+                if not vid or vid.startswith("folder@"):
+                    continue  # 女优/类型/发行商等文件夹条目不可直接播放, 跳过
+                videos.append((vid, v.get("vod_name", ""), v.get("vod_pic", "")))
+        _log("[%s] 抓取完成, 共 %d 条" % (tid, len(videos)))
+        with _cache_lock:
+            _cache_put_locked(_cat_cache, key, (now, videos))
+        return videos
+    finally:
+        with _cache_lock:
+            _cat_inflight.pop(key, None)
+        ev.set()
+
+
+def cached_category_ready(tid, chunk=1, pages=None):
+    """只读已缓存分类, 不触发抓取; 供 /all.m3u 冷启动快速返回。"""
+    pages = SRV_PAGES if pages is None else pages
+    chunk = max(1, int(chunk))
+    key = (tid, chunk, pages)
+    now = _time.time()
     with _cache_lock:
-        _cache_put_locked(_cat_cache, key, (now, videos))
-    return videos
+        hit = _cat_cache.get(key)
+        if hit and now - hit[0] < SRV_CACHE_MINS * 60:
+            return hit[1]
+    return None
 
 
 def resolve_play_url(raw_id):
@@ -1602,25 +1706,62 @@ def _revproxy_spider():
     return sp
 
 
-def _seg_fetch_bytes(target, headers, timeout=SRV_TIMEOUT):
+def _seg_fetch_bytes(target, headers, timeout=SRV_TIMEOUT, range_header=None):
     """经当前 opener 拉字节; 代理连接层失败标死并直连重试一次。
-    代理存活首跳用 PROXY_HOP_TIMEOUT 快速失败, 标死后直连用完整 timeout。"""
+    返回 (data, ctype, status, content_range, accept_ranges)。"""
     sp = get_spider()
+    hdrs = dict(headers)
+    if range_header:
+        hdrs["Range"] = range_header
+
+    def _once(opener, to):
+        req = urllib.request.Request(target, headers=hdrs)
+        with opener.open(req, timeout=to) as r:
+            return (r.read(),
+                    r.headers.get("Content-Type", "application/octet-stream"),
+                    r.getcode(),
+                    r.headers.get("Content-Range", ""),
+                    r.headers.get("Accept-Ranges", ""))
+
     try:
         opener = sp._opener_for(target)
-        req = urllib.request.Request(target, headers=headers)
         to = PROXY_HOP_TIMEOUT if sp._proxy_alive() else timeout
-        with opener.open(req, timeout=to) as r:
-            return r.read(), r.headers.get("Content-Type", "application/octet-stream")
+        return _once(opener, to)
+    except urllib.error.HTTPError as e:
+        if sp._proxy_alive() and e.code in (400, 403, 407, 502, 504):
+            sp._proxy_fail += 1
+            if sp._proxy_fail >= 2:
+                sp._mark_proxy_dead()
+        raise
     except Exception as e:
         reason = getattr(e, "reason", e)
         if sp._proxy_alive() and _conn_layer_fail(reason):
             sp._mark_proxy_dead()
-            opener = sp._opener_for(target)
-            req = urllib.request.Request(target, headers=headers)
-            with opener.open(req, timeout=timeout) as r:
-                return r.read(), r.headers.get("Content-Type", "application/octet-stream")
+            return _once(sp._opener_for(target), timeout)
         raise
+
+
+def _slice_range(data, rng):
+    """把完整响应按 Range 切一段; 返回 (chunk, start, end, total) 或 None。"""
+    m = re.match(r"^\s*bytes=(\d*)-(\d*)\s*$", rng or "")
+    if not m or not data:
+        return None
+    a, b = m.group(1), m.group(2)
+    if not a and not b:
+        return None
+    total = len(data)
+    if not a:
+        n = int(b)
+        if n <= 0:
+            return None
+        start, end = max(0, total - n), total - 1
+    else:
+        start = int(a)
+        end = int(b) if b else total - 1
+    if start >= total or end < start:
+        return None
+    end = min(end, total - 1)
+    return data[start:end + 1], start, end, total
 
 
 class _RevProxyHandler(BaseHTTPRequestHandler):
@@ -1631,7 +1772,7 @@ class _RevProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
-    def _send(self, code, body, ctype="text/plain; charset=utf-8"):
+    def _send(self, code, body, ctype="text/plain; charset=utf-8", extra=None):
         data = body.encode("utf-8") if isinstance(body, str) else (body or b"")
         try:
             self.send_response(code)
@@ -1639,8 +1780,45 @@ class _RevProxyHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Cache-Control", "no-cache")
+            for k, v in (extra or {}).items():
+                if v:
+                    self.send_header(k, v)
             self.end_headers()
-            self.wfile.write(data)
+            if self.command != "HEAD":
+                self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_HEAD(self):
+        path = urlparse(self.path).path
+        if path not in ("/pl", "/seg"):
+            try:
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type",
+                             "application/vnd.apple.mpegurl" if path == "/pl"
+                             else "application/octet-stream")
+            self.send_header("Content-Length", "0")
+            if path == "/seg":
+                self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_OPTIONS(self):
+        try:
+            self.send_response(204)
+            self.send_header("Allow", "GET, HEAD, OPTIONS")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
         except (BrokenPipeError, ConnectionResetError):
             pass
 
@@ -1678,8 +1856,23 @@ class _RevProxyHandler(BaseHTTPRequestHandler):
             "Connection": "keep-alive",
         }
         try:
-            data, ctype = _seg_fetch_bytes(target, headers)
-            self._send(200, data, ctype)
+            rng = self.headers.get("Range")
+            data, ctype, code, crange, arange = _seg_fetch_bytes(
+                target, headers, range_header=rng)
+            if code not in (200, 206):
+                code = 200
+            if code == 200 and rng:
+                sliced = _slice_range(data, rng)
+                if sliced:
+                    chunk, start, end, total = sliced
+                    self._send(206, chunk, ctype, {
+                        "Content-Range": "bytes %d-%d/%d" % (start, end, total),
+                        "Accept-Ranges": "bytes"})
+                    return
+            extra = {"Accept-Ranges": arange or "bytes"}
+            if code == 206 and crange:
+                extra["Content-Range"] = crange
+            self._send(code, data, ctype, extra)
         except Exception:
             self._send(502, "seg fetch failed\n")
 
@@ -1746,7 +1939,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
-    def _send(self, code, body, ctype="text/plain; charset=utf-8"):
+    def _send(self, code, body, ctype="text/plain; charset=utf-8", extra=None):
         data = body.encode("utf-8") if isinstance(body, str) else body
         try:
             self.send_response(code)
@@ -1754,8 +1947,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Cache-Control", "no-cache")
+            for k, v in (extra or {}).items():
+                if v:
+                    self.send_header(k, v)
             self.end_headers()
-            self.wfile.write(data)
+            if self.command != "HEAD":
+                self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
@@ -1794,18 +1991,29 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             chunk = self._chunk_of(m.group(1), qs)
             cats = srv_cats()
-            # 并发预热分类缓存
-            from concurrent.futures import ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=8) as pool:
-                list(pool.map(lambda c: cached_category(c["type_id"], chunk=chunk), cats))
             names = {c["type_id"]: c["type_name"] for c in cats}
+            # 只读预热好的缓存, 不在请求线程里现抓 (冷启动不再阻塞 30s+)
+            ready = []
+            for c in cats:
+                if c["type_id"] in M3U_SKIP:
+                    continue
+                vids = cached_category_ready(c["type_id"], chunk=chunk)
+                if vids is not None:  # [] 表示已缓存但该分类为空, 不能当成未就绪
+                    ready.append((c, vids))
+            expected = len([c for c in cats if c["type_id"] not in M3U_SKIP])
+            if len(ready) < expected:
+                _start_prewarm(chunk)
+            if not any(v for _, v in ready) and len(ready) < expected:
+                self._send(503, "预热中，请 5 秒后重试\n",
+                           extra={"Retry-After": "5"})
+                return
             hattrs = _m3u_header_attrs()
             lines = ["#EXTM3U",
                      "#EXT-X-APTV-PREVIEW: FALSE",
                      "#EXT-X-APTV-LATENCY: FALSE",
                      "#EXT-X-APTV-LOGO: FALSE"]
-            for c in cats:
-                for vid, name, pic in cached_category(c["type_id"], chunk=chunk):
+            for c, vids in ready:
+                for vid, name, pic in vids:
                     logo_url = _m3u_logo(pic, host)
                     logo = ' tvg-logo="%s"' % logo_url if logo_url else ""
                     lines.append('#EXTINF:-1 group-title="%s"%s %s,%s'
@@ -1815,8 +2023,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         m = re.match(r"^/cat/([A-Za-z0-9_]+)(?:-(\d+))?\.m3u$", path)
         if m:
+            pages = SRV_CAT_PAGES
+            raw_pages = qs.get("pages", [""])[0]
+            if raw_pages:
+                try:
+                    pages = max(1, min(30, int(raw_pages)))
+                except Exception:
+                    pages = SRV_CAT_PAGES
             body = build_cat_m3u(m.group(1), host, chunk=self._chunk_of(m.group(2), qs),
-                                 pages=SRV_CAT_PAGES)
+                                 pages=pages)
             if body is None:
                 self._send(404, "未知分类\n")
             else:
@@ -1842,8 +2057,23 @@ class Handler(BaseHTTPRequestHandler):
                 "Connection": "keep-alive",
             }
             try:
-                data, ctype = _seg_fetch_bytes(target, headers)
-                self._send(200, data, ctype)
+                rng = self.headers.get("Range")
+                data, ctype, code, crange, arange = _seg_fetch_bytes(
+                    target, headers, range_header=rng)
+                if code not in (200, 206):
+                    code = 200
+                if code == 200 and rng:
+                    sliced = _slice_range(data, rng)
+                    if sliced:
+                        chunk, start, end, total = sliced
+                        self._send(206, chunk, ctype, {
+                            "Content-Range": "bytes %d-%d/%d" % (start, end, total),
+                            "Accept-Ranges": "bytes"})
+                        return
+                extra = {"Accept-Ranges": arange or "bytes"}
+                if code == 206 and crange:
+                    extra["Content-Range"] = crange
+                self._send(code, data, ctype, extra)
             except Exception:
                 self._send(502, "seg fetch failed\n")
             return
@@ -1900,6 +2130,48 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send(404, "not found\n")
 
+    def do_HEAD(self):
+        """轻量 HEAD: 只回路由与类型, 不触发抓取/解析, 避免播放器探测拿到 501。"""
+        path = urllib.parse.urlparse(self.path).path
+        ctype = None
+        code = 200
+        if path in ("/", "/index.html"):
+            ctype = "text/html; charset=utf-8"
+        elif path == "/health":
+            ctype = "text/plain; charset=utf-8"
+        elif (re.match(r"^/all(?:-\d+)?\.m3u$", path)
+              or re.match(r"^/cat/[A-Za-z0-9_]+(?:-\d+)?\.m3u$", path)
+              or re.match(r"^/v/.+\.m3u8$", path)):
+            ctype = "application/vnd.apple.mpegurl"
+        elif path == "/pl":
+            ctype = "application/vnd.apple.mpegurl"
+        elif path == "/seg":
+            ctype = "application/octet-stream"
+        else:
+            code = 404
+        try:
+            self.send_response(code)
+            if ctype:
+                self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", "0")
+            if path == "/seg":
+                self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_OPTIONS(self):
+        try:
+            self.send_response(204)
+            self.send_header("Allow", "GET, HEAD, OPTIONS")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
 
 def _index_page():
     items = []
@@ -1927,23 +2199,50 @@ def _index_page():
                SRV_CACHE_MINS, "".join(items)))
 
 
-def _prewarm():
-    """启动后后台预热 chunk1, 首个 /all.m3u 直接命中缓存, 不用现抓等超时。"""
+def _prewarm(chunk=1):
+    """后台预热指定块, 首个 /all(.N).m3u 直接命中缓存, 不用现抓等超时。"""
+    chunk = max(1, int(chunk))
     try:
-        cats = srv_cats()
-        _log("后台预热开始, %d 个分类..." % len(cats))
+        cats = [c for c in srv_cats() if c["type_id"] not in M3U_SKIP]
+        _log("后台预热开始 chunk%d, %d 个分类..." % (chunk, len(cats)))
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=8) as pool:
-            list(pool.map(lambda c: cached_category(c["type_id"], chunk=1), cats))
-        _log("后台预热完成")
+            list(pool.map(lambda c: cached_category(c["type_id"], chunk=chunk), cats))
+        _log("后台预热完成 chunk%d" % chunk)
     except Exception as e:
-        _log("后台预热失败: %s" % e)
+        _log("后台预热失败 chunk%d: %s" % (chunk, e))
+
+
+_warm_lock = _threading.Lock()
+_warm_running = set()
+
+
+def _start_prewarm(chunk=1):
+    """每个块最多一个预热线程; /all.m3u 冷启动时也可安全触发。"""
+    chunk = max(1, int(chunk))
+    with _warm_lock:
+        if chunk in _warm_running:
+            return
+        _warm_running.add(chunk)
+
+    def _run():
+        try:
+            _prewarm(chunk)
+        finally:
+            with _warm_lock:
+                _warm_running.discard(chunk)
+
+    _threading.Thread(target=_run, daemon=True).start()
 
 
 def serve(port):
     global _srv_mode
     _srv_mode = True
-    srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    try:
+        srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    except OSError as e:
+        print("端口 %d 无法监听: %s（可能被占用）" % (port, e), flush=True)
+        return 2
     ncats = len(srv_cats())
     print("=" * 64, flush=True)
     print("MissAV M3U 服务启动: %d 个分类, 端口 %d" % (ncats, port), flush=True)
@@ -1951,14 +2250,20 @@ def serve(port):
     print("  聚合订阅: http://127.0.0.1:%d/all.m3u （默认前 %d 页）" % (port, SRV_PAGES), flush=True)
     print("  分页: http://127.0.0.1:%d/all.m3u?chunk=2 （chunk=2=%d-%d页, 以此类推）"
           % (port, SRV_PAGES + 1, SRV_PAGES * 2), flush=True)
-    print("  分类: http://127.0.0.1:%d/cat/<分类ID>.m3u （默认10页）  健康检查: /health" % port, flush=True)
+    print("  分类: http://127.0.0.1:%d/cat/<分类ID>.m3u （默认%d页, 可加 ?pages=N）  健康检查: /health"
+          % (port, SRV_CAT_PAGES), flush=True)
+    try:
+        lan_ip = socket.gethostbyname(socket.gethostname())
+    except Exception:
+        lan_ip = ""
+    if lan_ip and not lan_ip.startswith("127."):
+        print("  局域网: http://%s:%d/all.m3u" % (lan_ip, port), flush=True)
     print("  缓存: 分类列表%d分钟, 播放地址%d秒" % (SRV_CACHE_MINS, SRV_VID_CACHE_SECS), flush=True)
     print("  分类列表:")
     for c in srv_cats():
         print("    %s = %s" % (c["type_id"], c["type_name"]), flush=True)
     print("=" * 64, flush=True)
-    import threading
-    threading.Thread(target=_prewarm, daemon=True).start()
+    _start_prewarm()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -2078,8 +2383,8 @@ def main(argv=None):
         _log("完成: 成功 %d 条, 失败 %d 条 -> %s" % (ok, fail, args.output))
         return
 
-    serve(args.port)
+    return serve(args.port)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
