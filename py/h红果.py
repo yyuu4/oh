@@ -1763,6 +1763,68 @@ class _StreamSession:
             cursor += len(block)
 
 
+def _public_video_url(video_id: str) -> str:
+    # 官网对免费前 3 集提供明文试看片；App video_model 空包时的兜底源。
+    # 仅 360p 存在（720p/1080p 与 ep4+ 均 404），故固定 360p。
+    return SITE + "/video/public/" + str(video_id) + "/360p.mp4"
+
+
+def _public_video_probe(url: str) -> int | None:
+    """探活官网试看片并取总长；404/网络失败一律 None，绝不抛给上层。"""
+    try:
+        response = requests.get(
+            url,
+            headers=dict(MEDIA_HEADERS, Range="bytes=0-0"),
+            timeout=15,
+            stream=True,
+        )
+        try:
+            if response.status_code not in (200, 206):
+                return None
+            content_range = response.headers.get("Content-Range") or ""
+            if "/" in content_range:
+                total_text = content_range.rsplit("/", 1)[-1].strip()
+                if total_text.isdigit() and int(total_text) > 0:
+                    return int(total_text)
+            length = response.headers.get("Content-Length") or ""
+            if length.isdigit() and int(length) > 0:
+                # 200+无 Range 时 Content-Length 即整片长；206 时是分片长，仅作兜底。
+                if response.status_code == 200:
+                    return int(length)
+            # Content-Range 缺失时退回读 1 字节确认可达，长度未知仍算失败
+            return None
+        finally:
+            response.close()
+    except Exception:
+        return None
+
+
+class _PlainStreamSession:
+    """官网明文试看片的 Range 会话：无 CENC，直读直出，接口对齐 _StreamSession。"""
+
+    def __init__(self, url: str, total: int) -> None:
+        self.url = url
+        self.total = total
+        self.created = time.time()
+
+    def expired(self) -> bool:
+        return time.time() - self.created > _STREAM_TTL_SECONDS
+
+    def read_range(self, start: int, end: int) -> bytes:
+        raw, _ = _range_get(self.url, start, end)
+        if not raw:
+            raise HongguoPluginError("媒体分片为空")
+        return raw
+
+    def iter_range(self, start: int, end: int):
+        cursor = start
+        while cursor <= end:
+            stop = min(cursor + _STREAM_CHUNK - 1, end)
+            block = self.read_range(cursor, stop)
+            yield block
+            cursor += len(block)
+
+
 def _fresh_device_pair() -> tuple[str, str]:
     return (
         str(random.randint(10**17, 10**18 - 1)),
@@ -1998,6 +2060,23 @@ def _stream_session(video_id: str, config: Mapping[str, Any], quality: str = "10
                 except Exception:
                     pass
         if last_err is not None:
+            # App video_model 恒空包（沙箱/上游风控），或缺设备对必抛配置错时，
+            # 回退官网明文试看；冷却/网络等真故障仍原样上抛，不掩盖根因。
+            if _is_empty_model_error(last_err) or "缺少红果 device_id/install_id" in str(last_err):
+                public_url = _public_video_url(video_id)
+                public_total = _public_video_probe(public_url)
+                if public_total and public_total > 0:
+                    session = _PlainStreamSession(public_url, public_total)
+                    with _STREAM_LOCK:
+                        sessions = _STREAM_STATE["sessions"]
+                        while len(sessions) >= _STREAM_MAX_SESSIONS:
+                            sessions.pop(next(iter(sessions)), None)
+                        sessions[cache_key] = session
+                    _hg_trace(
+                        "官网试看回退 vid=%s q=%s total=%d %dms"
+                        % (video_id, quality, public_total, int((time.time() - build_t0) * 1000))
+                    )
+                    return session
             raise last_err
         raise HongguoPluginError("媒体会话创建失败")
     finally:
