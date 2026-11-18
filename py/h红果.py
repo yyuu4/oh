@@ -1763,68 +1763,6 @@ class _StreamSession:
             cursor += len(block)
 
 
-def _public_video_url(video_id: str) -> str:
-    # 官网对免费前 3 集提供明文试看片；App video_model 空包时的兜底源。
-    # 仅 360p 存在（720p/1080p 与 ep4+ 均 404），故固定 360p。
-    return SITE + "/video/public/" + str(video_id) + "/360p.mp4"
-
-
-def _public_video_probe(url: str) -> int | None:
-    """探活官网试看片并取总长；404/网络失败一律 None，绝不抛给上层。"""
-    try:
-        response = requests.get(
-            url,
-            headers=dict(MEDIA_HEADERS, Range="bytes=0-0"),
-            timeout=15,
-            stream=True,
-        )
-        try:
-            if response.status_code not in (200, 206):
-                return None
-            content_range = response.headers.get("Content-Range") or ""
-            if "/" in content_range:
-                total_text = content_range.rsplit("/", 1)[-1].strip()
-                if total_text.isdigit() and int(total_text) > 0:
-                    return int(total_text)
-            length = response.headers.get("Content-Length") or ""
-            if length.isdigit() and int(length) > 0:
-                # 200+无 Range 时 Content-Length 即整片长；206 时是分片长，仅作兜底。
-                if response.status_code == 200:
-                    return int(length)
-            # Content-Range 缺失时退回读 1 字节确认可达，长度未知仍算失败
-            return None
-        finally:
-            response.close()
-    except Exception:
-        return None
-
-
-class _PlainStreamSession:
-    """官网明文试看片的 Range 会话：无 CENC，直读直出，接口对齐 _StreamSession。"""
-
-    def __init__(self, url: str, total: int) -> None:
-        self.url = url
-        self.total = total
-        self.created = time.time()
-
-    def expired(self) -> bool:
-        return time.time() - self.created > _STREAM_TTL_SECONDS
-
-    def read_range(self, start: int, end: int) -> bytes:
-        raw, _ = _range_get(self.url, start, end)
-        if not raw:
-            raise HongguoPluginError("媒体分片为空")
-        return raw
-
-    def iter_range(self, start: int, end: int):
-        cursor = start
-        while cursor <= end:
-            stop = min(cursor + _STREAM_CHUNK - 1, end)
-            block = self.read_range(cursor, stop)
-            yield block
-            cursor += len(block)
-
-
 def _fresh_device_pair() -> tuple[str, str]:
     return (
         str(random.randint(10**17, 10**18 - 1)),
@@ -2060,23 +1998,6 @@ def _stream_session(video_id: str, config: Mapping[str, Any], quality: str = "10
                 except Exception:
                     pass
         if last_err is not None:
-            # App video_model 恒空包（沙箱/上游风控），或缺设备对必抛配置错时，
-            # 回退官网明文试看；冷却/网络等真故障仍原样上抛，不掩盖根因。
-            if _is_empty_model_error(last_err) or "缺少红果 device_id/install_id" in str(last_err):
-                public_url = _public_video_url(video_id)
-                public_total = _public_video_probe(public_url)
-                if public_total and public_total > 0:
-                    session = _PlainStreamSession(public_url, public_total)
-                    with _STREAM_LOCK:
-                        sessions = _STREAM_STATE["sessions"]
-                        while len(sessions) >= _STREAM_MAX_SESSIONS:
-                            sessions.pop(next(iter(sessions)), None)
-                        sessions[cache_key] = session
-                    _hg_trace(
-                        "官网试看回退 vid=%s q=%s total=%d %dms"
-                        % (video_id, quality, public_total, int((time.time() - build_t0) * 1000))
-                    )
-                    return session
             raise last_err
         raise HongguoPluginError("媒体会话创建失败")
     finally:
@@ -6366,15 +6287,36 @@ class Spider(_BaseSpider):
                 "url": SITE + "/",
                 "header": {"User-Agent": UA},
             }
-        # 取流优先级：本机 Range 流服务 > 壳代理。
-        # 壳代理（fongmi / OK影视 的 /proxy?do=py）实测会忽略 Range：对 bytes=0-1023
-        # 也回 200 + 整片 + chunked，既无 Content-Range 也无 Accept-Ranges，且必须
-        # 等整片下载 + CENC 解密完成后才吐首字节（单集 12~17MB，实测 8.7s / 16.3s，
-        # 超过播放器默认 8s 读超时）。首集常因缓存或重试侥幸起播，切到第二集时播放器
-        # 按新 URL 重新请求即超时失败，表现为“第 1 集能放、第 2 集不能放”。
-        # 本机流服务支持 206 / Content-Range / Accept-Ranges，首字节约 1s，切集稳定。
-        # 会话构建（取 video_model + 拉 moov）在冷启动时约 3~18s，若等到播放器连上来
-        # 才建会话，响应头会被拖延到读超时。这里先异步预热会话，让播放器连接时命中缓存。
+        # OK影视32位TV等环境下播放器可能无法访问插件内置 127.0.0.1 流服务，导致全剧不可播。
+        # 优先走壳代理(getProxyUrl/localProxy)，localProxy 已支持 Range 按需取流；本机流服务仅作兜底。
+        proxy = ""
+        try:
+            if hasattr(self, "getProxyUrl"):
+                proxy = (self.getProxyUrl() or "").strip()
+        except Exception:
+            proxy = ""
+        if proxy:
+            sep = "&" if "?" in proxy else "?"
+            url = proxy + sep + urlencode(
+                {
+                    "vid": vid,
+                    "q": q,
+                    "hg": "cenc",
+                    "did": self.device_id or "",
+                    "iid": self.install_id or "",
+                }
+            )
+            return {
+                "parse": 0,
+                "jx": 0,
+                "playUrl": "",
+                "url": url,
+                "header": {
+                    "User-Agent": MEDIA_UA,
+                    "Referer": "https://novel.snssdk.com/",
+                },
+            }
+        # 回退：本机 Range 流服务（壳不提供代理 URL 时）
         def _warm_session():
             try:
                 _stream_session(vid, {
@@ -6407,41 +6349,11 @@ class Spider(_BaseSpider):
                 "url": "http://127.0.0.1:%d/hg.mp4?%s" % (port, query),
                 "header": {"User-Agent": UA},
             }
-            # 弹幕挂载必须全程兜底：任何异常都吞掉，出流结果照常返回（流畅度红线）
             try:
                 result.update(self._danmaku_payload(port, vid))
             except Exception:
                 pass
             return result
-        # 回退：壳代理（保留壳自带的 do=py，不要覆盖 do）
-        _hg_trace("流服务不可用→壳代理回退 vid=%s q=%s" % (vid, q))
-        proxy = ""
-        try:
-            if hasattr(self, "getProxyUrl"):
-                proxy = (self.getProxyUrl() or "").strip()
-        except Exception:
-            proxy = ""
-        if proxy:
-            sep = "&" if "?" in proxy else "?"
-            url = proxy + sep + urlencode(
-                {
-                    "vid": vid,
-                    "q": q,
-                    "hg": "cenc",
-                    "did": self.device_id or "",
-                    "iid": self.install_id or "",
-                }
-            )
-            return {
-                "parse": 0,
-                "jx": 0,
-                "playUrl": "",
-                "url": url,
-                "header": {
-                    "User-Agent": MEDIA_UA,
-                    "Referer": "https://novel.snssdk.com/",
-                },
-            }
         return {
             "parse": 1,
             "jx": 0,
@@ -6456,7 +6368,7 @@ class Spider(_BaseSpider):
         return self.localProxy(param)
 
     def localProxy(self, param):
-        """壳本地代理：优先读缓存；无原生 AES 时避免一上来就解 1080 整集导致超时失败。"""
+        """壳本地代理：支持 Range 按需取流（适配 OK影视32位TV等播放器探测/拖动）。"""
         import traceback
         param = param or {}
         self._adopt_working_pair()
@@ -6481,117 +6393,93 @@ class Spider(_BaseSpider):
                 "install_id": str(param.get("iid") or self.install_id or ""),
             }
             user_q = str(param.get("q") or param.get("quality") or "").strip()
-            # 有原生 AES：优先 1080；纯 Python AES 很慢：先 720 保证能播，再尝试更高
+            # 32位/纯Python AES 环境优先低清保证可播；用户指定清晰度时优先该档
             if user_q:
-                order = [user_q, "1080", "720", "480", "360"]
+                order = [user_q, "720", "480", "360", "1080"]
             elif _aes_is_fast():
                 order = ["1080", "720", "480", "360"]
             else:
-                order = ["720", "480", "1080", "360"]
-            # dedupe
+                order = ["720", "480", "360", "1080"]
             seen_q = set()
             quals = []
             for q in order:
-                if q and q not in seen_q:
+                if q and q in _QUALITY_LINE_NAME_TO_Q and q not in seen_q:
                     seen_q.add(q)
                     quals.append(q)
+            if not quals:
+                quals = ["720", "480", "360", "1080"]
 
-            # 缓存命中直接返回。用户指定线路清晰度(user_q)时，只认该清晰度缓存，
-            # 不能回退命中其它清晰度缓存（否则请求480会拿到360内容）。
-            if user_q:
-                primary = [user_q]
-            else:
-                primary = quals
-            for q in primary:
-                cached = _hg_cache_get(vid, q)
-                if cached:
-                    return [200, "video/mp4", cached]
+            range_header = str(
+                param.get("Range")
+                or param.get("range")
+                or param.get("HTTP_RANGE")
+                or param.get("http_range")
+                or ""
+            ).strip()
 
-            model = None
-            rows = None
-            for _round in range(4):
-                try:
-                    model = _video_model(vid, cfg)
-                except Exception as err:
-                    if not _is_empty_model_error(err) or _round >= 3:
-                        raise
-                    pair = _rotate_stream_device()
-                    cfg = {"device_id": pair["device_id"], "install_id": pair["install_id"]}
-                    self.device_id = pair["device_id"]
-                    self.install_id = pair["install_id"]
-                    continue
-                rows = _video_list_from_model(model)
-                if rows:
-                    break
-                if _round >= 3:
-                    break
-                pair = _rotate_stream_device()
-                cfg = {"device_id": pair["device_id"], "install_id": pair["install_id"]}
-                self.device_id = pair["device_id"]
-                self.install_id = pair["install_id"]
-            if not rows:
-                return [500, "text/plain; charset=utf-8", b"empty video list"]
+            # 无 Range 请求时优先命中完整缓存，避免重复全量解密
+            if not range_header:
+                cache_order = [user_q] if user_q else quals
+                for q in cache_order:
+                    if not q:
+                        continue
+                    cached = _hg_cache_get(vid, q)
+                    if cached:
+                        return [200, "video/mp4", cached]
 
             last_err = None
             for wanted in quals:
                 try:
-                    # 再查一次该清晰度缓存（model 解析后）
-                    cached = _hg_cache_get(vid, wanted)
-                    if cached:
-                        return [200, "video/mp4", cached]
+                    session = _stream_session(vid, cfg, wanted)
+                    total = int(getattr(session, "total", 0) or 0)
+                    if total <= 0:
+                        raise HongguoPluginError("媒体长度无效")
 
-                    actual_q, item = _select_quality(rows, wanted)
-                    cached = _hg_cache_get(vid, actual_q)
-                    if cached:
-                        return [200, "video/mp4", cached]
-                    url = _media_url(item)
-                    spade = _spade_value(item)
-                    if not url or not spade:
-                        last_err = "missing url/spade q=%s" % actual_q
-                        continue
-                    try:
-                        key_seed = _key_seed_from_model(model)
-                        if key_seed:
-                            url = _decrypt_spade_url(url, key_seed)
-                    except Exception:
-                        pass
+                    if range_header:
+                        rng = _parse_range(range_header, total)
+                        if rng == _RANGE_UNSATISFIABLE:
+                            return [416, "video/mp4", b"", {
+                                "Accept-Ranges": "bytes",
+                                "Content-Range": "bytes */%d" % total,
+                                "Content-Length": "0",
+                                "Connection": "close",
+                            }]
+                        if rng is None:
+                            start, end = 0, total - 1
+                            status = 200
+                        else:
+                            start, end = rng
+                            status = 206
+                    else:
+                        start, end, status = 0, total - 1, 200
 
-                    # 下载超时：纯 AES 环境更短，避免壳端空等后失败
-                    dl_timeout = 150 if _aes_is_fast() else 90
-                    media_headers = {
-                        "User-Agent": MEDIA_UA,
-                        "Referer": "https://novel.snssdk.com/",
+                    body = session.read_range(start, end)
+                    headers = {
+                        "Accept-Ranges": "bytes",
+                        "Content-Type": "video/mp4",
+                        "Content-Length": str(len(body)),
+                        "Connection": "close",
                     }
-                    try:
-                        body = _multi_download(
-                            url,
-                            headers=media_headers,
-                            timeout=dl_timeout,
-                            workers=4 if _aes_is_fast() else 3,
-                        )
-                    except Exception as dl_err:
-                        last_err = "download failed q=%s err=%s" % (actual_q, dl_err)
-                        continue
-                    if not body:
-                        last_err = "empty body q=%s" % actual_q
-                        continue
+                    if status == 206:
+                        headers["Content-Range"] = "bytes %d-%d/%d" % (start, end, total)
 
-                    # 纯 AES 且体积过大时跳过超大 1080，减少必超时
-                    if (not _aes_is_fast()) and actual_q in ("1080", "4k") and len(body) > 45 * 1024 * 1024:
-                        last_err = "skip large %s without native AES size=%s" % (actual_q, len(body))
-                        continue
-
-                    plain = decrypt_mp4_cenc(body, derive_content_key(spade))
-                    if len(plain) < 64 or (b"ftyp" not in plain[:64] and b"moov" not in plain[:4096]):
-                        last_err = "bad mp4 after decrypt q=%s" % actual_q
-                        continue
-                    try:
-                        _hg_cache_put(vid, actual_q, plain)
-                    except Exception:
-                        pass
-                    return [200, "video/mp4", plain]
-                except Exception as one_err:
-                    last_err = "%s q=%s" % (one_err, wanted)
+                    # 无 Range 的完整响应可落盘缓存，便于复播；限制体积避免32位内存压力
+                    if status == 200 and (not range_header) and 0 < len(body) <= 80 * 1024 * 1024:
+                        try:
+                            _hg_cache_put(vid, wanted, body)
+                        except Exception:
+                            pass
+                    return [status, "video/mp4", body, headers]
+                except Exception as err:
+                    last_err = err
+                    if _is_empty_model_error(err):
+                        try:
+                            pair = _rotate_stream_device()
+                            cfg = {"device_id": pair["device_id"], "install_id": pair["install_id"]}
+                            self.device_id = pair["device_id"]
+                            self.install_id = pair["install_id"]
+                        except Exception:
+                            pass
                     continue
 
             msg = "hg localProxy failed: %s" % last_err
