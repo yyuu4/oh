@@ -1399,6 +1399,492 @@ def _search_videos_by_drive(keyword, page, drive_type):
     }
 
 
+# ==================== 网盘直链解析 ====================
+# playerContent 返回分享页 HTML 会导致 OK影视「container unsupported」。
+# 下列 resolve_* 把分享链接解析成真视频流（m3u8/mp4），失败返回 None 回退分享页。
+
+_VIDEO_EXT_RE = re.compile(
+    r"\.(mp4|mkv|flv|ts|m3u8|avi|wmv|mov|rmvb|mpg|mpeg|m4v|webm)(?:\?|$)",
+    re.I,
+)
+
+
+def _is_video_name(name=""):
+    return bool(_VIDEO_EXT_RE.search(str(name or "").strip()))
+
+
+def _json_get(session, url, params=None, headers=None, timeout=15):
+    h = {"User-Agent": SITE_UA, "Accept": "application/json, text/plain, */*"}
+    if headers:
+        h.update(headers)
+    r = session.get(url, params=params, headers=h, timeout=timeout, verify=False)
+    try:
+        return r.json()
+    except Exception:
+        return {}
+
+
+def _json_post(session, url, data=None, headers=None, timeout=15):
+    h = {"User-Agent": SITE_UA, "Accept": "application/json, text/plain, */*"}
+    if headers:
+        h.update(headers)
+    r = session.post(url, data=data, headers=h, timeout=timeout, verify=False)
+    try:
+        return r.json()
+    except Exception:
+        return {}
+
+
+def _new_pan_session(drive_type=""):
+    """带网盘 Cookie 的独立 Session（与站点 HttpClient 隔离）。
+
+    Cookie 放进 jar 而非 headers：headers 静态 Cookie 会盖住响应 Set-Cookie
+    合并，且百度 streaming 对带全量配置 Cookie 的头会回 errno=71。
+    """
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": SITE_UA,
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    })
+    ck = pan_cookie(drive_type)
+    if ck:
+        for part in str(ck).split(";"):
+            if "=" not in part:
+                continue
+            k, v = part.split("=", 1)
+            k, v = k.strip(), v.strip()
+            if not k:
+                continue
+            try:
+                s.cookies.set(k, v)
+            except Exception:
+                pass
+    return s
+
+
+def _cookie_header_for(session, url=""):
+    """导出将发往 url 的 Cookie 头（含 path 定向 cookie）。"""
+    try:
+        if url and requests is not None:
+            prep = session.prepare_request(requests.Request("GET", url))
+            ck = prep.headers.get("Cookie")
+            if ck:
+                return ck
+    except Exception:
+        pass
+    try:
+        return "; ".join("%s=%s" % (c.name, c.value) for c in session.cookies)
+    except Exception:
+        return ""
+
+
+def resolve_baidu_share(share_url=""):
+    """百度分享 → 真视频流。成功返回 (url, header_dict)，失败 None。
+
+    配方（真网已验证）：
+      verify → 分享页抽 uk/shareid → list 递归找视频 fs_id
+      → tplconfig 拿 sign/timestamp → streaming 出 m3u8
+    streaming 必须带 Cookie + Referer(分享页) + Origin，否则 errno=31341。
+    """
+    if requests is None:
+        return None
+    u = str(share_url or "")
+    m = re.search(r"pan\.baidu\.com/s/1([A-Za-z0-9_-]+)", u)
+    if not m:
+        return None
+    surl = m.group(1)
+    mp = re.search(r"[?&]pwd=([0-9A-Za-z]+)", u)
+    pwd = mp.group(1) if mp else ""
+    page_url = "https://pan.baidu.com/s/1" + surl + (("?pwd=" + pwd) if pwd else "")
+    origin = "https://pan.baidu.com"
+    ajax = {
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": origin,
+        "Referer": origin + "/",
+    }
+    # 匿名会话（照 omnibox觅盘.js）：不预置 COOKIE_BAIDU，
+    # 只靠 verify+分享页种的完整罐；预置全量 Cookie 会让 streaming 回 errno=71
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": SITE_UA,
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    })
+
+    # 1) verify → BDCLND（正确提取码偶发 -12/-9，短延迟重试；randsk 兜底进罐）
+    verify = {}
+    for attempt in range(3):
+        try:
+            verify = _json_post(
+                s,
+                "https://pan.baidu.com/share/verify?surl=%s&channel=channellist&clienttype=0&app_id=250528"
+                % quote(surl),
+                data={"pwd": pwd, "vcode": "", "vcode_str": ""},
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "Referer": origin + "/",
+                    "Origin": origin,
+                },
+            ) or {}
+        except Exception:
+            verify = {}
+        errno = verify.get("errno")
+        if str(errno) in ("0", ""):
+            break
+        if str(errno) in ("-12", "-9") and attempt < 2:
+            time.sleep(0.8)
+            continue
+        break
+    if verify.get("randsk") and not s.cookies.get("BDCLND"):
+        try:
+            s.cookies.set("BDCLND", str(verify.get("randsk")), domain="pan.baidu.com")
+        except Exception:
+            pass
+
+    # 2) 分享页抽 share_uk / shareid（window.yunData 窗口，缺则 share_uk 锚点反转义）
+    try:
+        r = s.get(page_url, headers={"Referer": origin + "/"}, timeout=15, verify=False)
+        raw = r.text or ""
+    except Exception:
+        return None
+    seg = ""
+    yi = raw.find("window.yunData=")
+    if yi >= 0:
+        seg = raw[yi:yi + 1200]
+    else:
+        ai = raw.find("share_uk")
+        if ai >= 0:
+            seg = raw[max(0, ai - 600):ai + 1200].replace('\\"', '"')
+    mm = re.search(r'''["']?share_uk["']?\s*:\s*["']?(\d+)''', seg)
+    uk = mm.group(1) if mm else ""
+    mm = re.search(r'''["']?shareid["']?\s*:\s*["']?(\d+)''', seg)
+    shareid = mm.group(1) if mm else ""
+    if not uk or not shareid:
+        return None
+
+    # 3) list 递归找第一个视频 fs_id（channel=channellist；sekey 仅在有 BDCLND 时带）
+    sekey = unquote(s.cookies.get("BDCLND") or "")
+
+    def _list(dir_path=""):
+        params = {
+            "shareid": shareid,
+            "uk": uk,
+            "app_id": "250528",
+            "channel": "channellist",
+            "clienttype": "0",
+            "order": "time",
+            "desc": "1",
+            "showempty": "0",
+            "view_mode": "1",
+            "web": "1",
+            "page": "1",
+            "num": "100",
+        }
+        if sekey:
+            params["is_from_web"] = "1"
+            params["sekey"] = sekey
+        if dir_path:
+            params["dir"] = dir_path
+        else:
+            params["root"] = "1"
+        data = _json_get(
+            s,
+            "https://pan.baidu.com/share/list",
+            params=params,
+            headers={"Referer": page_url, "Accept": "application/json, text/plain, */*"},
+        )
+        if not isinstance(data, dict) or str(data.get("errno", "0")) not in ("0", ""):
+            return []
+        lst = data.get("list")
+        return lst if isinstance(lst, list) else []
+
+    def _child_path(it):
+        raw_path = str((it or {}).get("path") or "")
+        if re.match(r"^/sharelink\d*-\d+(/|$)", raw_path):
+            return raw_path
+        name = str((it or {}).get("server_filename") or "")
+        fs_id = str((it or {}).get("fs_id") or "")
+        if not name or not fs_id:
+            return ""
+        return "/sharelink%s-%s/%s" % (uk, fs_id, name)
+
+    def _find_video(dir_path="", depth=0):
+        if depth > 4:
+            return None
+        items = _list(dir_path)
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            if str(it.get("isdir") or "0") in ("1", "true"):
+                continue
+            name = str(it.get("server_filename") or it.get("filename") or "")
+            fid = str(it.get("fs_id") or "")
+            if fid and _is_video_name(name):
+                return {"fid": fid, "name": name}
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            if str(it.get("isdir") or "0") not in ("1", "true"):
+                continue
+            child = _child_path(it)
+            if not child:
+                continue
+            got = _find_video(child, depth + 1)
+            if got:
+                return got
+        return None
+
+    target = _find_video()
+    if not target:
+        return None
+    fs_id = target["fid"]
+
+    # 4) tplconfig → sign / timestamp
+    try:
+        tpl = _json_get(
+            s,
+            "https://pan.baidu.com/share/tplconfig",
+            params={
+                "surl": "1" + surl,
+                "shareid": shareid,
+                "uk": uk,
+                "fields": "sign,timestamp",
+                "view_mode": "1",
+            },
+            headers=ajax,
+        )
+    except Exception:
+        return None
+    sign = str((tpl or {}).get("sign") or "")
+    timestamp = str((tpl or {}).get("timestamp") or "")
+    if not sign:
+        inner = (tpl or {}).get("data")
+        if isinstance(inner, dict):
+            sign = str(inner.get("sign") or "")
+            timestamp = str(inner.get("timestamp") or timestamp)
+    if not sign:
+        return None
+
+    # 5) streaming → m3u8/mp4（Cookie + Referer + Origin 必带）
+    stream_url = (
+        "https://pan.baidu.com/share/streaming?channel=chunlei"
+        "&uk=%s&fid=%s&sign=%s&timestamp=%s&shareid=%s"
+        "&type=M3U8_FLV_264_480&vip=0&check_blue=1&isplayer=1"
+    ) % (quote(uk), quote(fs_id), quote(sign), quote(timestamp), quote(shareid))
+    cookie = _cookie_header_for(s, stream_url)
+    headers = {
+        "User-Agent": SITE_UA,
+        "Referer": page_url,
+        "Origin": origin,
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    try:
+        r = s.get(stream_url, headers=headers, timeout=20, verify=False, stream=True)
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        head = b""
+        try:
+            head = next(r.iter_content(64)) or b""
+        except Exception:
+            pass
+        try:
+            r.close()
+        except Exception:
+            pass
+        if r.status_code != 200:
+            return None
+        text_head = head.decode("utf-8", "ignore") if head else ""
+        looks_m3u8 = "mpegurl" in ctype or text_head.lstrip().startswith("#EXTM3U")
+        looks_mp4 = (
+            "video/" in ctype
+            or "mp4" in ctype
+            or b"ftyp" in head[:32]
+            or head[:4] in (b"\x00\x00\x00\x18", b"\x00\x00\x00\x1c", b"\x00\x00\x00\x20")
+        )
+        if looks_m3u8 or looks_mp4:
+            return stream_url, headers
+        return None
+    except Exception:
+        return None
+
+
+def _115_snap_list(session, code, pwd, cid="0", depth=0):
+    """递归列 115 分享目录，返回第一个视频 {name, fid}。"""
+    if depth > 3:
+        return None
+    data = _json_get(
+        session,
+        "https://webapi.115.com/share/snap",
+        params={
+            "share_code": code,
+            "offset": "0",
+            "limit": "100",
+            "asc": "0",
+            "o": "",
+            "cid": str(cid),
+            "receive_code": pwd,
+            "format": "json",
+        },
+        headers={"Referer": "https://115.com/"},
+    )
+    if not isinstance(data, dict) or str(data.get("errno", "0")) not in ("0", ""):
+        return None
+    payload = data.get("data") if isinstance(data.get("data"), dict) else data
+    lst = payload.get("list") if isinstance(payload, dict) else None
+    if not isinstance(lst, list):
+        return None
+    # 先找视频文件（字段 fid，fc=1）
+    for it in lst:
+        if not isinstance(it, dict):
+            continue
+        fid = str(it.get("fid") or it.get("file_id") or "")
+        name = str(it.get("n") or it.get("name") or it.get("server_filename") or "")
+        if fid and _is_video_name(name):
+            return {"name": name, "fid": fid}
+    # 再进子目录（fc=0 且有 cid、无 fid）
+    for it in lst:
+        if not isinstance(it, dict):
+            continue
+        fid = str(it.get("fid") or "")
+        sub_cid = str(it.get("cid") or "")
+        if fid or not sub_cid:
+            continue
+        if str(it.get("fc") or "0") not in ("0", "", "None"):
+            continue
+        got = _115_snap_list(session, code, pwd, sub_cid, depth + 1)
+        if got:
+            return got
+    return None
+
+
+def resolve_115_share(share_url=""):
+    """115 分享 → 真视频流。成功 (url, header_dict)，失败 None。
+
+    配方（真网已验证）：
+      snap(+receive_code) 列文件 → 按文件名 files/search 拿 pickcode
+      → 优先 /api/video/m3u8/{pc}.m3u8（小文件 200 #EXTM3U）
+      → 回退 files/video 拿 origin_file_url
+      （CDN 需带 files/video 的 path cookie，同 Session 自动合并后 206）
+    分享 downurl=50029、skip_login=4100054 不可用；无个人副本时返回 None。
+    """
+    if requests is None:
+        return None
+    u = normalize_share_url(share_url)
+    m = re.search(r"115\.com/s/([A-Za-z0-9]+)", u or "")
+    if not m:
+        return None
+    code = m.group(1)
+    mp = re.search(r"[?&]password=([0-9A-Za-z]+)", u or "")
+    pwd = mp.group(1) if mp else ""
+    referer = "https://115.com/s/%s" % code
+    if pwd:
+        referer += "?password=" + pwd
+
+    s = _new_pan_session("115")
+
+    target = _115_snap_list(s, code, pwd)
+    if not target:
+        return None
+    fname = target["name"]
+
+    # 个人盘按文件名搜 pickcode（用户已转存/接收时可用）
+    data = _json_get(
+        s,
+        "https://webapi.115.com/files/search",
+        params={"search_value": fname, "offset": "0", "limit": "115", "aid": "1", "cid": "0", "format": "json"},
+        headers={"Referer": "https://115.com/"},
+    )
+    pc = ""
+    if isinstance(data, dict):
+        # files/search：data 可能是列表（顶层 data:[...]），也可能是 {list:[...]}
+        raw_list = data.get("data")
+        if isinstance(raw_list, list):
+            lst = raw_list
+        elif isinstance(raw_list, dict):
+            lst = raw_list.get("list")
+            if isinstance(lst, dict):
+                lst = lst.get("list")
+        else:
+            lst = data.get("list")
+            if isinstance(lst, dict):
+                lst = lst.get("list")
+        if isinstance(lst, list):
+            for it in lst:
+                if not isinstance(it, dict):
+                    continue
+                n = str(it.get("n") or it.get("name") or it.get("server_filename") or "")
+                p = str(it.get("pc") or it.get("pickcode") or "")
+                if p and (n == fname or _is_video_name(n) or not n):
+                    pc = p
+                    break
+    if not pc:
+        return None
+
+    # 优先 m3u8
+    m3u8_url = "https://115.com/api/video/m3u8/%s.m3u8" % pc
+    cookie = _cookie_header_for(s, m3u8_url)
+    h = {"User-Agent": SITE_UA, "Referer": "https://115.com/"}
+    if cookie:
+        h["Cookie"] = cookie
+    try:
+        r = s.get(m3u8_url, headers=h, timeout=15, verify=False)
+        body_head = (r.text or "")[:200]
+        if r.status_code == 200 and "#EXTM3U" in body_head:
+            return m3u8_url, h
+    except Exception:
+        pass
+
+    # 回退 files/video → origin_file_url（同 Session 合并 path cookie 后可 206）
+    data = _json_get(
+        s,
+        "https://webapi.115.com/files/video",
+        params={"pickcode": pc, "format": "json"},
+        headers={"Referer": "https://115.com/"},
+    )
+    origin = ""
+    if isinstance(data, dict):
+        payload = data.get("data") if isinstance(data.get("data"), dict) else data
+        if isinstance(payload, dict):
+            origin = str(payload.get("origin_file_url") or payload.get("url") or "")
+    if not origin:
+        return None
+    cookie = _cookie_header_for(s, origin)
+    h = {"User-Agent": SITE_UA, "Referer": "https://115.com/"}
+    if cookie:
+        h["Cookie"] = cookie
+    try:
+        r = s.get(origin, headers=h, timeout=15, verify=False, stream=True)
+        status = r.status_code
+        head = b""
+        try:
+            head = next(r.iter_content(16)) or b""
+        except Exception:
+            pass
+        try:
+            r.close()
+        except Exception:
+            pass
+        if status in (200, 206):
+            return origin, h
+        return None
+    except Exception:
+        # 探活失败但 URL 可能仍可用
+        return origin, h
+
+
+def resolve_share_media(share_url="", drive_type=""):
+    """按网盘类型解析成真视频流。成功 (url, header)，失败 None。"""
+    try:
+        dt = normalize_drive_type(drive_type or infer_drive_type_from_share_url(share_url))
+        if dt == "baidu":
+            return resolve_baidu_share(share_url)
+        if dt == "115":
+            return resolve_115_share(share_url)
+    except Exception:
+        return None
+    return None
+
+
 # ==================== Spider ====================
 class Spider(BaseSpider):
     def init(self, extend=""):
@@ -1693,8 +2179,21 @@ class Spider(BaseSpider):
         ck = pan_cookie(drive_type)
         if ck:
             header["Cookie"] = ck
-        # 网盘分享页非视频流：parse=0 直链交宿主网盘插件/直链播放，
-        # parse=1 会当普通网页嗅探导致「播放地址解析失败」
+
+        # 先解析成真视频流（m3u8/mp4），避免分享页 HTML 触发 container unsupported
+        resolved = resolve_share_media(share_url, drive_type)
+        if resolved and resolved[0]:
+            stream_url, stream_header = resolved
+            return {
+                "parse": 0,
+                "jx": 0,
+                "playUrl": "",
+                "url": stream_url,
+                "header": stream_header or header,
+                "flag": flag or "",
+            }
+
+        # 回退：分享页直链（parse=0 交宿主网盘插件；parse=1 会嗅探失败）
         return {
             "parse": 0,
             "jx": 0,
