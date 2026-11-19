@@ -1815,7 +1815,8 @@ def _baidu_stream(ctx, fs_id):
     if not sign:
         return None
 
-    # streaming → m3u8（非会员一般只有 480P 转码；分片直链本身带签名）
+    # streaming → m3u8：M3U8_MP4_* 是非会员可用的「完整正片」转码（AVC 源可出 1080P，
+    # 单分片整片 MP4）；M3U8_AUTO/FLV 在非会员下只有 ~100 秒试看，仅作兜底。
     headers = {
         "User-Agent": SITE_UA,
         "Referer": ctx["page_url"],
@@ -1824,7 +1825,10 @@ def _baidu_stream(ctx, fs_id):
     bdclnd = _cookie_get(s, "BDCLND") or ctx["randsk"]
     if bdclnd:
         headers["Cookie"] = "BDCLND=" + bdclnd
-    for typ in ("M3U8_FLV_264_480", "M3U8_AUTO_480", "M3U8_MP4_264_480"):
+    preview = None
+    for typ in ("M3U8_MP4_264_1080", "M3U8_MP4_264_720", "M3U8_MP4_264_480",
+                "M3U8_AUTO_1080", "M3U8_AUTO_720", "M3U8_AUTO_480",
+                "M3U8_FLV_264_480"):
         stream_url = (
             "https://pan.baidu.com/share/streaming?channel=chunlei"
             "&uk=%s&fid=%s&sign=%s&timestamp=%s&shareid=%s"
@@ -1832,32 +1836,30 @@ def _baidu_stream(ctx, fs_id):
         ) % (quote(ctx["uk"]), quote(str(fs_id)), quote(sign), quote(timestamp),
              quote(ctx["shareid"]), typ)
         try:
-            r = s.get(stream_url, headers=headers, timeout=20, verify=False, stream=True)
-            ctype = (r.headers.get("Content-Type") or "").lower()
-            head = b""
-            try:
-                head = next(r.iter_content(64)) or b""
-            except Exception:
-                pass
-            try:
-                r.close()
-            except Exception:
-                pass
+            r = s.get(stream_url, headers=headers, timeout=20, verify=False)
             if r.status_code != 200:
                 continue
-            text_head = head.decode("utf-8", "ignore") if head else ""
-            looks_m3u8 = "mpegurl" in ctype or text_head.lstrip().startswith("#EXTM3U")
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            body = r.content or b""
+            looks_m3u8 = "mpegurl" in ctype or body.lstrip().startswith(b"#EXTM3U")
             looks_mp4 = (
                 "video/" in ctype
                 or "mp4" in ctype
-                or b"ftyp" in head[:32]
-                or head[:4] in (b"\x00\x00\x00\x18", b"\x00\x00\x00\x1c", b"\x00\x00\x00\x20")
+                or b"ftyp" in body[:32]
+                or body[:4] in (b"\x00\x00\x00\x18", b"\x00\x00\x00\x1c", b"\x00\x00\x00\x20")
             )
-            if looks_m3u8 or looks_mp4:
+            if looks_m3u8:
+                dur = _m3u8_duration(body.decode("utf-8", "ignore"))
+                if dur >= 60:
+                    return stream_url, headers
+                if preview is None:
+                    preview = (stream_url, headers)
+                continue
+            if looks_mp4:
                 return stream_url, headers
         except Exception:
             continue
-    return None
+    return preview
 
 
 def resolve_baidu_file(share_url="", file_id=""):
@@ -1945,6 +1947,17 @@ def _115_snap_videos(session, code, pwd, cid="0", depth=0, out=None):
             continue
         _115_snap_videos(session, code, pwd, sub_cid, depth + 1, out)
     return out
+
+
+def _m3u8_duration(text):
+    """HLS 清单总时长（秒），用于识别百度 100 秒试看片单。"""
+    total = 0.0
+    for m in re.finditer(r"#EXTINF:\s*([\d.]+)", text or ""):
+        try:
+            total += float(m.group(1))
+        except Exception:
+            pass
+    return total
 
 
 def _probe_stream(session, url, headers=None, timeout=15):
