@@ -11,10 +11,8 @@
   mp|k|...  搜索关键词+网盘类型 -> 链接列表
   纯数字    站点影片 ID
 
-播放: playerContent 将分享链接 resolve 成真视频流（m3u8/mp4）；
-      解析失败返回空 url+msg，绝不回退分享页 HTML（避免 ExoPlayer container unsupported）。
-选集: vod_play_from 多线路 $$$ ，vod_play_url 线路内多集 # 、线路间 $$$ ，集 名$播放id ；
-      播放id = 分享链接 或 分享链接|fid（指定文件）。
+播放: 115/百度 分享会先解析成 m3u8/mp4 直链再交给播放器（115 需有效 Cookie），
+      解析失败才回退分享页，避免播放器把网页当视频报 container unsupported。
 """
 import base64
 import json
@@ -43,18 +41,6 @@ try:
     from lxml import html as lxml_html
 except Exception:
     lxml_html = None
-
-try:
-    from Crypto.PublicKey import RSA
-    from Crypto.Cipher import PKCS1_v1_5
-    from Crypto.Util.number import bytes_to_long, long_to_bytes
-    _HAS_CRYPTO = True
-except Exception:
-    RSA = None
-    PKCS1_v1_5 = None
-    bytes_to_long = None
-    long_to_bytes = None
-    _HAS_CRYPTO = False
 
 
 # ==================== 配置 ====================
@@ -121,6 +107,25 @@ PAN_COOKIES = {
 def pan_cookie(drive_type=""):
     """取指定网盘的 Cookie；未配置返回空串。"""
     return PAN_COOKIES.get(normalize_drive_type(drive_type), "") or ""
+
+
+# 源配置 extend 里可覆盖的 Cookie 键（OK影视/TVBox 挂载时填写）
+COOKIE_EXTEND_KEYS = {
+    "115": ("cookie115", "cookie_115", "pan115", "115cookie", "115_cookie", "115"),
+    "baidu": ("cookiebaidu", "cookie_baidu", "panbaidu", "baiducookie", "baidu_cookie", "baidu"),
+}
+
+
+def apply_extend_options(ext):
+    """从 init(extend) 读取网盘 Cookie，覆盖内置/环境变量配置。"""
+    if not isinstance(ext, dict):
+        return
+    for drive, keys in COOKIE_EXTEND_KEYS.items():
+        for k in keys:
+            v = ext.get(k)
+            if isinstance(v, str) and v.strip():
+                PAN_COOKIES[drive] = v.strip()
+                break
 
 
 DRIVE_ORDER = [
@@ -1274,7 +1279,7 @@ def build_movie_drive_groups(video_id, vod_name, vod_pic, pan_urls, info=None):
     return items
 
 
-def _link_item_to_vod(share_url, name, vod_pic, drive_type, movie_title="", info=None, video_id="", episodes=None):
+def _link_item_to_vod(share_url, name, vod_pic, drive_type, movie_title="", info=None, video_id=""):
     data = {"u": share_url, "n": name or "", "t": drive_type}
     # 带上影片 video_id：点开 R 级详情时回拉站点元数据（演员/简介/年份）
     if video_id:
@@ -1296,13 +1301,8 @@ def _link_item_to_vod(share_url, name, vod_pic, drive_type, movie_title="", info
         # 简介：真实分享链接，影片元数据接在后面（无则仅链接）
         "vod_content": build_link_content(share_url, info),
         "vod_play_from": pan_name(drive_type) if drive_type else "网盘",
-        "vod_play_url": "播放$%s" % _sanitize_play_url(share_url),
+        "vod_play_url": "播放$%s" % share_url,
     }
-    if episodes:
-        pf, pu = _pack_play([(pan_name(drive_type) if drive_type else "网盘", episodes)])
-        if pf and pu:
-            item["vod_play_from"] = pf
-            item["vod_play_url"] = pu
     # 导演/主演/备注/更新时间与网页详情对齐
     apply_detail_meta(item, info)
     if info and info.get("vodRemarks"):
@@ -1323,53 +1323,18 @@ def _get_detail_cached(video_id):
 
 
 def _movie_drive_groups_by_vid(video_id):
-    """影片详情 → 单条 vod，多线路（$$$）× 选集（#）。
-
-    每条盘线路的选集 = 该盘各分享链接（不枚举文件，避免详情过慢）。
-    """
     vid = normalize_video_id(video_id)
     body, base = _get_detail_cached(vid)
     info = parse_vod_base_info(body, base)
     pan_urls = extract_pan_urls(body)
-    by_type = {}
-    order = []
-    for url in pan_urls:
-        u = normalize_share_url(url)
-        if not u:
-            continue
-        t = infer_drive_type_from_share_url(u) or "others"
-        if t not in by_type:
-            by_type[t] = []
-            order.append(t)
-        if u not in by_type[t]:
-            by_type[t].append(u)
-    if not by_type:
-        return {"list": [], "page": 1, "pagecount": 0, "limit": PAGE_SIZE, "total": 0}
-    lines = []
-    for t in sort_drive_keys(order):
-        shares = by_type[t]
-        line_name = pan_name(t) if t not in ("others", "all") else "网盘"
-        episodes = []
-        for i, u in enumerate(shares):
-            label = "资源%d" % (i + 1) if len(shares) > 1 else "播放"
-            episodes.append((label, u))
-        lines.append((line_name, episodes))
-    pf, pu = _pack_play(lines)
-    # 无分组卡列表：直接可播的多线路详情
-    vod = {
-        "vod_id": encode_id("m", {"v": vid}),
-        "vod_name": info["vodName"] or "影片",
-        "vod_pic": info["vodPic"] or "",
-        "type_id": "pan_category",
-        "type_name": "网盘分类",
-        "vod_remarks": info.get("vodRemarks") or "",
-        "vod_tag": "file",
-        "vod_content": format_movie_meta(info),
-        "vod_play_from": pf or "网盘",
-        "vod_play_url": pu or "",
+    groups = build_movie_drive_groups(vid, info["vodName"], info["vodPic"], pan_urls, info)
+    return {
+        "list": groups,
+        "page": 1,
+        "pagecount": 1,
+        "limit": PAGE_SIZE,
+        "total": len(groups),
     }
-    apply_detail_meta(vod, info)
-    return _single_vod_result(vod)
 
 
 def _movie_links_by_drive(video_id, drive_type):
@@ -1377,7 +1342,7 @@ def _movie_links_by_drive(video_id, drive_type):
     body, base = _get_detail_cached(vid)
     info = parse_vod_base_info(body, base)
     dt = normalize_drive_type(drive_type)
-    shares = []
+    link_items = []
     seen = set()
     for url in extract_pan_urls(body):
         u = normalize_share_url(url)
@@ -1389,26 +1354,131 @@ def _movie_links_by_drive(video_id, drive_type):
         if dt == "others" and inferred:
             continue
         seen.add(u)
-        shares.append(u)
-    if not shares:
-        return {"list": [], "page": 1, "pagecount": 0, "limit": PAGE_SIZE, "total": 0}
-    # 单条 vod：该盘全部分享作选集
-    episodes = []
-    for i, u in enumerate(shares):
-        label = "资源%d" % (i + 1) if len(shares) > 1 else "播放"
-        episodes.append((label, u))
-    line = pan_name(dt) if dt not in ("others", "all") else "网盘"
-    vod = _link_item_to_vod(
-        shares[0], info["vodName"], info["vodPic"], dt, info["vodName"], info, vid,
-        episodes=episodes,
-    )
-    # 多集时线路名用盘名，选集名用资源序号
-    if len(shares) > 1:
-        pf, pu = _pack_play([(line, episodes)])
-        if pf and pu:
-            vod["vod_play_from"] = pf
-            vod["vod_play_url"] = pu
-    return _single_vod_result(vod)
+        item = _link_item_to_vod(
+            u, "", info["vodPic"], inferred or "others", info["vodName"], info, vid)
+        _attach_episodes(item, u, inferred or "others")
+        link_items.append(item)
+    return {
+        "list": link_items,
+        "page": 1,
+        "pagecount": 1,
+        "limit": PAGE_SIZE,
+        "total": len(link_items),
+    }
+
+
+def _episode_meta(name):
+    """从文件名提取 (季, 集)；识别不到返回 (0, 0)。"""
+    s = str(name or "")
+    m = re.search(r"[Ss](\d{1,2})[ ._-]*[Ee][Pp]?(\d{1,4})", s)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = re.search(r"(?:^|[^A-Za-z0-9])[Ee][Pp]?[ ._-]?(\d{1,4})(?:[^0-9]|$)", s)
+    if m:
+        return 1, int(m.group(1))
+    m = re.search(r"第\s*(\d{1,4})\s*[集话話期]", s)
+    if m:
+        return 1, int(m.group(1))
+    # 「剧名 - 01 [1080P]」这类：1~3 位数字，避免把年份/1080P 当集数
+    m = re.search(r"(?:^|[\s._-])(\d{1,3})(?=[\s._\[]|$)", s)
+    if m:
+        return 1, int(m.group(1))
+    return 0, 0
+
+
+def _episode_label(name, index):
+    season, ep = _episode_meta(name)
+    if ep:
+        if season > 1:
+            return "第%d季第%d集" % (season, ep)
+        return "第%d集" % ep
+    stem = re.sub(r"\.[^.]+$", "", str(name or "")).strip()
+    return stem[:20] if stem else ("第%d集" % (index + 1))
+
+
+def _pick_main_group(videos):
+    """多目录分享取「集数最多」的那一个目录，避免混入不同压制组的文件。"""
+    if not videos:
+        return []
+    groups = {}
+    for v in videos:
+        groups.setdefault(str(v.get("dir") or ""), []).append(v)
+    if len(groups) <= 1:
+        return videos
+    best = max(groups.values(), key=len)
+    return best if len(best) > 1 else videos
+
+
+def _order_episodes(videos):
+    """按季/集排序并去重（同集多版本只保留一个）。"""
+    def _key(v):
+        season, ep = _episode_meta(v.get("name") or "")
+        return (0 if ep else 1, season, ep, str(v.get("name") or ""))
+
+    ordered = sorted(videos or [], key=_key)
+    out, seen = [], set()
+    for v in ordered:
+        season, ep = _episode_meta(v.get("name") or "")
+        k = (season, ep) if ep else str(v.get("name") or "")
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(v)
+    return out
+
+
+def _list_share_videos(share_url, drive_type):
+    """列出分享内全部视频（带 12 小时缓存）。"""
+    key = "eps:%s" % share_url
+    hit = _cache_get(key)
+    if hit is not None:
+        return hit
+    videos = []
+    try:
+        if drive_type == "115":
+            code, pwd = _115_share_parts(share_url)
+            if code:
+                videos = _115_snap_videos(_new_pan_session("115"), code, pwd)
+        elif drive_type == "baidu":
+            ctx = _baidu_context(share_url)
+            if ctx:
+                videos = _baidu_list_videos(ctx)
+    except Exception:
+        videos = []
+    videos = _pick_main_group(videos)
+    _cache_set(key, videos)
+    return videos
+
+
+def _build_episode_play_url(share_url, videos):
+    """分享 → CatVod 选集串：第N集$encode_id#..."""
+    ordered = _order_episodes(videos)
+    if not ordered:
+        return "播放$%s" % share_url
+    if len(ordered) == 1:
+        return "播放$%s" % share_url
+    parts = []
+    for idx, v in enumerate(ordered):
+        label = _episode_label(v.get("name") or "", idx)
+        eid = encode_id("e", {
+            "u": share_url,
+            "f": str(v.get("fid") or ""),
+            "n": str(v.get("name") or ""),
+            "h": str(v.get("sha") or ""),
+        })
+        parts.append("%s$%s" % (label, eid))
+    return "#".join(parts)
+
+
+def _attach_episodes(item, share_url, drive_type):
+    """把分享内的多集展开到列表项，播放器可直接选集。"""
+    if not item or drive_type not in ("115", "baidu"):
+        return item
+    videos = _list_share_videos(share_url, drive_type)
+    if len(videos) > 1:
+        item["vod_play_from"] = pan_name(drive_type)
+        item["vod_play_url"] = _build_episode_play_url(share_url, videos)
+    return item
 
 
 def _share_url_detail(share_url, title="", info=None, video_id=""):
@@ -1424,17 +1494,21 @@ def _share_url_detail(share_url, title="", info=None, video_id=""):
     site_name = str((info or {}).get("vodName") or "").strip()
     # 名称：站点片名 > 传入标题 > 网盘名；简介一律放真实分享链接（+元数据）
     name = site_name or title or (pan_name(dt) + "分享")
-    # 列分享内视频作选集（share|fid）；失败回退单条播放
-    files = list_share_videos(u, dt)
-    episodes = _episodes_from_share_files(u, files) if files else None
     vod = _link_item_to_vod(
         u, name, (info or {}).get("vodPic") or pan_pic(dt),
         dt, site_name or title, info, video_id or "",
-        episodes=episodes,
     )
     vod["vod_name"] = name
     vod["vod_content"] = build_link_content(u, info)
-    return _single_vod_result(vod)
+    # 多集分享展开选集（115/百度），单集保持原样
+    _attach_episodes(vod, u, dt)
+    return {
+        "list": [vod],
+        "page": 1,
+        "pagecount": 1,
+        "limit": PAGE_SIZE,
+        "total": 1,
+    }
 
 
 def _search_videos_by_drive(keyword, page, drive_type):
@@ -1482,7 +1556,7 @@ def _search_videos_by_drive(keyword, page, drive_type):
 
 # ==================== 网盘直链解析 ====================
 # playerContent 返回分享页 HTML 会导致 OK影视「container unsupported」。
-# 下列 resolve_* 把分享链接解析成真视频流（m3u8/mp4），失败返回 None。
+# 下列 resolve_* 把分享链接解析成真视频流（m3u8/mp4），失败返回 None 回退分享页。
 
 _VIDEO_EXT_RE = re.compile(
     r"\.(mp4|mkv|flv|ts|m3u8|avi|wmv|mov|rmvb|mpg|mpeg|m4v|webm)(?:\?|$)",
@@ -1492,274 +1566,6 @@ _VIDEO_EXT_RE = re.compile(
 
 def _is_video_name(name=""):
     return bool(_VIDEO_EXT_RE.search(str(name or "").strip()))
-
-
-def _sanitize_play_url(url=""):
-    """vod_play_url 分隔符消毒：# $ 换行会截断宿主解析。"""
-    return (
-        str(url or "")
-        .replace("#", "%23")
-        .replace("$", "%24")
-        .replace("\r", "")
-        .replace("\n", "")
-    )
-
-
-def _sanitize_ep_name(name=""):
-    """选集名消毒：去掉分隔符，限长。"""
-    s = re.sub(r"[$#\r\n]+", " ", str(name or ""))
-    s = re.sub(r"\s+", " ", s).strip()
-    return s[:60]
-
-
-def _pack_play(lines):
-    """拼 CatVod 多线路/多集。
-
-    lines: [(线路名, [(集名, 播放id), ...]), ...]
-    → (vod_play_from, vod_play_url)
-    """
-    froms = []
-    urls = []
-    for line_name, episodes in lines:
-        eps = list(episodes or [])
-        if not eps:
-            continue
-        froms.append(_sanitize_ep_name(line_name) or "线路")
-        parts = []
-        for i, ep in enumerate(eps):
-            if isinstance(ep, dict):
-                ep_name = ep.get("name") or ""
-                play_id = ep.get("id") or ep.get("url") or ""
-            else:
-                ep_name = ep[0] if len(ep) > 0 else ""
-                play_id = ep[1] if len(ep) > 1 else ""
-            ep_name = _sanitize_ep_name(ep_name) or ("第%d集" % (i + 1) if len(eps) > 1 else "播放")
-            play_id = _sanitize_play_url(str(play_id or ""))
-            if not play_id:
-                continue
-            parts.append("%s$%s" % (ep_name, play_id))
-        if not parts:
-            continue
-        urls.append("#".join(parts))
-    if not froms or not urls:
-        return "", ""
-    return "$$$".join(froms), "$$$".join(urls)
-
-
-def _single_vod_result(vod):
-    if not vod:
-        return {"list": [], "page": 1, "pagecount": 0, "limit": PAGE_SIZE, "total": 0}
-    return {
-        "list": [vod],
-        "page": 1,
-        "pagecount": 1,
-        "limit": PAGE_SIZE,
-        "total": 1,
-    }
-
-
-def list_share_videos(share_url="", drive_type=""):
-    """列分享内全部视频文件 [{name, fid}]，失败 []。仅 115/百度。"""
-    try:
-        dt = normalize_drive_type(drive_type or infer_drive_type_from_share_url(share_url))
-        if dt == "115":
-            return _115_list_videos(share_url)
-        if dt == "baidu":
-            return _baidu_list_videos(share_url)
-    except Exception:
-        return []
-    return []
-
-
-def _episodes_from_share_files(share_url, files):
-    """文件列表 → 选集 [(名, share|fid)]；空则回退单条播放。"""
-    u = normalize_share_url(share_url)
-    eps = []
-    n = len(files or [])
-    for i, f in enumerate(files or []):
-        if not isinstance(f, dict):
-            continue
-        fid = str(f.get("fid") or "").strip()
-        name = _sanitize_ep_name(f.get("name") or "")
-        if not name:
-            name = "第%d集" % (i + 1) if n > 1 else "播放"
-        play_id = "%s|%s" % (u, fid) if fid else u
-        eps.append((name, play_id))
-    if not eps:
-        eps = [("播放", u)]
-    return eps
-
-
-class _M115Crypto:
-    """115 proapi 对称+RSA 加解密（fake115upload / 115drive-webdav 同款）。"""
-
-    G_KEY_L = bytes.fromhex("7806AD4C33865D184C013F46")
-    G_KEY_S = bytes.fromhex("2923215E")
-    G_KTS = bytes.fromhex(
-        "F0E569AEBFDCBF8A1A45E8BE7DA673B8DE8FE7C445DA86C49B648B146AB4F1AA"
-        "3801359E26692C86006B4FA5363462A62A966818F24AFDBD6B978F4D8F8913B7"
-        "6C8E93ED0E0D483ED72F88D8FEFE7E8650954FD1EB832634DB667B9C7E9D7A81"
-        "32EAB633DE3AA95934663BAABA816048B9D5819CF86C8477FF5478265FBEE81E"
-        "369F34805C452C9B76D51B8FCCC3B8F5"
-    )
-    RSA_N = int(
-        "8686980c0f5a24c4b9d43020cd2c22703ff3f450756529058b1cf88f09b86021"
-        "36477198a6e2683149659bd122c33592fdb5ad47944ad1ea4d36c6b172aad633"
-        "8c3bb6ac6227502d010993ac967d1aef00f0c8e038de2e4d3bc2ec368af2e9f1"
-        "0a6f1eda4f7262f136420c07c331b871bf139f74f3010e3c4fe57df3afb71683",
-        16,
-    )
-    RSA_E = 0x10001
-
-    def __init__(self):
-        self.g_key_l = self.G_KEY_L
-        self.g_key_s = self.G_KEY_S
-        self.l_rnd_key = b""
-
-    def _setkey(self, randkey, sk_len):
-        length = sk_len * (sk_len - 1)
-        index = 0
-        xorkey = bytearray()
-        if randkey:
-            for _i in range(sk_len):
-                x = (randkey[_i] + self.G_KTS[index]) & 0xFF
-                xorkey.append(self.G_KTS[length] ^ x)
-                length -= sk_len
-                index += sk_len
-        if sk_len == 4:
-            self.g_key_s = bytes(xorkey)
-        elif sk_len == 12:
-            self.g_key_l = bytes(xorkey)
-
-    @staticmethod
-    def _xor115(src, key):
-        pad = len(src) % 4
-        out = bytearray(len(src))
-        if pad > 0:
-            for i in range(pad):
-                out[i] = src[i] ^ key[i]
-        lkey = len(key)
-        num = 0
-        for i in range(pad, len(src)):
-            if num >= lkey:
-                num = num % lkey
-            out[i] = src[i] ^ key[num]
-            num += 1
-        return bytes(out)
-
-    def encode(self, plaintext):
-        """str → URL-safe base64（POST data= 后的值）。"""
-        if not _HAS_CRYPTO:
-            return ""
-        self.g_key_l = self.G_KEY_L
-        self.g_key_s = self.G_KEY_S
-        self.l_rnd_key = os.urandom(16)
-        self._setkey(self.l_rnd_key, 4)
-        data = plaintext.encode("utf-8")
-        tmp = self._xor115(data, self.g_key_s)[::-1]
-        xortext = self._xor115(tmp, self.g_key_l)
-        payload = self.l_rnd_key + xortext
-        key = RSA.construct((self.RSA_N, self.RSA_E))
-        cipher = PKCS1_v1_5.new(key)
-        out = bytearray()
-        block = 117
-        for i in range(0, len(payload), block):
-            out.extend(cipher.encrypt(payload[i : i + block]))
-        return quote(base64.b64encode(bytes(out)).decode("ascii"))
-
-    def decode(self, ciphertext_b64):
-        """base64 密文 → 明文 bytes（需先 encode 同一实例）。"""
-        if not _HAS_CRYPTO or not self.l_rnd_key:
-            return b""
-        try:
-            ct = base64.b64decode(ciphertext_b64)
-        except Exception:
-            return b""
-        plain = bytearray()
-        nblocks = len(ct) // 128
-        for i in range(nblocks):
-            chunk = ct[i * 128 : (i + 1) * 128]
-            m = long_to_bytes(pow(bytes_to_long(chunk), self.RSA_E, self.RSA_N))
-            if not m:
-                continue
-            if m[:1] == b"\x00":
-                m = m[1:]
-            sep = m.find(b"\x00")
-            if sep >= 0:
-                plain.extend(m[sep + 1 :])
-            else:
-                plain.extend(m)
-        if len(plain) < 16:
-            return b""
-        s_rnd_key = bytes(plain[:16])
-        body = bytes(plain[16:])
-        self._setkey(self.l_rnd_key, 4)
-        self._setkey(s_rnd_key, 12)
-        tmp = self._xor115(body, self.g_key_l)[::-1]
-        return self._xor115(tmp, self.g_key_s)
-
-
-def _115_share_downurl(session, code, pwd, fid):
-    """分享文件直链：proapi.115.com/app/share/downurl（不依赖个人盘 pickcode）。"""
-    if not _HAS_CRYPTO or requests is None:
-        return ""
-    crypto = _M115Crypto()
-    payload = json.dumps(
-        {
-            "share_code": str(code or ""),
-            "receive_code": str(pwd or ""),
-            "file_id": str(fid or ""),
-        },
-        ensure_ascii=True,
-        separators=(",", ":"),
-    )
-    enc = crypto.encode(payload)
-    if not enc:
-        return ""
-    body = "data=" + enc
-    headers = {
-        "User-Agent": SITE_UA,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Referer": "https://115.com/",
-        "Origin": "https://115.com",
-    }
-    ck = _cookie_header_for(session, "https://proapi.115.com/")
-    if ck:
-        headers["Cookie"] = ck
-    try:
-        r = session.post(
-            "https://proapi.115.com/app/share/downurl",
-            data=body,
-            headers=headers,
-            timeout=15,
-            verify=False,
-        )
-        resp = r.json()
-    except Exception:
-        return ""
-    if not isinstance(resp, dict):
-        return ""
-    if resp.get("state") is False:
-        return ""
-    enc_resp = resp.get("data")
-    if not isinstance(enc_resp, str) or not enc_resp:
-        return ""
-    try:
-        plain = crypto.decode(enc_resp)
-        obj = json.loads(plain.decode("utf-8", "ignore"))
-    except Exception:
-        return ""
-    if not isinstance(obj, dict):
-        return ""
-    u = obj.get("url")
-    if isinstance(u, dict):
-        return str(u.get("url") or u.get("file_url") or "")
-    if isinstance(u, str) and u:
-        return u
-    for k in ("play_url", "download_url", "file_url"):
-        if obj.get(k):
-            return str(obj[k])
-    return ""
 
 
 def _json_get(session, url, params=None, headers=None, timeout=15):
@@ -1827,155 +1633,23 @@ def _cookie_header_for(session, url=""):
         return ""
 
 
-def _baidu_list_videos(share_url=""):
-    """列百度分享内全部视频文件 [{name, fid}]，失败 []。"""
-    if requests is None:
-        return []
-    u = str(share_url or "")
-    m = re.search(r"pan\.baidu\.com/s/1([A-Za-z0-9_-]+)", u)
-    if not m:
-        return []
-    surl = m.group(1)
-    mp = re.search(r"[?&]pwd=([0-9A-Za-z]+)", u)
-    pwd = mp.group(1) if mp else ""
-    page_url = "https://pan.baidu.com/s/1" + surl + (("?pwd=" + pwd) if pwd else "")
-    origin = "https://pan.baidu.com"
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": SITE_UA,
-        "Accept-Language": "zh-CN,zh;q=0.9",
-    })
-    verify = {}
-    for attempt in range(3):
-        try:
-            verify = _json_post(
-                s,
-                "https://pan.baidu.com/share/verify?surl=%s&channel=channellist&clienttype=0&app_id=250528"
-                % quote(surl),
-                data={"pwd": pwd, "vcode": "", "vcode_str": ""},
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                    "Accept": "application/json, text/javascript, */*; q=0.01",
-                    "Referer": origin + "/",
-                    "Origin": origin,
-                },
-            ) or {}
-        except Exception:
-            verify = {}
-        errno = verify.get("errno")
-        if str(errno) in ("0", ""):
-            break
-        if str(errno) in ("-12", "-9") and attempt < 2:
-            time.sleep(0.8)
-            continue
-        break
-    if verify.get("randsk") and not s.cookies.get("BDCLND"):
-        try:
-            s.cookies.set("BDCLND", str(verify.get("randsk")), domain="pan.baidu.com")
-        except Exception:
-            pass
+def _cookie_get(session, name):
+    """安全取单个 Cookie（同名多域时返回第一个）。"""
     try:
-        r = s.get(page_url, headers={"Referer": origin + "/"}, timeout=15, verify=False)
-        raw = r.text or ""
+        for c in session.cookies:
+            if c.name == name:
+                return c.value
     except Exception:
-        return []
-    seg = ""
-    yi = raw.find("window.yunData=")
-    if yi >= 0:
-        seg = raw[yi:yi + 1200]
-    else:
-        ai = raw.find("share_uk")
-        if ai >= 0:
-            seg = raw[max(0, ai - 600):ai + 1200].replace('\\"', '"')
-    mm = re.search(r'''["']?share_uk["']?\s*:\s*["']?(\d+)''', seg)
-    uk = mm.group(1) if mm else ""
-    mm = re.search(r'''["']?shareid["']?\s*:\s*["']?(\d+)''', seg)
-    shareid = mm.group(1) if mm else ""
-    if not uk or not shareid:
-        return []
-    sekey = unquote(s.cookies.get("BDCLND") or "")
-
-    def _list(dir_path=""):
-        params = {
-            "shareid": shareid,
-            "uk": uk,
-            "app_id": "250528",
-            "channel": "channellist",
-            "clienttype": "0",
-            "order": "time",
-            "desc": "1",
-            "showempty": "0",
-            "view_mode": "1",
-            "web": "1",
-            "page": "1",
-            "num": "100",
-        }
-        if sekey:
-            params["is_from_web"] = "1"
-            params["sekey"] = sekey
-        if dir_path:
-            params["dir"] = dir_path
-        else:
-            params["root"] = "1"
-        data = _json_get(
-            s,
-            "https://pan.baidu.com/share/list",
-            params=params,
-            headers={"Referer": page_url, "Accept": "application/json, text/plain, */*"},
-        )
-        if not isinstance(data, dict) or str(data.get("errno", "0")) not in ("0", ""):
-            return []
-        lst = data.get("list")
-        return lst if isinstance(lst, list) else []
-
-    def _child_path(it):
-        raw_path = str((it or {}).get("path") or "")
-        if re.match(r"^/sharelink\d*-\d+(/|$)", raw_path):
-            return raw_path
-        name = str((it or {}).get("server_filename") or "")
-        fs_id = str((it or {}).get("fs_id") or "")
-        if not name or not fs_id:
-            return ""
-        return "/sharelink%s-%s/%s" % (uk, fs_id, name)
-
-    out = []
-
-    def _walk(dir_path="", depth=0):
-        if depth > 4 or len(out) >= 50:
-            return
-        items = _list(dir_path)
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            if str(it.get("isdir") or "0") in ("1", "true"):
-                continue
-            name = str(it.get("server_filename") or it.get("filename") or "")
-            fid = str(it.get("fs_id") or "")
-            if fid and _is_video_name(name) and len(out) < 50:
-                out.append({"name": name, "fid": fid})
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            if str(it.get("isdir") or "0") not in ("1", "true"):
-                continue
-            child = _child_path(it)
-            if not child:
-                continue
-            _walk(child, depth + 1)
-            if len(out) >= 50:
-                return
-
-    _walk()
-    return out
+        pass
+    return ""
 
 
-def resolve_baidu_share(share_url="", fid=""):
-    """百度分享 → 真视频流。成功返回 (url, header_dict)，失败 None。
+def _baidu_context(share_url=""):
+    """百度分享 → 会话上下文（分享页 + verify）。失败 None。
 
     配方（真网已验证）：
-      verify → 分享页抽 uk/shareid → list 递归找视频 fs_id
-      → tplconfig 拿 sign/timestamp → streaming 出 m3u8
-    streaming 必须带 Cookie + Referer(分享页) + Origin，否则 errno=31341。
+      分享页抽 share_uk/shareid → 旧版 verify(shareid+uk) 拿 randsk（不触发图形验证码）
+    新版 verify(surl) 会被要求图形验证码；旧版 shareid+uk 接口仍可用。
     """
     if requests is None:
         return None
@@ -1988,78 +1662,86 @@ def resolve_baidu_share(share_url="", fid=""):
     pwd = mp.group(1) if mp else ""
     page_url = "https://pan.baidu.com/s/1" + surl + (("?pwd=" + pwd) if pwd else "")
     origin = "https://pan.baidu.com"
-    ajax = {
-        "X-Requested-With": "XMLHttpRequest",
-        "Origin": origin,
-        "Referer": origin + "/",
-    }
-    # 匿名会话（照 omnibox觅盘.js）：不预置 COOKIE_BAIDU，
-    # 只靠 verify+分享页种的完整罐；预置全量 Cookie 会让 streaming 回 errno=71
+
+    # 匿名会话：只需 verify 种下的 BDCLND，预置全量 Cookie 会触发 errno=71
     s = requests.Session()
     s.headers.update({
         "User-Agent": SITE_UA,
         "Accept-Language": "zh-CN,zh;q=0.9",
     })
 
-    # 1) verify → BDCLND（正确提取码偶发 -12/-9，短延迟重试；randsk 兜底进罐）
-    verify = {}
-    for attempt in range(3):
-        try:
-            verify = _json_post(
-                s,
-                "https://pan.baidu.com/share/verify?surl=%s&channel=channellist&clienttype=0&app_id=250528"
-                % quote(surl),
-                data={"pwd": pwd, "vcode": "", "vcode_str": ""},
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                    "Accept": "application/json, text/javascript, */*; q=0.01",
-                    "Referer": origin + "/",
-                    "Origin": origin,
-                },
-            ) or {}
-        except Exception:
-            verify = {}
-        errno = verify.get("errno")
-        if str(errno) in ("0", ""):
-            break
-        if str(errno) in ("-12", "-9") and attempt < 2:
-            time.sleep(0.8)
-            continue
-        break
-    if verify.get("randsk") and not s.cookies.get("BDCLND"):
-        try:
-            s.cookies.set("BDCLND", str(verify.get("randsk")), domain="pan.baidu.com")
-        except Exception:
-            pass
-
-    # 2) 分享页抽 share_uk / shareid（window.yunData 窗口，缺则 share_uk 锚点反转义）
+    # 1) 分享页抽 share_uk / shareid
     try:
-        r = s.get(page_url, headers={"Referer": origin + "/"}, timeout=15, verify=False)
-        raw = r.text or ""
+        raw = s.get(page_url, headers={"Referer": origin + "/"}, timeout=15, verify=False).text or ""
     except Exception:
         return None
-    seg = ""
-    yi = raw.find("window.yunData=")
-    if yi >= 0:
-        seg = raw[yi:yi + 1200]
-    else:
-        ai = raw.find("share_uk")
-        if ai >= 0:
-            seg = raw[max(0, ai - 600):ai + 1200].replace('\\"', '"')
-    mm = re.search(r'''["']?share_uk["']?\s*:\s*["']?(\d+)''', seg)
+    mm = re.search(r'''["']?share_uk["']?\s*:\s*["']?(\d+)''', raw)
     uk = mm.group(1) if mm else ""
-    mm = re.search(r'''["']?shareid["']?\s*:\s*["']?(\d+)''', seg)
+    mm = re.search(r'''["']?shareid["']?\s*:\s*["']?(\d+)''', raw)
     shareid = mm.group(1) if mm else ""
     if not uk or not shareid:
         return None
 
-    # 3) list 递归找第一个视频 fs_id（channel=channellist；sekey 仅在有 BDCLND 时带）
-    sekey = unquote(s.cookies.get("BDCLND") or "")
+    # 2) 旧版 verify（shareid+uk，不触发验证码）→ randsk/BDCLND
+    randsk = ""
+    if pwd:
+        verify = {}
+        try:
+            verify = _json_post(
+                s,
+                "https://pan.baidu.com/share/verify?shareid=%s&uk=%s&app_id=250528"
+                % (quote(shareid), quote(uk)),
+                data={"pwd": pwd},
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "Referer": page_url,
+                    "Origin": origin,
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+            ) or {}
+            randsk = str(verify.get("randsk") or "")
+        except Exception:
+            randsk = ""
+        if randsk and not _cookie_get(s, "BDCLND"):
+            try:
+                s.cookies.set("BDCLND", randsk, domain="pan.baidu.com")
+            except Exception:
+                pass
+        if str(verify.get("errno") or "0") not in ("0", ""):
+            return None
 
-    def _list(dir_path=""):
+    return {
+        "s": s,
+        "surl": surl,
+        "page_url": page_url,
+        "origin": origin,
+        "uk": uk,
+        "shareid": shareid,
+        "randsk": randsk,
+        "sekey": unquote(randsk or _cookie_get(s, "BDCLND") or ""),
+        "ajax": {
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": origin,
+            "Referer": page_url,
+            "Accept": "application/json, text/plain, */*",
+        },
+    }
+
+
+def _baidu_list_videos(ctx):
+    """递归列出百度分享中的全部视频，返回 [{name, fid}]。"""
+    videos = []
+    s = ctx["s"]
+    ajax = ctx["ajax"]
+    sekey = ctx["sekey"]
+
+    def walk(dir_path="", depth=0):
+        if depth > 4 or len(videos) >= 500:
+            return
         params = {
-            "shareid": shareid,
-            "uk": uk,
+            "shareid": ctx["shareid"],
+            "uk": ctx["uk"],
             "app_id": "250528",
             "channel": "channellist",
             "clienttype": "0",
@@ -2078,31 +1760,10 @@ def resolve_baidu_share(share_url="", fid=""):
             params["dir"] = dir_path
         else:
             params["root"] = "1"
-        data = _json_get(
-            s,
-            "https://pan.baidu.com/share/list",
-            params=params,
-            headers={"Referer": page_url, "Accept": "application/json, text/plain, */*"},
-        )
+        data = _json_get(s, "https://pan.baidu.com/share/list", params=params, headers=ajax)
         if not isinstance(data, dict) or str(data.get("errno", "0")) not in ("0", ""):
-            return []
-        lst = data.get("list")
-        return lst if isinstance(lst, list) else []
-
-    def _child_path(it):
-        raw_path = str((it or {}).get("path") or "")
-        if re.match(r"^/sharelink\d*-\d+(/|$)", raw_path):
-            return raw_path
-        name = str((it or {}).get("server_filename") or "")
-        fs_id = str((it or {}).get("fs_id") or "")
-        if not name or not fs_id:
-            return ""
-        return "/sharelink%s-%s/%s" % (uk, fs_id, name)
-
-    def _find_video(dir_path="", depth=0):
-        if depth > 4:
-            return None
-        items = _list(dir_path)
+            return
+        items = data.get("list") if isinstance(data.get("list"), list) else []
         for it in items:
             if not isinstance(it, dict):
                 continue
@@ -2111,34 +1772,32 @@ def resolve_baidu_share(share_url="", fid=""):
             name = str(it.get("server_filename") or it.get("filename") or "")
             fid = str(it.get("fs_id") or "")
             if fid and _is_video_name(name):
-                return {"fid": fid, "name": name}
+                videos.append({"name": name, "fid": fid, "dir": dir_path})
         for it in items:
             if not isinstance(it, dict):
                 continue
             if str(it.get("isdir") or "0") not in ("1", "true"):
                 continue
-            child = _child_path(it)
-            if not child:
-                continue
-            got = _find_video(child, depth + 1)
-            if got:
-                return got
-        return None
+            child = str(it.get("path") or "")
+            if child:
+                walk(child, depth + 1)
 
-    target = _find_video()
-    if not target:
-        return None
-    fs_id = str(fid or "") or target["fid"]
+    walk()
+    return videos
 
-    # 4) tplconfig → sign / timestamp
+
+def _baidu_stream(ctx, fs_id):
+    """百度分享文件 → m3u8 流。成功 (url, header)，失败 None。"""
+    s = ctx["s"]
+    ajax = ctx["ajax"]
     try:
         tpl = _json_get(
             s,
             "https://pan.baidu.com/share/tplconfig",
             params={
-                "surl": "1" + surl,
-                "shareid": shareid,
-                "uk": uk,
+                "surl": "1" + ctx["surl"],
+                "shareid": ctx["shareid"],
+                "uk": ctx["uk"],
                 "fields": "sign,timestamp",
                 "view_mode": "1",
             },
@@ -2156,22 +1815,158 @@ def resolve_baidu_share(share_url="", fid=""):
     if not sign:
         return None
 
-    # 5) streaming → m3u8/mp4（Cookie + Referer + Origin 必带）
-    stream_url = (
-        "https://pan.baidu.com/share/streaming?channel=chunlei"
-        "&uk=%s&fid=%s&sign=%s&timestamp=%s&shareid=%s"
-        "&type=M3U8_FLV_264_480&vip=0&check_blue=1&isplayer=1"
-    ) % (quote(uk), quote(fs_id), quote(sign), quote(timestamp), quote(shareid))
-    cookie = _cookie_header_for(s, stream_url)
+    # streaming → m3u8：M3U8_MP4_* 是非会员可用的「完整正片」转码（AVC 源可出 1080P，
+    # 单分片整片 MP4）；M3U8_AUTO/FLV 在非会员下只有 ~100 秒试看，仅作兜底。
     headers = {
         "User-Agent": SITE_UA,
-        "Referer": page_url,
-        "Origin": origin,
+        "Referer": ctx["page_url"],
+        "Origin": ctx["origin"],
     }
-    if cookie:
-        headers["Cookie"] = cookie
+    bdclnd = _cookie_get(s, "BDCLND") or ctx["randsk"]
+    if bdclnd:
+        headers["Cookie"] = "BDCLND=" + bdclnd
+    preview = None
+    for typ in ("M3U8_MP4_264_1080", "M3U8_MP4_264_720", "M3U8_MP4_264_480",
+                "M3U8_AUTO_1080", "M3U8_AUTO_720", "M3U8_AUTO_480",
+                "M3U8_FLV_264_480"):
+        stream_url = (
+            "https://pan.baidu.com/share/streaming?channel=chunlei"
+            "&uk=%s&fid=%s&sign=%s&timestamp=%s&shareid=%s"
+            "&type=%s&vip=0&check_blue=1&isplayer=1"
+        ) % (quote(ctx["uk"]), quote(str(fs_id)), quote(sign), quote(timestamp),
+             quote(ctx["shareid"]), typ)
+        try:
+            r = s.get(stream_url, headers=headers, timeout=20, verify=False)
+            if r.status_code != 200:
+                continue
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            body = r.content or b""
+            looks_m3u8 = "mpegurl" in ctype or body.lstrip().startswith(b"#EXTM3U")
+            looks_mp4 = (
+                "video/" in ctype
+                or "mp4" in ctype
+                or b"ftyp" in body[:32]
+                or body[:4] in (b"\x00\x00\x00\x18", b"\x00\x00\x00\x1c", b"\x00\x00\x00\x20")
+            )
+            if looks_m3u8:
+                dur = _m3u8_duration(body.decode("utf-8", "ignore"))
+                if dur >= 60:
+                    return stream_url, headers
+                if preview is None:
+                    preview = (stream_url, headers)
+                continue
+            if looks_mp4:
+                return stream_url, headers
+        except Exception:
+            continue
+    return preview
+
+
+def resolve_baidu_file(share_url="", file_id=""):
+    """百度分享中的指定文件 → 真视频流（选集播放用）。"""
+    ctx = _baidu_context(share_url)
+    if not ctx or not file_id:
+        return None
+    return _baidu_stream(ctx, file_id)
+
+
+def resolve_baidu_share(share_url=""):
+    """百度分享 → 真视频流（默认取分享内第一个视频）。"""
+    ctx = _baidu_context(share_url)
+    if not ctx:
+        return None
+    videos = _baidu_list_videos(ctx)
+    if not videos:
+        return None
+    return _baidu_stream(ctx, videos[0]["fid"])
+
+
+def _115_share_parts(share_url=""):
+    """分享链接 → (share_code, password)。"""
+    u = normalize_share_url(share_url)
+    m = re.search(r"115\.com/s/([A-Za-z0-9]+)", u or "")
+    if not m:
+        return "", ""
+    mp = re.search(r"[?&]password=([0-9A-Za-z]+)", u or "")
+    return m.group(1), (mp.group(1) if mp else "")
+
+
+def _115_snap_videos(session, code, pwd, cid="0", depth=0, out=None):
+    """递归列出 115 分享中的全部视频（含 fid/sha/size），返回列表。"""
+    if out is None:
+        out = []
+    if depth > 3 or len(out) >= 500:
+        return out
+    data = _json_get(
+        session,
+        "https://webapi.115.com/share/snap",
+        params={
+            "share_code": code,
+            "offset": "0",
+            "limit": "100",
+            "asc": "0",
+            "o": "",
+            "cid": str(cid),
+            "receive_code": pwd,
+            "format": "json",
+        },
+        headers={"Referer": "https://115.com/"},
+    )
+    if not isinstance(data, dict) or str(data.get("errno", "0")) not in ("0", ""):
+        return out
+    payload = data.get("data") if isinstance(data.get("data"), dict) else {}
+    if not isinstance(payload, dict):
+        return out
+    lst = payload.get("list")
+    if not isinstance(lst, list):
+        return out
+    for it in lst:
+        if not isinstance(it, dict):
+            continue
+        fid = str(it.get("fid") or it.get("file_id") or "")
+        name = str(it.get("n") or it.get("name") or it.get("server_filename") or "")
+        if fid and _is_video_name(name):
+            out.append({
+                "name": name,
+                "fid": fid,
+                "sha": str(it.get("sha") or ""),
+                "cid": str(it.get("cid") or ""),
+                "dir": str(cid),
+                "size": it.get("s") or 0,
+            })
+    # 再进子目录（fc=0 且有 cid、无 fid）
+    for it in lst:
+        if not isinstance(it, dict):
+            continue
+        if str(it.get("fid") or ""):
+            continue
+        sub_cid = str(it.get("cid") or "")
+        if not sub_cid:
+            continue
+        if str(it.get("fc") or "0") not in ("0", "", "None"):
+            continue
+        _115_snap_videos(session, code, pwd, sub_cid, depth + 1, out)
+    return out
+
+
+def _m3u8_duration(text):
+    """HLS 清单总时长（秒），用于识别百度 100 秒试看片单。"""
+    total = 0.0
+    for m in re.finditer(r"#EXTINF:\s*([\d.]+)", text or ""):
+        try:
+            total += float(m.group(1))
+        except Exception:
+            pass
+    return total
+
+
+def _probe_stream(session, url, headers=None, timeout=15):
+    """探测 url 是否返回可播放流（排除 HTML/JSON 页面）。"""
+    if not url:
+        return False
     try:
-        r = s.get(stream_url, headers=headers, timeout=20, verify=False, stream=True)
+        r = session.get(url, headers=headers or {}, timeout=timeout, verify=False, stream=True)
+        status = r.status_code
         ctype = (r.headers.get("Content-Type") or "").lower()
         head = b""
         try:
@@ -2182,276 +1977,229 @@ def resolve_baidu_share(share_url="", fid=""):
             r.close()
         except Exception:
             pass
-        if r.status_code != 200:
-            return None
-        text_head = head.decode("utf-8", "ignore") if head else ""
-        looks_m3u8 = "mpegurl" in ctype or text_head.lstrip().startswith("#EXTM3U")
-        looks_mp4 = (
-            "video/" in ctype
-            or "mp4" in ctype
-            or b"ftyp" in head[:32]
-            or head[:4] in (b"\x00\x00\x00\x18", b"\x00\x00\x00\x1c", b"\x00\x00\x00\x20")
-        )
-        if looks_m3u8 or looks_mp4:
-            return stream_url, headers
-        return None
+        if status not in (200, 206):
+            return False
+        if "html" in ctype or "json" in ctype:
+            return False
+        if "mpegurl" in ctype or head.lstrip().lower().startswith(b"#extm3u"):
+            return True
+        if "video/" in ctype or "octet-stream" in ctype:
+            return True
+        if head[:4] == b"\x1a\x45\xdf\xa3":  # mkv
+            return True
+        if len(head) >= 12 and head[4:8] == b"ftyp":  # mp4/mov
+            return True
+        if head[:1] in (b"\x47", b"\x00"):  # ts / 裸流
+            return True
+        return False
     except Exception:
-        return None
+        return False
 
 
-def _115_snap_list(session, code, pwd, cid="0", depth=0):
-    """递归列 115 分享目录，返回第一个视频 {name, fid}。"""
-    if depth > 3:
-        return None
+def _115_name_key(name):
+    """同名文件去重键：去掉「(1)」这类重复后缀。"""
+    s = str(name or "").strip()
+    return re.sub(r"\(\d+\)(?=\.[^.]*$)", "", s)
+
+
+def _115_find_pickcode(session, fname, sha=""):
+    """个人盘按文件名/哈希搜 pickcode（已转存/接收时可用）。"""
+    if not fname and not sha:
+        return ""
     data = _json_get(
         session,
-        "https://webapi.115.com/share/snap",
-        params={
-            "share_code": code,
-            "offset": "0",
-            "limit": "100",
-            "asc": "0",
-            "o": "",
-            "cid": str(cid),
-            "receive_code": pwd,
-            "format": "json",
-        },
+        "https://webapi.115.com/files/search",
+        params={"search_value": fname, "offset": "0", "limit": "115", "aid": "1", "cid": "0", "format": "json"},
         headers={"Referer": "https://115.com/"},
     )
-    if not isinstance(data, dict) or str(data.get("errno", "0")) not in ("0", ""):
-        return None
-    payload = data.get("data") if isinstance(data.get("data"), dict) else data
-    lst = payload.get("list") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return ""
+    # files/search：data 可能是列表（顶层 data:[...]），也可能是 {list:[...]}
+    raw_list = data.get("data")
+    if isinstance(raw_list, list):
+        lst = raw_list
+    elif isinstance(raw_list, dict):
+        lst = raw_list.get("list")
+        if isinstance(lst, dict):
+            lst = lst.get("list")
+    else:
+        lst = data.get("list")
+        if isinstance(lst, dict):
+            lst = lst.get("list")
     if not isinstance(lst, list):
+        return ""
+    want = _115_name_key(fname)
+    fuzzy = ""
+    for it in lst:
+        if not isinstance(it, dict):
+            continue
+        n = str(it.get("n") or it.get("name") or it.get("server_filename") or "")
+        p = str(it.get("pc") or it.get("pickcode") or "")
+        if not p:
+            continue
+        if sha and str(it.get("sha") or "").upper() == sha.upper():
+            return p
+        if n == fname:
+            return p
+        if not fuzzy and _115_name_key(n) == want:
+            fuzzy = p
+    return fuzzy
+
+
+def _115_play_by_pickcode(session, pc):
+    """个人盘文件 → 官方 m3u8 转码流。"""
+    if not pc:
         return None
-    # 先找视频文件（字段 fid，fc=1）
-    for it in lst:
-        if not isinstance(it, dict):
-            continue
-        fid = str(it.get("fid") or it.get("file_id") or "")
-        name = str(it.get("n") or it.get("name") or it.get("server_filename") or "")
-        if fid and _is_video_name(name):
-            return {"name": name, "fid": fid}
-    # 再进子目录（fc=0 且有 cid、无 fid）
-    for it in lst:
-        if not isinstance(it, dict):
-            continue
-        fid = str(it.get("fid") or "")
-        sub_cid = str(it.get("cid") or "")
-        if fid or not sub_cid:
-            continue
-        if str(it.get("fc") or "0") not in ("0", "", "None"):
-            continue
-        got = _115_snap_list(session, code, pwd, sub_cid, depth + 1)
-        if got:
-            return got
-    return None
-
-
-def _115_collect_videos(session, code, pwd, out, cid="0", depth=0):
-    """递归收集 115 分享内全部视频到 out（[{name,fid}]），深度/数量封顶。"""
-    if depth > 3 or len(out) >= 50:
-        return
-    data = _json_get(
-        session,
-        "https://webapi.115.com/share/snap",
-        params={
-            "share_code": code,
-            "offset": "0",
-            "limit": "100",
-            "asc": "0",
-            "o": "",
-            "cid": str(cid),
-            "receive_code": pwd,
-            "format": "json",
-        },
-        headers={"Referer": "https://115.com/"},
-    )
-    if not isinstance(data, dict) or str(data.get("errno", "0")) not in ("0", ""):
-        return
-    payload = data.get("data") if isinstance(data.get("data"), dict) else data
-    lst = payload.get("list") if isinstance(payload, dict) else None
-    if not isinstance(lst, list):
-        return
-    for it in lst:
-        if not isinstance(it, dict):
-            continue
-        fid = str(it.get("fid") or it.get("file_id") or "")
-        name = str(it.get("n") or it.get("name") or it.get("server_filename") or "")
-        if fid and _is_video_name(name):
-            if len(out) >= 50:
-                return
-            out.append({"name": name, "fid": fid})
-    for it in lst:
-        if not isinstance(it, dict):
-            continue
-        fid = str(it.get("fid") or "")
-        sub_cid = str(it.get("cid") or "")
-        if fid or not sub_cid:
-            continue
-        if str(it.get("fc") or "0") not in ("0", "", "None"):
-            continue
-        _115_collect_videos(session, code, pwd, out, sub_cid, depth + 1)
-        if len(out) >= 50:
-            return
-
-
-def _115_list_videos(share_url=""):
-    """列 115 分享内全部视频文件 [{name, fid}]，失败 []。"""
-    if requests is None:
-        return []
-    u = normalize_share_url(share_url)
-    m = re.search(r"115\.com/s/([A-Za-z0-9]+)", u or "")
-    if not m:
-        return []
-    code = m.group(1)
-    mp = re.search(r"[?&]password=([0-9A-Za-z]+)", u or "")
-    pwd = mp.group(1) if mp else ""
-    s = _new_pan_session("115")
-    out = []
-    _115_collect_videos(s, code, pwd, out)
-    return out
-
-
-def _115_probe_stream(session, url, referer="https://115.com/"):
-    """探活直链，成功 (url, header)。"""
-    h = {"User-Agent": SITE_UA, "Referer": referer or "https://115.com/"}
+    url = "https://115.com/api/video/m3u8/%s.m3u8" % pc
+    h = {"User-Agent": SITE_UA, "Referer": "https://115.com/"}
     cookie = _cookie_header_for(session, url)
     if cookie:
         h["Cookie"] = cookie
     try:
-        r = session.get(url, headers=h, timeout=15, verify=False, stream=True)
-        status = r.status_code
-        head = b""
-        try:
-            head = next(r.iter_content(32)) or b""
-        except Exception:
-            pass
-        try:
-            r.close()
-        except Exception:
-            pass
-        if status in (200, 206):
+        r = session.get(url, headers=h, timeout=15, verify=False)
+        if r.status_code == 200 and "#EXTM3U" in (r.text or "")[:200]:
             return url, h
-        # m3u8 文本即便非 200 探活失败也可能可播
-        if head.startswith(b"#EXTM3U"):
-            return url, h
-        return None
-    except Exception:
-        return url, h
-
-
-def resolve_115_share(share_url="", fid=""):
-    """115 分享 → 真视频流。成功 (url, header_dict)，失败 None。
-
-    fid 可选：选集 share|fid 指定文件时跳过 snap 列目录。
-    不依赖个人盘：
-      snap(+receive_code) 列文件拿 fid
-      → 优先 proapi share/downurl（RSA 加密，登录 Cookie）
-      → 个人盘 search 有 pc 时再试 m3u8 / files/video
-    """
-    if requests is None:
-        return None
-    u = normalize_share_url(share_url)
-    m = re.search(r"115\.com/s/([A-Za-z0-9]+)", u or "")
-    if not m:
-        return None
-    code = m.group(1)
-    mp = re.search(r"[?&]password=([0-9A-Za-z]+)", u or "")
-    pwd = mp.group(1) if mp else ""
-
-    s = _new_pan_session("115")
-    fname = ""
-    fid = str(fid or "").strip()
-    if not fid:
-        target = _115_snap_list(s, code, pwd)
-        if not target:
-            return None
-        fname = target["name"]
-        fid = target["fid"]
-
-    # 分享直链（不需个人盘副本）
-    direct = _115_share_downurl(s, code, pwd, fid)
-    if direct:
-        got = _115_probe_stream(s, direct, referer="https://115.com/s/%s" % code)
-        if got:
-            return got
-
-    # 个人盘按文件名搜 pickcode（用户已转存/接收时可用，m3u8 更稳）；无 fname 则跳过
-    pc = ""
-    if fname:
-        data = _json_get(
-            s,
-            "https://webapi.115.com/files/search",
-            params={"search_value": fname, "offset": "0", "limit": "115", "aid": "1", "cid": "0", "format": "json"},
-            headers={"Referer": "https://115.com/"},
-        )
-        if isinstance(data, dict):
-            raw_list = data.get("data")
-            if isinstance(raw_list, list):
-                lst = raw_list
-            elif isinstance(raw_list, dict):
-                lst = raw_list.get("list")
-                if isinstance(lst, dict):
-                    lst = lst.get("list")
-            else:
-                lst = data.get("list")
-                if isinstance(lst, dict):
-                    lst = lst.get("list")
-            if isinstance(lst, list):
-                for it in lst:
-                    if not isinstance(it, dict):
-                        continue
-                    n = str(it.get("n") or it.get("name") or it.get("server_filename") or "")
-                    p = str(it.get("pc") or it.get("pickcode") or "")
-                    if p and (n == fname or _is_video_name(n) or not n):
-                        pc = p
-                        break
-    if not pc:
-        return None
-
-    # 优先 m3u8
-    m3u8_url = "https://115.com/api/video/m3u8/%s.m3u8" % pc
-    cookie = _cookie_header_for(s, m3u8_url)
-    h = {"User-Agent": SITE_UA, "Referer": "https://115.com/"}
-    if cookie:
-        h["Cookie"] = cookie
-    try:
-        r = s.get(m3u8_url, headers=h, timeout=15, verify=False)
-        body_head = (r.text or "")[:200]
-        if r.status_code == 200 and "#EXTM3U" in body_head:
-            return m3u8_url, h
     except Exception:
         pass
-
-    # 回退 files/video → origin_file_url
-    data = _json_get(
-        s,
-        "https://webapi.115.com/files/video",
-        params={"pickcode": pc, "format": "json"},
-        headers={"Referer": "https://115.com/"},
-    )
-    origin = ""
-    if isinstance(data, dict):
-        payload = data.get("data") if isinstance(data.get("data"), dict) else data
-        if isinstance(payload, dict):
-            origin = str(payload.get("origin_file_url") or payload.get("url") or "")
-    if not origin:
-        return None
-    got = _115_probe_stream(s, origin)
-    if got:
-        return got
     return None
 
 
-def resolve_share_media(share_url="", drive_type="", fid=""):
-    """按网盘类型解析成真视频流。成功 (url, header)，失败 None。fid 可选指定文件。"""
+def _115_receive(session, code, pwd, fid=""):
+    """把分享文件转存到个人盘；已转存过也视为成功（不重复转存）。"""
+    try:
+        form = {"share_code": code, "receive_code": pwd}
+        if fid:
+            form["file_id"] = fid
+        r = session.post(
+            "https://webapi.115.com/share/receive",
+            data=form,
+            headers={
+                "User-Agent": SITE_UA,
+                "Referer": "https://115.com/s/%s" % code,
+                "Origin": "https://115.com",
+            },
+            timeout=15,
+            verify=False,
+        )
+        data = r.json() if r.text else {}
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    # 4200045 文件已接收 / 4100024 已经转存过该文件
+    if str(data.get("errno") or "") in ("4200045", "4100024"):
+        return True
+    return bool(data.get("state"))
+
+
+def _115_skip_login_url(session, code, pwd, fid):
+    """分享者开启「免登录下载」时可直接取直链。"""
+    try:
+        r = session.post(
+            "https://webapi.115.com/share/skip_login_downurl",
+            data={"share_code": code, "receive_code": pwd, "file_id": fid},
+            headers={
+                "User-Agent": SITE_UA,
+                "Referer": "https://115.com/s/%s" % code,
+                "Origin": "https://115.com",
+            },
+            timeout=15,
+            verify=False,
+        )
+        data = r.json() if r.text else {}
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not data.get("state"):
+        return None
+    payload = data.get("data") if isinstance(data.get("data"), dict) else {}
+    url = ""
+    for key in ("url", "file_url", "downurl"):
+        val = payload.get(key)
+        if isinstance(val, dict):
+            url = str(val.get("url") or "")
+        elif isinstance(val, str):
+            url = val
+        if url:
+            break
+    if not url:
+        return None
+    h = {"User-Agent": SITE_UA, "Referer": "https://115.com/"}
+    if _probe_stream(session, url, h):
+        return url, h
+    return None
+
+
+def resolve_115_file(share_url="", file_id="", name="", sha=""):
+    """115 分享中的指定文件 → 真视频流（选集播放用）。"""
+    if requests is None:
+        return None
+    code, pwd = _115_share_parts(share_url)
+    if not code or not file_id:
+        return None
+    s = _new_pan_session("115")
+    cookie = pan_cookie("115")
+    if cookie:
+        # 1) 个人盘已有该文件（按 sha/文件名匹配）
+        got = _115_play_by_pickcode(s, _115_find_pickcode(s, name, sha))
+        if got:
+            return got
+        # 2) 转存该集后再取 m3u8
+        if _115_receive(s, code, pwd, file_id):
+            for _attempt in range(4):
+                time.sleep(1.2)
+                got = _115_play_by_pickcode(s, _115_find_pickcode(s, name, sha))
+                if got:
+                    return got
+    # 3) 免登录下载直链
+    return _115_skip_login_url(s, code, pwd, file_id)
+
+
+def resolve_115_share(share_url=""):
+    """115 分享 → 真视频流。成功 (url, header_dict)，失败 None。
+
+    顺序：
+      1) 个人盘已有同名文件 → 官方 m3u8（最稳定，无副作用）
+      2) 转存到个人盘 → 轮询 pickcode → 官方 m3u8
+      3) /share/skip_login_downurl（分享者开启免登录下载）
+    无有效 115 Cookie 时只有第 3 步可能成功。
+    """
+    if requests is None:
+        return None
+    code, pwd = _115_share_parts(share_url)
+    if not code:
+        return None
+    videos = _115_snap_videos(_new_pan_session("115"), code, pwd)
+    if not videos:
+        return None
+    first = videos[0]
+    return resolve_115_file(share_url, first["fid"], first.get("name") or "", first.get("sha") or "")
+
+
+def resolve_share_media_file(share_url="", drive_type="", file_id="", name="", sha=""):
+    """选集：按网盘类型解析分享中的指定文件。失败回退整条分享解析。"""
+    try:
+        dt = normalize_drive_type(drive_type or infer_drive_type_from_share_url(share_url))
+        if dt == "115" and file_id:
+            got = resolve_115_file(share_url, file_id, name, sha)
+            if got:
+                return got
+        if dt == "baidu" and file_id:
+            got = resolve_baidu_file(share_url, file_id)
+            if got:
+                return got
+    except Exception:
+        pass
+    return resolve_share_media(share_url, drive_type)
+
+
+def resolve_share_media(share_url="", drive_type=""):
+    """按网盘类型解析成真视频流。成功 (url, header)，失败 None。"""
     try:
         dt = normalize_drive_type(drive_type or infer_drive_type_from_share_url(share_url))
         if dt == "baidu":
-            return resolve_baidu_share(share_url, fid=fid)
+            return resolve_baidu_share(share_url)
         if dt == "115":
-            return resolve_115_share(share_url, fid=fid)
+            return resolve_115_share(share_url)
     except Exception:
         return None
     return None
@@ -2469,6 +2217,10 @@ class Spider(BaseSpider):
                 self.options = {}
         else:
             self.options = {}
+        if not isinstance(self.options, dict):
+            self.options = {}
+        # 允许在源配置里直接填网盘 Cookie（如 {"cookie115": "..."}）
+        apply_extend_options(self.options)
 
     def getName(self):
         return "蜗牛4K"
@@ -2700,36 +2452,47 @@ class Spider(BaseSpider):
             vid = normalize_video_id(raw)
             if not vid:
                 return {"list": [], "page": 1, "pagecount": 0, "limit": PAGE_SIZE, "total": 0}
-            return _movie_drive_groups_by_vid(vid)
+
+            body, base = _get_detail_cached(vid)
+            info = parse_vod_base_info(body, base)
+            pan_urls = extract_pan_urls(body)
+            groups = build_movie_drive_groups(vid, info["vodName"], info["vodPic"], pan_urls, info)
+            if groups:
+                return {
+                    "list": groups,
+                    "page": 1,
+                    "pagecount": 1,
+                    "limit": PAGE_SIZE,
+                    "total": len(groups),
+                }
+            return {"list": [], "page": 1, "pagecount": 0, "limit": PAGE_SIZE, "total": 0}
         except Exception as e:
             return {"list": [], "page": 1, "pagecount": 0, "limit": PAGE_SIZE, "total": 0,
                     "msg": "详情加载失败：" + str(e)}
 
     # ---------- 播放 ----------
-    def playerContent(self, flag, ids, vipFlags=None):
-        if isinstance(ids, (list, tuple)):
-            raw_id = str(ids[0]) if ids else ""
-        else:
-            raw_id = str(ids or "")
-        play_id = raw_id.strip()
+    def playerContent(self, flag, id, vipFlags):
+        play_id = str(id or "").strip()
         if not play_id:
             return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
                     "msg": "播放地址为空"}
 
         share_url = play_id
-        file_id = ""
-        # 支持 shareURL|fileId 选集播放 id
+        # 支持 shareURL|fileId|... 取首段
         if "|" in play_id:
-            parts = play_id.split("|", 1)
-            share_url = parts[0]
-            if len(parts) > 1 and parts[1].strip():
-                file_id = parts[1].strip()
-        # encodeId r
+            share_url = play_id.split("|", 1)[0]
+        # encodeId r（整条分享）/ e（指定集）
         typ, data = decode_id(play_id)
+        file_id = ""
+        file_name = ""
+        file_sha = ""
         if typ == "r" and data.get("u"):
             share_url = normalize_share_url(data.get("u"))
-            if data.get("f"):
-                file_id = str(data.get("f"))
+        elif typ == "e" and data.get("u"):
+            share_url = normalize_share_url(data.get("u"))
+            file_id = str(data.get("f") or "")
+            file_name = str(data.get("n") or "")
+            file_sha = str(data.get("h") or "")
         share_url = normalize_share_url(share_url)
         if not share_url and re.match(r"^https?://", play_id, re.I):
             share_url = play_id
@@ -2751,8 +2514,8 @@ class Spider(BaseSpider):
         if ck:
             header["Cookie"] = ck
 
-        # 解析成真视频流（m3u8/mp4）；失败绝不回退分享页 HTML
-        resolved = resolve_share_media(share_url, drive_type, fid=file_id)
+        # 先解析成真视频流（m3u8/mp4），避免分享页 HTML 触发 container unsupported
+        resolved = resolve_share_media_file(share_url, drive_type, file_id, file_name, file_sha)
         if resolved and resolved[0]:
             stream_url, stream_header = resolved
             return {
@@ -2764,32 +2527,23 @@ class Spider(BaseSpider):
                 "flag": flag or "",
             }
 
-        return {
+        # 回退：分享页直链（parse=0 交宿主网盘插件；parse=1 会嗅探失败）
+        hint = ""
+        if drive_type == "115":
+            hint = "115 解析失败：请确认源配置 cookie115 有效、115 账号有网盘空间"
+        elif drive_type == "baidu":
+            hint = "百度分享解析失败：请确认分享链接与提取码有效"
+        result = {
             "parse": 0,
             "jx": 0,
             "playUrl": "",
-            "url": "",
-            "header": {},
+            "url": share_url,
+            "header": header,
             "flag": flag or "",
-            "msg": "网盘分享无法解析为视频直链（需有效 Cookie 或分享可直链）",
         }
-
-    # ---------- CatVod 挂载契约（对齐 hsck） ----------
-    def getDependence(self):
-        return []
-
-    def isVideoFormat(self, url):
-        u = str(url or "").lower().split("?")[0].split("#")[0]
-        return u.endswith((".mp4", ".m3u8", ".flv", ".mkv", ".ts", ".avi", ".m4v", ".webm"))
-
-    def manualVideoCheck(self):
-        return False
-
-    def action(self, action):
-        return {}
-
-    def localProxy(self, param):
-        return [404, "text/plain", b"Not Found", {}]
+        if hint:
+            result["msg"] = hint
+        return result
 
     def destroy(self):
         pass
