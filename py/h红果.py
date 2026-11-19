@@ -89,6 +89,7 @@ import binascii
 import bisect
 import hashlib
 import json
+import zlib
 import os
 import lzma
 import random
@@ -1763,11 +1764,17 @@ class _StreamSession:
             cursor += len(block)
 
 
-def _fresh_device_pair() -> tuple[str, str]:
-    return (
-        str(random.randint(10**17, 10**18 - 1)),
-        str(random.randint(10**17, 10**18 - 1)),
-    )
+def _fresh_device_pair() -> dict[str, str]:
+    try:
+        import uuid as _uuid
+        cdid = str(_uuid.uuid4())
+    except Exception:
+        cdid = ""
+    return {
+        "device_id": str(random.randint(10**17, 10**18 - 1)),
+        "install_id": str(random.randint(10**17, 10**18 - 1)),
+        "cdid": cdid,
+    }
 
 
 def _is_empty_model_error(err: BaseException) -> bool:
@@ -1781,11 +1788,12 @@ def _is_empty_model_error(err: BaseException) -> bool:
     )
 
 
-def _register_device_pair() -> tuple[str, str] | None:
+def _register_device_pair() -> dict[str, str] | None:
     try:
         import uuid as _uuid
         openudid = "".join(random.choice("0123456789abcdef") for _ in range(16))
-        header = {"display_name": "红果免费短剧", "aid": 8662, "app_version": "7.3.5.32", "version_code": 73532, "manifest_version_code": 73532, "update_version_code": 73532, "channel": "update_64", "package": "com.phoenix.read", "app_language": "zh", "os": "Android", "os_version": "16", "os_api": 36, "device_model": "25053RT47C", "device_brand": "Redmi", "device_manufacturer": "Xiaomi", "cpu_abi": "arm64-v8a", "density_dpi": 520, "display_density": "xxhdpi", "resolution": "2772x1280", "language": "zh", "timezone": 8, "access": "wifi", "openudid": openudid, "clientudid": str(_uuid.uuid4()), "cdid": str(_uuid.uuid4()), "region": "CN", "tz_name": "Asia/Shanghai", "tz_offset": 28800, "sim_region": "cn", "device_platform": "android", "not_request_sender": 0, "is_system_app": 0, "sdk_flavor": "china", "rom": "OS2.0", "rom_version": "BP2A.250605.031.A3"}
+        cdid = str(_uuid.uuid4())
+        header = {"display_name": "红果免费短剧", "aid": 8662, "app_version": "7.3.5.32", "version_code": 73532, "manifest_version_code": 73532, "update_version_code": 73532, "channel": "update_64", "package": "com.phoenix.read", "app_language": "zh", "os": "Android", "os_version": "16", "os_api": 36, "device_model": "25053RT47C", "device_brand": "Redmi", "device_manufacturer": "Xiaomi", "cpu_abi": "arm64-v8a", "density_dpi": 520, "display_density": "xxhdpi", "resolution": "2772x1280", "language": "zh", "timezone": 8, "access": "wifi", "openudid": openudid, "clientudid": str(_uuid.uuid4()), "cdid": cdid, "region": "CN", "tz_name": "Asia/Shanghai", "tz_offset": 28800, "sim_region": "cn", "device_platform": "android", "not_request_sender": 0, "is_system_app": 0, "sdk_flavor": "china", "rom": "OS2.0", "rom_version": "BP2A.250605.031.A3"}
         body = json.dumps({"magic_tag": "ss_app_log", "header": header, "_gen_time": int(time.time() * 1000)}).encode("utf-8")
         qs = urlencode({"req_id": str(_uuid.uuid4()), "_rticket": int(time.time() * 1000)})
         resp = requests.post(
@@ -1804,7 +1812,7 @@ def _register_device_pair() -> tuple[str, str] | None:
         did = str(data.get("device_id_str") or data.get("device_id") or "")
         iid = str(data.get("install_id_str") or data.get("install_id") or "")
         if did.isdigit() and iid.isdigit() and did != "0" and iid != "0":
-            return did, iid
+            return {"device_id": did, "install_id": iid, "cdid": cdid}
     except Exception as err:
         try:
             _hg_trace("设备注册失败 %s" % str(err)[:80])
@@ -1833,7 +1841,8 @@ def _device_memo_load() -> dict[str, str] | None:
             return None
         if time.time() - float(data.get("time") or 0) > _DEVICE_MEMO_MAX_AGE:
             return None
-        return {"device_id": device_id, "install_id": install_id}
+        cdid = str(data.get("cdid") or "")
+        return {"device_id": device_id, "install_id": install_id, "cdid": cdid}
     except Exception:
         return None
 
@@ -1844,6 +1853,7 @@ def _device_memo_save(pair: Mapping[str, Any], registered: bool) -> None:
         return
     device_id = str(pair.get("device_id") or "")
     install_id = str(pair.get("install_id") or "")
+    cdid = str(pair.get("cdid") or "")
     if not (device_id.isdigit() and install_id.isdigit()):
         return
     try:
@@ -1851,7 +1861,7 @@ def _device_memo_save(pair: Mapping[str, Any], registered: bool) -> None:
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(
-                {"device_id": device_id, "install_id": install_id, "registered": True, "time": time.time()},
+                {"device_id": device_id, "install_id": install_id, "cdid": cdid, "registered": True, "time": time.time()},
                 fh,
             )
         os.replace(tmp, path)
@@ -1875,34 +1885,46 @@ def _rotate_stream_device() -> dict[str, str]:
     _device_memo_discard()
     registered = _register_device_pair()
     if registered is not None:
-        device_id, install_id = registered
+        pair = dict(registered)
         is_registered = True
     else:
-        device_id, install_id = _fresh_device_pair()
+        pair = _fresh_device_pair()
         is_registered = False
-    pair = {"device_id": device_id, "install_id": install_id}
     with _STREAM_LOCK:
         stored = dict(pair)
         stored["registered"] = is_registered
         _STREAM_STATE["device"] = stored
     if is_registered:
         _device_memo_save(stored, True)
-        _hg_trace("设备轮换注册成功 did=%s" % device_id[:6])
-    return pair
+        _hg_trace("设备轮换注册成功 did=%s" % str(pair.get("device_id", ""))[:6])
+    return {"device_id": str(pair.get("device_id", "")), "install_id": str(pair.get("install_id", "")), "cdid": str(pair.get("cdid", ""))}
 
 
 def _working_device_pair() -> dict[str, str] | None:
     with _STREAM_LOCK:
         pair = _STREAM_STATE.get("device")
     if isinstance(pair, dict) and pair.get("device_id") and pair.get("install_id"):
-        return {"device_id": str(pair["device_id"]), "install_id": str(pair["install_id"])}
+        if not pair.get("cdid"):
+            try:
+                import uuid as _uuid
+                pair["cdid"] = str(_uuid.uuid4())
+            except Exception:
+                pair["cdid"] = ""
+        return {"device_id": str(pair["device_id"]), "install_id": str(pair["install_id"]), "cdid": str(pair.get("cdid") or "")}
     # 内存无对 → 兜底读盘(重载后模块内存态清零，但注册对不该丢)
     memo = _device_memo_load()
     if memo:
+        if not memo.get("cdid"):
+            try:
+                import uuid as _uuid
+                memo["cdid"] = str(_uuid.uuid4())
+            except Exception:
+                memo["cdid"] = ""
         with _STREAM_LOCK:
             _STREAM_STATE["device"] = {
                 "device_id": memo["device_id"],
                 "install_id": memo["install_id"],
+                "cdid": memo.get("cdid", ""),
                 "registered": True,
             }
         return dict(memo)
@@ -1919,11 +1941,13 @@ def _video_model_rotating(video_id: str, config: Mapping[str, Any]) -> dict[str,
     try:
         config["device_id"] = pair["device_id"]
         config["install_id"] = pair["install_id"]
+        config["cdid"] = pair.get("cdid", "")
     except (TypeError, AttributeError):
         # Mapping 不可变：合并而非整替，保留 x_tt_dt 等可选字段
         merged = dict(config) if isinstance(config, Mapping) else {}
         merged["device_id"] = pair["device_id"]
         merged["install_id"] = pair["install_id"]
+        merged["cdid"] = pair.get("cdid", "")
         config = merged
     return _video_model(video_id, config)
 
@@ -1938,6 +1962,8 @@ def _stream_session(video_id: str, config: Mapping[str, Any], quality: str = "10
         if pair:
             cfg["device_id"] = pair["device_id"]
             cfg["install_id"] = pair["install_id"]
+            if not cfg.get("cdid"):
+                cfg["cdid"] = pair.get("cdid", "")
     cache_key = "%s|%s" % (video_id, quality)
     with _STREAM_LOCK:
         sessions = _STREAM_STATE["sessions"]
@@ -4488,6 +4514,7 @@ def _device_config(config: Mapping[str, Any]) -> dict[str, str]:
         raise HongguoPluginError("缺少红果 device_id/install_id 配置")
     return {
         "device_id": device_id, "iid": install_id, "install_id": install_id,
+        "cdid": _text(config.get("cdid")),
         "device_brand": "Redmi", "device_model": "25053RT47C", "device_type": "25053RT47C",
         "device_manufacturer": "Xiaomi", "os_version": "16", "version_name": "7.1.3.32",
         "x_tt_dt": _text(config.get("x_tt_dt")),
@@ -4496,66 +4523,557 @@ def _device_config(config: Mapping[str, Any]) -> dict[str, str]:
         "ua": APP_UA,
     }
 
+
+# ---------------------------- V5 播放签名（对齐 HGTV.js / player/v1） ----------------------------
+_V5_PLAYER_API = "https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/player/v1"
+_V5_PLAYER_API_ALT = "https://api5-normal-sinfonlinea.fqnovel.com/novel/player/multi_video_model/player/v1"
+_V5_UA = "com.phoenix.read/73932 (Linux; U; Android 12; zh_CN_#Hans; PGT-AN10; Build/V417IR;tt-ok/3.12.13.20)"
+_V5_PROFILE = {
+    "aid": "8662", "app_name": "novelread", "version_code": "74332", "version_name": "7.4.3.32",
+    "channel": "vivo_8662_64", "device_platform": "android", "device_type": "PGT-AN10", "os_version": "12",
+    "update_version_code": "74332",
+}
+_V5_BIZ_PARAM = {
+    "detail_page_version": 0, "device_level": 3,
+    "disable_digg_stat": False, "disable_video_relate_book": False,
+    "need_all_video_definition": True, "need_mp4_align": False,
+    "use_os_player": False, "use_server_dns": False, "video_platform": 1024,
+}
+_V5_MAGIC = bytes.fromhex("2d4b4fca49750d433fb5ae2c226dcc56")
+_V5_SIGN_KEY = bytes.fromhex("b23c2a470a20d105dc3f8c4438f8272ed46d6c89ffdcdedd5108698d26e9489d")
+_V5_PROCESS_NONCE = base64.urlsafe_b64encode(bytes(random.getrandbits(8) for _ in range(18))).rstrip(b"=").decode()
+_V5_PROCESS_STARTED = int(time.time() * 1000)
+
+_V5_SBOX = bytes.fromhex(
+    "53290fe9e51f316f90f74a7e034d367784ab49237cd0135cdc632c322fd3be0e2624a417ecd9151a7ff64f60730a87f9"
+    "445ec6ada2f865d22b696c4188f24c0df37b75510b939f6bc2fe6883e68bc8c722181ba0bdb08c9871b50c9a16b46eea"
+    "8eed20ba4b8a14e0fcf1468dbbef05a93e5a9d7dcf06898635c1fd99f5de287a80c594daaab19b6279fbd75070cb52eb"
+    "2555c456e39e7839853874e2f0013ac0b64742d8ca10e4b79c955de8b843ce4ed464a6a72ed508091c92e7b3eedd1e1d"
+    "d12afac321618fa3d65f9167c982f43d66a53c6a1997585b346dbf9672ff37cdbc073b2dae11453304df00815476b2a1"
+    "3fccdb30b957a8acafe127400248591238922563e36406d37a24100b7902a028044e218453c2a399199c9d13dc40c55b"
+    "a67e502273850ebdc1a2e2188b8f2d9e3cb909b8c46a2a9f4a6dd93007eafa65b7b3a881aa908cc74f0ad76bbbb58617"
+    "c37012ca05a469fd44e62eecf1e4272ce860c0ae5eadf99b20d8f0234174006f3f110d7657d01645d4eff8f71471cbfe"
+    "1cb2f52648727bf3c9de55153e031b4d61757db63dbf7782eeafe9018a8891362fb14759ac32bab03b349aeb5a377c51"
+    "56be4c8dfbe13a684bda39cf836697c894545fe0f2491acea9fc6252f4ff1e0fe72bd2df6e67a7f635e5bcc6d1a5dd95"
+    "1d89960887a18eb40c785cdb1f80ed42299333ab98cdd67f316cd54346585dccd759fb722789b08807cc0fda293f7e5e"
+    "1819bb0353517020b31d3d00374952bea2c421e862040a9ec892a05b266b7a0d0cc316f483b81af39715657ffe32ad8d"
+    "e0c13077646035236ee5363e5f900e9a7cf850a81cd9960b6df73317226f99eaa6fff15cec34acb98246639b918ab285"
+    "1466a7cdfc4ad1b52c2ae95a58d3734e47ddd5b7560193f644ef9c408b7dee39b4d6aabf4de761e3252d4c7ba3843187"
+    "745d55e6a5db05d42b45caed43c0c5d0b64bfa9d94a4a9d8f2f0e1a108dcfd288fd2bc1fc7bd675412138169cb092498"
+    "75ba3b68cfb11180afae104fc9789571c6dfce02413886796ae21e3c488cc21b9f423a066c2eabf98e2fdeeb5776e4f5"
+    "d09a515ba58cbbab3e37b09fd4f6d9244df80512e84cd7956be301cf64f1429d58577cc241f3a2c655144f81aaf95a4e"
+    "108da894b38970561ae9002619fbbac91fa922ed202bfc62cb08e0de2a7f3631435f8b47c8a3c563b4db4071ce74c46d"
+    "a6fa696a9e282d1e825d663b93bfd56c48dce1884bb10fccea063929f746443fd830a4232e53da21a1f2d1bdfebc3a02"
+    "c10a1b8ad31d04fd616590d272ac737e98eb33af60528716bee78ec0ee8699031177277d9cff32542c67caf5f4459168"
+    "1335ae0e178f3409a7803db83892dde5b9b7f0c750e24aef077badd678a09b850b84ec1597e4963cb5e675df1c0d6fb6"
+    "18496ecd76c35c798325590c2fb27a5e"
+)
+_V5_HASH_TABLE = [
+    0xebb64faf,0x07aadcc2,0xcf3187bf,0xe01138ff,0x6d0bfcff,0x5a30a3be,0xb41ad638,0x34180eb8,
+    0xf233eb6f,0xb1a584cc,0xccc30dc7,0x47d1db51,0xd55653de,0x70a84fa1,0x57473c12,0xf76f0288,
+    0x2c077f0a,0xda0dcad0,0xfbb86f6c,0xfdc4cf00,0x688a020d,0xe676c6a6,0x8cd6338b,0x1a3c8d0e,
+    0xcce8b06b,0x6ad0ed0b,0xa0522717,0xdc71ac83,0x2285db71,0xd5b4dda6,0x736f8650,0x6560306c,
+    0x617ce2a6,0xe423417e,0x0a40e143,0x544e4032,0x88dffb2a,0x716c1ae0,0x4c467a88,0x05b23bb3,
+    0xe1d0b866,0xbaa3dcb8,0xae3374d3,0xc3381a50,0x1702f75b,0xfe6da368,0xf0b4cf48,0x4e0ffbb8,
+    0x72aad10d,0x26c53a3d,0xf2bce0f6,0xb4557581,0x4a257fdd,0x8c3182a2,0xab0b3b86,0x3d5dfb14,
+    0x4f103634,0xd37b52d7,0x444eff16,0xeb0a33d1,0x6ca86f6e,0x0284ba7,0x08387cfa,0x5fb37586,
+]
+
+def _v5_gzip_stored(data: bytes) -> bytes:
+    crc = (zlib.crc32(data) & 0xFFFFFFFF)
+    size = len(data) & 0xFFFFFFFF
+    out = bytearray(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03")
+    if not data:
+        out.extend(b"\x01\x00\x00\xff\xff")
+    else:
+        for off in range(0, len(data), 65535):
+            chunk = data[off:off + 65535]
+            last = 1 if off + len(chunk) >= len(data) else 0
+            ln = len(chunk)
+            out.append(last)
+            out.extend(struct.pack("<HH", ln, (~ln) & 0xFFFF))
+            out.extend(chunk)
+    out.extend(struct.pack("<II", crc, size))
+    return bytes(out)
+
+def _v5_u32(v): return v & 0xFFFFFFFF
+def _v5_rol32(v, n):
+    n &= 31
+    return _v5_u32((v << n) | (v >> (32 - n)))
+def _v5_ror32(v, n): return _v5_rol32(v, 32 - (n & 31))
+def _v5_ror64(v, n):
+    n &= 63
+    return ((v >> n) | (v << (64 - n))) & 0xFFFFFFFFFFFFFFFF
+def _v5_le32(v): return struct.pack("<I", v & 0xFFFFFFFF)
+def _v5_xor(a, b):
+    n = min(len(a), len(b))
+    return bytes(x ^ y for x, y in zip(a[:n], b[:n]))
+def _v5_varint(value):
+    n = int(value)
+    out = bytearray()
+    while n > 127:
+        out.append((n & 127) | 128)
+        n >>= 7
+    out.append(n)
+    return bytes(out)
+def _v5_proto(fields):
+    parts = []
+    for tag, value, *rest in fields:
+        kind = rest[0] if rest else "bytes"
+        if kind == "sint":
+            n = int(value)
+            zz = ((-n * 2) - 1) if n < 0 else (n * 2)
+            parts.append(_v5_varint(tag * 8)); parts.append(_v5_varint(zz))
+            continue
+        raw = value.encode("utf-8") if isinstance(value, str) else bytes(value)
+        if not raw:
+            continue
+        parts.append(_v5_varint(tag * 8 + 2)); parts.append(_v5_varint(len(raw))); parts.append(raw)
+    return b"".join(parts)
+
+def _v5_get_iv(initial, data):
+    value = initial & 0xFFFFFFFF
+    for i, byte in enumerate(data):
+        if (i & 1) == 0:
+            value = _v5_u32((value >> 4) ^ value ^ _v5_u32(value << 6) ^ byte)
+        else:
+            tmp = _v5_u32((value >> 7) ^ value ^ (byte | _v5_u32(value << 12)))
+            value = (~tmp) & 0xFFFFFFFF
+    return value & 0xFFFFFFFF
+
+def _v5_branch(query, body, ts):
+    return _v5_get_iv(_v5_get_iv(_v5_get_iv(0x20230928, query), body), _v5_le32(ts)) & 15
+
+def _v5_sum_md5(data):
+    check = 0x20220420
+    for i in range(12):
+        temp = _v5_u32((check >> (3 if (i & 1) == 0 else 5)) ^ check)
+        if (i & 1) == 0:
+            expr = _v5_u32(data[i] ^ _v5_u32(check << 7))
+        else:
+            expr = (~_v5_u32(data[i] | _v5_u32(check << 11))) & 0xFFFFFFFF
+        check = _v5_u32(expr ^ temp)
+    return _v5_u32((check | 4) ^ 0x1000000)
+
+def _v5_hash_f13(query, body, ts):
+    if _v5_branch(query, body, ts) != 12:
+        raise Exception("Unsupported v5 hash branch")
+    seed = 0x9d4a97c2
+    count = _v5_u32(seed + ts)
+    table = [_v5_ror32(v, (count + 1) & 31) for v in _V5_HASH_TABLE]
+    shift = (count + 2) & 7
+    pad = bytes(((v | (v << 8)) >> shift) & 255 for v in (0xfa, 0x45, 0x61, 0xd7))
+    data = query + body + _v5_le32(ts) + pad + bytes.fromhex("00000000000001a0")
+    schedule = [struct.unpack_from(">I", data, i)[0] for i in range(0, len(data), 4)]
+    for n in range(112):
+        x = schedule[n + 1]; y = schedule[n + 14]
+        value = _v5_u32(schedule[n] + schedule[n + 9]
+            + (_v5_rol32(x, 14) ^ _v5_rol32(x, 25) ^ (x >> 3))
+            + (_v5_rol32(y, 13) ^ _v5_rol32(y, 15) ^ (y >> 10)))
+        schedule.append(value)
+    initial = [
+        _v5_ror32(0x7aba4fc8, count & 31), _v5_ror32(0x67166507, count & 31),
+        _v5_ror32(0x6403fa00, count & 31), _v5_ror32(0x340f512f, count & 31),
+        _v5_ror32(984304912, count & 31), _v5_ror32(3005047866, count & 31),
+        _v5_ror32(2874125293, count & 31), _v5_ror32(2152413264, count & 31),
+    ]
+    state = initial[:]
+    for r in range(96):
+        base = seed + r
+        n1 = ((state[4] ^ state[0]) & state[1]) ^ state[4]
+        n2 = _v5_rol32(state[1], 26) ^ _v5_rol32(state[1], 21) ^ _v5_rol32(state[1], 7)
+        n4 = _v5_u32(schedule[base & 127] + n1 + n2 + table[base & 63] + state[6])
+        n5 = _v5_rol32(state[3], 30) ^ _v5_rol32(state[3], 19) ^ _v5_rol32(state[3], 10)
+        n6 = ((state[3] & state[5]) | ((state[3] | state[5]) & state[2])) & 0xFFFFFFFF
+        old = state[7]
+        state = [state[7], state[0], state[1], state[2], state[3], state[4], state[5], state[6]]
+        state[7] = _v5_u32(n5 + n6 + n4)
+        state[0] = _v5_u32(old + n4)
+    output = bytearray(32)
+    for o in range(8):
+        w = _v5_u32(state[o] + initial[o])
+        struct.pack_into(">I", output, o * 4, w)
+    folded = _v5_xor(bytes(output[:16]), bytes(output[16:32]))
+    return folded + _v5_le32(_v5_u32(_v5_sum_md5(folded) | 0x20))
+
+class _V5Carrier:
+    def __init__(self, key, ts):
+        word = ts & 3
+        self.box = _V5_SBOX[word * 256:(word + 1) * 256]
+        self.con = [[2,0,3,1],[1,3,2,0],[3,2,1,0],[2,3,1,0]][word]
+        self.order = [
+            [0,9,14,15,4,13,2,7,8,1,6,3,12,5,10,11],
+            [0,9,14,11,4,13,2,3,8,1,6,15,12,5,10,7],
+            [0,9,14,3,4,13,2,15,8,1,6,11,12,5,10,7],
+            [0,9,14,15,4,13,2,3,8,1,6,11,12,5,10,7],
+        ][word]
+        initial = [0xbbb5de72,0xd4638d5b,0x92a5f73b,0x89f8a1c9][word]
+        base = _v5_le32(initial)
+        seed = bytearray(48)
+        for i in range(4):
+            seed[i*4:i*4+4] = base
+        expanded = bytearray(64)
+        expanded[0:48] = _v5_xor(bytes(seed), key)
+        rounds = 8
+        for n in range(4, 12):
+            at = 4 * (n - 1)
+            a,b,c,d = expanded[at], expanded[at+1], expanded[at+2], expanded[at+3]
+            if (n & 3) == 0:
+                temp = ((initial >> (rounds & 24)) ^ self.box[b]) & 255
+                b = self.box[c]; c = self.box[d]; d = self.box[a]; a = temp
+            rounds += 2
+            expanded[at+4] = a ^ expanded[at-12]
+            expanded[at+5] = b ^ expanded[at-11]
+            expanded[at+6] = c ^ expanded[at-10]
+            expanded[at+7] = d ^ expanded[at-9]
+        self.keys = [bytes(expanded[k*4:k*4+4]) for k in range(12)]
+
+    def add(self, rows, offset):
+        for i in range(4):
+            for j in range(4):
+                rows[i][j] ^= self.keys[offset+i][self.con[j]]
+
+    def block(self, value):
+        rows = [[value[i*4], value[i*4+1], value[i*4+2], value[i*4+3]] for i in range(4)]
+        self.add(rows, 0)
+        for r in range(1, 3):
+            before = [[self.box[v] for v in row] for row in rows]
+            flat = []
+            for c in range(4):
+                flat.extend(before[self.con[c]])
+            rows = []
+            for q in range(4):
+                rows.append([flat[self.order[q*4]], flat[self.order[q*4+1]], flat[self.order[q*4+2]], flat[self.order[q*4+3]]])
+            if r == 1:
+                rows = [[row[self.con[0]], row[self.con[1]], row[self.con[2]], row[self.con[3]]] for row in rows]
+                def xt(x): return ((x << 1) ^ (0x1b if (x & 128) else 0)) & 255
+                for col in range(4):
+                    t = rows[0][col] ^ rows[1][col] ^ rows[2][col] ^ rows[3][col]
+                    u = rows[0][col]
+                    rows[0][col] ^= t ^ xt(rows[0][col] ^ rows[1][col])
+                    rows[1][col] ^= t ^ xt(rows[1][col] ^ rows[2][col])
+                    rows[2][col] ^= t ^ xt(rows[2][col] ^ rows[3][col])
+                    rows[3][col] ^= t ^ xt(rows[3][col] ^ u)
+            self.add(rows, r*4)
+        out = bytearray(16)
+        pos = 0
+        for a in range(4):
+            for b in range(4):
+                out[pos] = rows[a][b] ^ self.keys[4+a][b]
+                pos += 1
+        return bytes(out)
+
+    def encrypt(self, source, iv):
+        src = bytes(source)
+        if len(src) < 248:
+            raise Exception("V5 carrier requires at least 248 bytes")
+        wire = [6,5,3,4,2,7,1,0]
+        compact = [1,7,3,6,2,0,4,5]
+        plaintext = bytearray(32)
+        for i in range(31):
+            for j in range(8):
+                plaintext[i] |= ((src[i*8 + j] >> wire[j]) & 1) << compact[j]
+        plaintext[31] = 1
+        first = self.block(_v5_xor(bytes(plaintext[:16]), iv))
+        key = first + self.block(_v5_xor(bytes(plaintext[16:32]), first))
+        output = bytearray(src)
+        for a in range(31):
+            for b in range(8):
+                at = a*8 + b
+                mask = 0xff ^ (1 << wire[b])
+                output[at] = (output[at] & mask) | (((key[a] >> compact[b]) & 1) << wire[b])
+        return key[31:32] + bytes(output)
+
+def _v5_xmxor(data, key):
+    d = bytes(data); k = bytes(key)
+    encoded = bytearray(len(d))
+    for i in range(len(d)):
+        at = (i * 4) & 28
+        d0 = k[at]; d1 = k[at+1]; value = d[i]
+        rot = ((value << 4) | (value >> 4)) & 255
+        v = ((~(rot + d0)) & 0xFFFFFFFF) ^ d1
+        v = (((v & 255) << 3) | ((v & 255) >> 5)) & 255
+        encoded[len(d)-i-1] = ((~(((v + d1) & 255) ^ d0)) & 0xFFFFFFFF) & 255
+    last = encoded[-1] ^ encoded[-2]
+    first = encoded[0]
+    encoded[0] = ((~last + first) & 0xFFFFFFFF) & 255
+    encoded[1] = ((encoded[0] ^ encoded[-1] ^ 254) + encoded[1]) & 255
+    rot1 = ((encoded[1] << 3) | (encoded[1] >> 5)) & 255
+    encoded[2] = (encoded[2] + ((last - first) ^ rot1 ^ 2)) & 255
+    for n in range(len(encoded)-4):
+        rot2 = ((encoded[n+2] << 3) | (encoded[n+2] >> 5)) & 255
+        temp = rot2 ^ encoded[n+1] ^ (n+3)
+        encoded[n+3] = ((~temp + encoded[n+3]) & 0xFFFFFFFF) & 255
+    encoded[-1] ^= encoded[-2]
+    ssum = 0
+    for s in range(1, len(encoded)): ssum = (ssum + encoded[s]) & 255
+    encoded[0] = ((encoded[0] ^ encoded[1]) + ssum) & 255
+    return bytes(encoded)
+
+def _v5_random32():
+    return random.getrandbits(32) & 0xFFFFFFFF
+
+def _v5_helios(ts, nonce=None):
+    if nonce is None: nonce = _v5_random32()
+    nonce &= 0xFFFFFFFF
+    ascii_bytes = hashlib.md5(_v5_le32(nonce) + b"8662").hexdigest().encode()
+    words = []
+    for i in range(4):
+        w = 0
+        for j in range(7, -1, -1):
+            w = (w << 8) | ascii_bytes[i*8 + j]
+        words.append(w & 0xFFFFFFFFFFFFFFFF)
+    queue = [words[2], words[3]]
+    table = [words[0]]
+    b0, b8 = words[0], words[1]
+    for n in range(34):
+        value = ((_v5_ror64(b8, 8) + b0) & 0xFFFFFFFFFFFFFFFF) ^ n
+        queue.append(value)
+        value = (value ^ _v5_ror64(b0, 61)) & 0xFFFFFFFFFFFFFFFF
+        table.append(value)
+        b0 = value
+        b8 = queue.pop(0)
+    text = (str(ts) + "-646637794-8662").encode()
+    padding = 16 - (len(text) % 16)
+    data = text + bytes([padding]) * padding
+    out = bytearray()
+    for off in range(0, len(data), 16):
+        a = 0; b = 0
+        for q in range(7, -1, -1): a = (a << 8) | data[off+q]
+        for r in range(7, -1, -1): b = (b << 8) | data[off+8+r]
+        for k in range(34):
+            b = table[k] ^ ((a + _v5_ror64(b, 8)) & 0xFFFFFFFFFFFFFFFF)
+            a = (b ^ _v5_ror64(a, 61)) & 0xFFFFFFFFFFFFFFFF
+        for _ in range(8): out.append(a & 255); a >>= 8
+        for _ in range(8): out.append(b & 255); b >>= 8
+    return base64.b64encode(_v5_le32(nonce) + bytes(out)).decode()
+
+def _v5_medusa(query, f13, ts, who, nonce=None):
+    flags = b"\x00" * 8
+    device = _v5_proto([
+        (1,1,"sint"), (2,2,"sint"), (3,"8662"), (4,who["device_id"]),
+        (5,_V5_PROCESS_NONCE), (6,"!noperm!"), (12,"Asia/Shanghai,8"), (13,"zh_CN"),
+        (22,who["os_version"]), (25,_V5_PROCESS_STARTED,"sint"), (30,who["device_type"]),
+        (31,"HONOR"), (32,who["device_type"]), (34,"HONOR"),
+    ])
+    env = _v5_proto([
+        (6,"v04.10.03.04-bugfix"), (8,who["channel"]), (12,device), (14,who["version_name"]),
+    ])
+    message = _v5_proto([
+        (1,_V5_MAGIC), (2,5,"sint"), (3,_v5_random32(),"sint"), (4,"8662"),
+        (5,who["device_id"]), (6,"646637794"), (7,who["version_name"]),
+        (8,"v04.10.03-ml-android"), (9,0x040a0300,"sint"), (10,flags),
+        (12,ts,"sint"), (13,f13), (14,bytes(query[:6])),
+        (15,_v5_proto([(1,1,"sint"),(2,1,"sint"),(3,1,"sint"),(5,1,"sint")])),
+        (17,ts,"sint"), (20,"none"), (21,377,"sint"), (23,env),
+        (24,'{"cmr":16777216,"cmr2":16777216,"un_h":11,"vpn":0,"kd":0,"dyn":"","do":1,"tk":true}'),
+    ])
+    if nonce is None: nonce = _v5_random32()
+    nonce &= 0xFFFFFFFF
+    high = (nonce >> 16) & 255
+    hash_bytes = SM3(_V5_SIGN_KEY + _v5_le32(nonce) + _V5_SIGN_KEY).digest()
+    tmp = (((high << 11) | (nonce >> 24)) ^ (high >> 5) ^ high) & 0xFFFFFFFF
+    seed = _v5_le32((~tmp) & 0xFFFFFFFF)
+    transformed = bytearray(flags + _v5_xmxor(message, hash_bytes))
+    transformed.reverse()
+    for i in range(len(transformed)):
+        transformed[i] ^= seed[(~i) & 3]
+    check = 0x18000001 | ((query[0] & 63) << 14) | ((f13[0] & 63) << 8)
+    packed = b"\xca" + _v5_le32(_v5_random32()) + _v5_le32(check) + bytes(transformed)
+    packed += bytes([(nonce >> 16) & 255, (nonce >> 24) & 255])
+    encrypted = _V5Carrier(hashlib.md5(_V5_SIGN_KEY[:16]).digest(), ts).encrypt(packed, hashlib.md5(_V5_SIGN_KEY[16:32]).digest())
+    prefix = bytearray(_v5_le32(5) + _V5_MAGIC)
+    time_bytes = _v5_le32(ts)
+    for p in range(len(prefix)):
+        prefix[p] ^= time_bytes[p & 3]
+    tail = bytes([nonce & 255, (nonce >> 8) & 255, 0, 1])
+    return base64.b64encode(bytes(prefix) + tail + encrypted).decode()
+
+def _v5_encode(value):
+    from urllib.parse import quote
+    s = str(value)
+    # JS: encodeURIComponent then replace !'() with %XX uppercase
+    out = quote(s, safe="A-Za-z0-9-_.~")
+    return out.replace("!", "%21").replace("'", "%27").replace("(", "%28").replace(")", "%29")
+
+def _v5_sign(base, values, body, now, nonce=None):
+    ts = now // 1000
+    body_hash = hashlib.md5(body).digest()
+    who = dict(values)
+    if "ts" in who:
+        who["ts"] = str(ts)
+    for offset in range(1024):
+        ticket = now + offset
+        qv = dict(who)
+        qv["_rticket"] = str(ticket)
+        query = "&".join(_v5_encode(k) + "=" + _v5_encode(qv[k]) for k in qv.keys())
+        query_hash = SM3(query.encode("utf-8")).digest()
+        if _v5_branch(query_hash, body_hash, ts) != 12:
+            continue
+        f13 = _v5_hash_f13(query_hash, body_hash, ts)
+        return {
+            "url": base + "?" + query,
+            "headers": {
+                "x-khronos": str(ts),
+                "x-helios": _v5_helios(ts, nonce),
+                "x-medusa": _v5_medusa(query_hash, f13, ts, who, nonce),
+                "x-ss-stub": body_hash.hex().upper(),
+                "x-ss-req-ticket": str(ticket),
+            },
+        }
+    raise Exception("Unable to select V5 playback signature branch")
+
+
 def _video_model(video_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
     devices = _device_config(config)
-    payload = {
-        "biz_param": {
-            "detail_page_version": 0,
-            "device_level": 3,
-            "disable_digg_stat": False,
-            "need_all_video_definition": True,
-            "need_mp4_align": False,
-            "use_os_player": False,
-            "use_server_dns": False,
-            "video_platform": 1024,
-        },
-        "mixed_video_id_map": {"1004": [video_id]},
+    last_err = ""
+
+    def _extract_model(response_data: Any) -> dict[str, Any]:
+        if not isinstance(response_data, Mapping):
+            raise HongguoPluginError("video_model 数据为空")
+        code_val = response_data.get("Code") if "Code" in response_data else response_data.get("code")
+        if code_val not in (None, 0, "0"):
+            raise HongguoPluginError("上游拒绝播放请求 code=%s msg=%s" % (code_val, response_data.get("message") or response_data.get("msg") or ""))
+        data = response_data.get("data") or {}
+        if not isinstance(data, Mapping):
+            # 有些响应直接把 video_id 映射放顶层
+            data = response_data if isinstance(response_data, Mapping) else {}
+        entry: Any = data.get(video_id)
+        if entry is None:
+            for value in data.values():
+                if isinstance(value, Mapping):
+                    entry = value
+                    break
+                if isinstance(value, list) and value and isinstance(value[0], Mapping):
+                    entry = value[0]
+                    break
+        if not isinstance(entry, Mapping):
+            entry = data
+        raw_model = entry.get("video_model") if isinstance(entry, Mapping) else None
+        if raw_model is None:
+            raw_model = data.get("video_model")
+        if isinstance(raw_model, str):
+            try:
+                raw_model = json.loads(raw_model)
+            except ValueError as exc:
+                raise HongguoPluginError("video_model JSON 无效") from exc
+        if not isinstance(raw_model, Mapping):
+            raise HongguoPluginError("video_model 为空")
+        return dict(raw_model)
+
+    # 1) V5 player/v1 签名（对齐 HGTV.js 当前可用链路）
+    try:
+        import uuid as _uuid
+        cdid = str(config.get("cdid") or devices.get("cdid") or _uuid.uuid4())
+    except Exception:
+        cdid = str(config.get("cdid") or devices.get("cdid") or "")
+    v5_identity = {
+        "device_id": str(devices.get("device_id") or ""),
+        "iid": str(devices.get("install_id") or devices.get("iid") or ""),
+        "cdid": cdid,
     }
-    # 1.7.1 修起播：multi_video_model 上游已弃用旧 x-gorgon/x-medusa 签名
-    # （200 空包），改走弹幕同款 SM3/SIMON Argus+Ladon 新签名与 7.3.9.32 App query。
-    # x-ss-stub 必须对同一份字节做 md5 → 先序列化 body 再签名。
-    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    query = _dm_query(devices["device_id"]) + "&iid=" + devices["install_id"]
-    request_headers = {
-        "content-type": "application/json; charset=utf-8",
-        "User-Agent": "com.dragon.read",
-        "accept": "application/json",
-    }
-    request_headers.update(
-        _dm_sign_headers(query, body, devices["device_id"], devices["install_id"])
-    )
-    response = requests.post(
-        VIDEO_URL.split("?")[0] + "?" + query,
-        headers=request_headers,
-        data=body,
-        timeout=30,
-    )
-    response_data = _json_response(response)
-    data = response_data.get("data") or {}
-    if not isinstance(data, Mapping):
-        raise HongguoPluginError("video_model 数据为空")
-    entry: Any = data.get(video_id)
-    if entry is None:
-        for value in data.values():
-            if isinstance(value, Mapping):
-                entry = value
-                break
-            if isinstance(value, list) and value and isinstance(value[0], Mapping):
-                entry = value[0]
-                break
-    if not isinstance(entry, Mapping):
-        entry = data
-    raw_model = entry.get("video_model") if isinstance(entry, Mapping) else None
-    if raw_model is None:
-        raw_model = data.get("video_model")
-    if isinstance(raw_model, str):
-        try:
-            raw_model = json.loads(raw_model)
-        except ValueError as exc:
-            raise HongguoPluginError("video_model JSON 无效") from exc
-    if not isinstance(raw_model, Mapping):
-        raise HongguoPluginError("video_model 为空")
-    return dict(raw_model)
+    if v5_identity["device_id"] and v5_identity["iid"] and v5_identity["cdid"]:
+        payload_v5 = {
+            "biz_param": dict(_V5_BIZ_PARAM),
+            "mixed_video_id_map": {"1004": [str(video_id)]},
+            "dr_scene": "player",
+        }
+        body_v5 = _v5_gzip_stored(json.dumps(payload_v5, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        for alt in (False, True):
+            try:
+                base = _V5_PLAYER_API_ALT if alt else _V5_PLAYER_API
+                signed = _v5_sign(base, dict(_V5_PROFILE, **{"iid": v5_identity["iid"], "cdid": v5_identity["cdid"], "device_id": v5_identity["device_id"]}), body_v5, int(time.time() * 1000))
+                headers_v5 = dict(signed["headers"])
+                headers_v5.update({
+                    "User-Agent": _V5_UA,
+                    "Accept": "application/json",
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Content-Encoding": "gzip",
+                })
+                if alt:
+                    headers_v5["Connection"] = "close"
+                resp = requests.post(signed["url"], headers=headers_v5, data=body_v5, timeout=30)
+                txt = resp.text if hasattr(resp, "text") else ""
+                if not txt or not txt.strip():
+                    raise HongguoPluginError("上游响应为空")
+                return _extract_model(json.loads(txt))
+            except Exception as e:
+                last_err = str(e)
+
+    # 2) 弹幕同款 Argus+Ladon 签名（旧链路兜底）
+    try:
+        payload = {
+            "biz_param": {
+                "detail_page_version": 0,
+                "device_level": 3,
+                "disable_digg_stat": False,
+                "need_all_video_definition": True,
+                "need_mp4_align": False,
+                "use_os_player": False,
+                "use_server_dns": False,
+                "video_platform": 1024,
+            },
+            "mixed_video_id_map": {"1004": [video_id]},
+        }
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        query = _dm_query(devices["device_id"]) + "&iid=" + devices["install_id"]
+        request_headers = {
+            "content-type": "application/json; charset=utf-8",
+            "User-Agent": "com.dragon.read",
+            "accept": "application/json",
+        }
+        request_headers.update(
+            _dm_sign_headers(query, body, devices["device_id"], devices["install_id"])
+        )
+        response = requests.post(
+            VIDEO_URL.split("?")[0] + "?" + query,
+            headers=request_headers,
+            data=body,
+            timeout=30,
+        )
+        return _extract_model(_json_response(response))
+    except Exception as e:
+        last_err = str(e)
+
+    # 3) 旧公开无签名入口兜底
+    try:
+        params = {
+            "aid": "8662", "app_name": "novelread", "version_code": "73532",
+            "version_name": "7.3.5.32", "manifest_version_code": "73532",
+            "update_version_code": "73532", "channel": "update_64",
+            "device_platform": "android", "os": "android", "ssmix": "a",
+            "device_type": "25053RT47C", "device_brand": "Redmi", "language": "zh",
+            "os_api": "36", "os_version": "16", "resolution": "1280*2772",
+            "dpi": "520", "ac": "wifi",
+            "device_id": devices.get("device_id", ""), "iid": devices.get("install_id", ""),
+            "_rticket": str(int(time.time() * 1000)),
+        }
+        qs = urlencode(params)
+        player_base = "https://api5-normal-sinfonlineb.fqnovel.com"
+        attempts = [
+            ("/novel/player/multi_video_model/v1/", {"biz_param": dict(_V5_BIZ_PARAM), "mixed_video_id_map": {"1": [str(video_id)]}}),
+            ("/novel/player/multi_video_model/v1/", {"biz_param": dict(_V5_BIZ_PARAM), "mixed_video_id_map": {"1004": [str(video_id)]}}),
+            ("/novel/player/multi_video_model/preload/v1/", {"biz_param": dict(_V5_BIZ_PARAM), "mixed_video_id_map": {"1004": [str(video_id)]}}),
+            ("/novel/player/video_model/v1/", {"video_id": str(video_id), "content_type": 1, "need_all_video_definition": True}),
+        ]
+        pub_headers = {
+            "user-agent": APP_UA, "accept": "application/json",
+            "x-xs-from-web": "0", "sdk-version": "2",
+            "content-type": "application/json; charset=utf-8",
+        }
+        for path, pbody in attempts:
+            try:
+                resp = requests.post(player_base + path + "?" + qs, headers=pub_headers, data=json.dumps(pbody, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), timeout=20)
+                txt = resp.text if hasattr(resp, "text") else ""
+                if not txt or not txt.strip():
+                    continue
+                return _extract_model(json.loads(txt))
+            except Exception as e:
+                last_err = str(e)
+    except Exception as e:
+        last_err = str(e)
+
+    raise HongguoPluginError("video_model 数据为空: %s" % last_err)
 
 def _video_list_from_model(model: Mapping[str, Any]) -> Any:
     for key in ("video_list", "dynamic_video_list"):
@@ -5934,14 +6452,21 @@ def _dm_push_local(url: str, vid: str) -> None:
 
 class Spider(_BaseSpider):
     def __init__(self):
+        try:
+            import uuid as _uuid
+            _cdid = str(_uuid.uuid4())
+        except Exception:
+            _cdid = ""
         self.device_id = str(random.randint(10**17, 10**18 - 1))
         self.install_id = str(random.randint(10**17, 10**18 - 1))
+        self.cdid = _cdid
 
     def _adopt_working_pair(self):
         pair = _working_device_pair()
         if pair is not None:
             self.device_id = pair["device_id"]
             self.install_id = pair["install_id"]
+            self.cdid = str(pair.get("cdid") or getattr(self, "cdid", "") or "")
 
     def getName(self):
         return "红果短剧"
@@ -6304,6 +6829,7 @@ class Spider(_BaseSpider):
                     "hg": "cenc",
                     "did": self.device_id or "",
                     "iid": self.install_id or "",
+                    "cdid": getattr(self, "cdid", "") or "",
                 }
             )
             return {
@@ -6340,6 +6866,7 @@ class Spider(_BaseSpider):
                     "q": q,
                     "did": self.device_id or "",
                     "iid": self.install_id or "",
+                    "cdid": getattr(self, "cdid", "") or "",
                 }
             )
             result = {
@@ -6391,6 +6918,7 @@ class Spider(_BaseSpider):
             cfg = {
                 "device_id": str(param.get("did") or self.device_id or ""),
                 "install_id": str(param.get("iid") or self.install_id or ""),
+                "cdid": str(param.get("cdid") or getattr(self, "cdid", "") or ""),
             }
             user_q = str(param.get("q") or param.get("quality") or "").strip()
             # 32位/纯Python AES 环境优先低清保证可播；用户指定清晰度时优先该档
@@ -6425,7 +6953,12 @@ class Spider(_BaseSpider):
                         continue
                     cached = _hg_cache_get(vid, q)
                     if cached:
-                        return [200, "video/mp4", cached]
+                        return [200, "video/mp4", cached, {
+                            "Accept-Ranges": "bytes",
+                            "Content-Type": "video/mp4",
+                            "Content-Length": str(len(cached)),
+                            "Connection": "close",
+                        }]
 
             last_err = None
             for wanted in quals:
