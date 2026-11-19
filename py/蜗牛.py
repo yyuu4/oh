@@ -1,0 +1,1561 @@
+# -*- coding: utf-8 -*-
+"""蜗牛 - wn4k.com 通用 CatVod Python 蜘蛛
+
+业务参照: omn蜗牛.js (MacCMS panlian_dark/mxone, 网盘资源分组)
+分组参照: omnibox觅盘.js (encodeId: mp|type|base64url(JSON))
+
+分组 ID:
+  mp|m|...  影片 -> 网盘分组卡
+  mp|g|...  影片+网盘类型 -> 分享链接列表
+  mp|r|...  分享链接资源详情
+  mp|k|...  搜索关键词+网盘类型 -> 链接列表
+  纯数字    站点影片 ID
+
+播放: 无 OmniBox SDK, playerContent 返回 parse=1 + 分享链接交宿主解析。
+"""
+import base64
+import json
+import os
+import re
+import threading
+import time
+from html import unescape
+from urllib.parse import quote
+
+try:
+    from base.spider import Spider as BaseSpider
+except Exception:
+    BaseSpider = object
+
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.ssl_ import create_urllib3_context
+except Exception:
+    requests = None
+    HTTPAdapter = object
+    create_urllib3_context = None
+
+try:
+    from lxml import html as lxml_html
+except Exception:
+    lxml_html = None
+
+
+# ==================== 配置 ====================
+def _split_cfg(value):
+    return [x.strip() for x in re.split(r"[;,]", str(value or "")) if x.strip()]
+
+
+WEB_SITES = _split_cfg(os.environ.get("WEB_SITE_WONIU4K", "https://wn4k.com/"))
+if not WEB_SITES:
+    WEB_SITES = ["https://wn4k.com/"]
+
+SITE_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
+VERSION = "1.0.0"
+PAGE_SIZE = 20
+
+STATIC_CLASSES = [
+    {"type_id": "1", "type_name": "电影"},
+    {"type_id": "2", "type_name": "连续剧"},
+    {"type_id": "3", "type_name": "综艺"},
+    {"type_id": "4", "type_name": "动漫"},
+]
+
+LOGIN_USERNAME = (
+    os.environ.get("WONIU4K_USERNAME")
+    or os.environ.get("WONIU4K_USER")
+    or "raaaee"
+).strip()
+LOGIN_PASSWORD = (
+    os.environ.get("WONIU4K_PASSWORD")
+    or os.environ.get("WONIU4K_PASS")
+    or "kisser123"
+).strip()
+WONIU4K_COOKIE = (
+    os.environ.get("WONIU4K_COOKIE") or os.environ.get("WONIU4K_COOKIES") or ""
+).strip()
+CAPTCHA_SERVICE_URL = (os.environ.get("DDDDOCR_API") or "").rstrip("/")
+
+# ---- 网盘 Cookie（playerContent 按分享链接类型注入对应 Cookie）----
+# 115 网盘 Cookie：浏览器登录 115 后 F12 -> Network -> 任意请求 -> Request Headers -> Cookie 整串粘贴
+COOKIE_115 = (
+    os.environ.get("DRIVE_COOKIE_115")
+    or os.environ.get("PAN_COOKIE_115")
+    or "UID=7090991_R1_1785487771; CID=3c1a3ab03cfc92b0b7c80db6efa950c6; SEID=81ec0f1ad4aa99de925b609465a91c20d8894da910834a59f27cb239ebc5eb70412b456e8e91fff5654dc089a9d0c153f5fcec844b4cf7fa1b8aac84; KID=bc573815d056010f1b8373db03247c3b"
+).strip()
+# 百度网盘 Cookie：浏览器登录百度网盘后 F12 -> Network -> 任意请求 -> Request Headers -> Cookie 整串粘贴
+# 至少需含 BDUSS（分享页公开访问可不填；解析/下载通常需要）
+COOKIE_BAIDU = (
+    os.environ.get("DRIVE_COOKIE_BAIDU")
+    or os.environ.get("PAN_COOKIE_BAIDU")
+    or "XFI=5a3aacd5-1882-383f-9c13-6fbd8fc45616; XFCS=6934486FF35D07B993DE7A3D39C61F9257A9B98486E6D660D5ED9B8B1ED3B540; XFT=kkuwSdMMmttM7GFwy/yfPs4Q45NbUUISVippBlCCBic=; csrfToken=CrD-pvP-vceUgIEsOoFIXXz1; BAIDUID=90B996B2BCB42015D7470F897FBF7BFB:FG=1; Hm_lvt_7a3960b6f067eb0085b7f96ff5e660b0=1775418321; HMACCOUNT=EBEA8556F8CD8755; Hm_lpvt_7a3960b6f067eb0085b7f96ff5e660b0=1775418389; BAIDUID_REF=90B996B2BCB42015D7470F897FBF7BFB:FG=1; H_WISE_SIDS=110085_656456_661764_667680_673675_681439_685375_686052_660927_686285_690306_690304_690575_690335_687554_691367_691536_692755_692780_692124_692900_690140_693135_693222_693152_693362_693404_693433_693386_693658_690883_693896_692094_693945_693938_692187_691305_693392_694167_693882_693994_694313_693890_694342_694409_691557_694697_694780_694782_694890_694912_694995_694990_695085_695032_695119_694839_695137_695180_695222_694712_695218_695274_695240_695111_695263_688609_695329_695278_694865_695215_695374_695404_690651_694609_695418_692377_695452_695457_694951_695599_691406_695630_695824_695886_695894_695890_694174_695987_695899_695627_696154_696149_696145_696166_696066_696071_694359_696304_696291_695715_696128_8000064_8000101_8000125_8000141_8000150_8000163_8000166_8000184_8000185; delPer=0; PSINO=1; H_WISE_SIDS_BFESS=110085_656456_661764_667680_673675_681439_685375_686052_660927_686285_690306_690304_690575_690335_687554_691367_691536_692755_692780_692124_692900_690140_693135_693222_693152_693362_693404_693433_693386_693658_690883_693896_692094_693945_693938_692187_691305_693392_694167_693882_693994_694313_693890_694342_694409_691557_694697_694780_694782_694890_694912_694995_694990_695085_695032_695119_694839_695137_695180_695222_694712_695218_695274_695240_695111_695263_688609_695329_695278_694865_695215_695374_695404_690651_694609_695418_692377_695452_695457_694951_695599_691406_695630_695824_695886_695894_695890_694174_695987_695899_695627_696154_696149_696145_696166_696066_696071_694359_696304_696291_695715_696128_8000064_8000101_8000125_8000141_8000150_8000163_8000166_8000184_8000185; AFD_IP=123.161.131.206; BDORZ=AE84CDB3A529C0F8A2B9DCDD1D18B695; TWIE=2c1406016562687f0c402ab89c1acfcfd5dd4f75; BA_HECTOR=ak0k0104800ka5a0a0akq18lal81001kt5f1i27; ZFY=InaOdiWY7Vc1kBfxNcJWIVTID57swVMFBJMsXogZISw:C; PSCBD=22%3A1%3A3_31%3A1%3A3; SE_LAUNCH=5%3A1775418413_22%3A29590306%3A3_31%3A29590306%3A3; PANWEB=1; Hm_lvt_e6c5e9705447b840241ebab6dbdb5fda=1775418436; Hm_lpvt_e6c5e9705447b840241ebab6dbdb5fda=1775418436; __bid_n=19d5f2f75411152f6810ea; fuid=FOCoIC3q5fKa8fgJnwzbE3sZaS3poGTofPItBD67MTHOloTQtOTfZukshuG%2BjikLybArGBMGkcl3D0n7OfYYBeeuMJbyvedtMOkHUXMQ%2FwcvUmvSFoFnt6cL142DvIB%2Ffx8gRLk7JeWDA3kj4XzAejClZZ9eRAnDz%2F0Cw7lDZU6%2BdzYmUcYiUZLxWrbPg4Dz5zjC6J2VZADEQ1e1sq%2Fzq4nfXktmQlxVo4DI6UwJAk2vaZmouLIwdB2TeZfY9lwsOCQTO9Od0PlMgkxI%2BxYHeILcwPvQ%2BSSsagGp9hRSGn9n9cPgTbFGfmOa7igyYqKa7Uad26lBYGHjZD92i0E%2BZGIwIfAPMn7frNweEbSkbvFc4wWHN1WTvAtxSSj3%2F1aTNmR9zbVoccdRrfytLDEvOxloaHF6z6eWPHrwPHt6udHcEuGg0AJIhaOSArAjPD1lDocf5LvdCPD1XFodWK9agrguQ9X7tNE4swbRXqvQD77ORY52MWLLV4P%2FRHwdxFZi0SwHTBzijU3UiD16FDlUvtD7%2F%2FB2ufpJTPtrS8QybtCoaoEkkgsZyEL9kzRrGKeJVErHhHdypWlNU2pM%2FW1YacYa78BUtLc1w8Xdd6YmRnKLovQE8DrrUkOPSWZkiBwIebSUY4OhhbO4vtkOLMGbR3wEkglRLWVQ4815uODk4KPCRKrXqDriC6Cs786E35eNx60PK%2FdPPTpYZ4xHikqR35OQpKVjqdV6%2FwyFpPcBQ%2FB35PlBM3%2BPfapqEoUehtzp54HMSn6tTlOHCkgqonyEhkAxjRer%2Ba3slsL588nOBR8k3P8Ux6dOE9QtywAx3XFwVaSI9A67EzF%2Bygjtpnv9ghZYlkcjMyoe5PmJ1%2Bmc7wkckxzjF65GDtt%2BkRj%2B%2FBuhHnXd8JWxbTSPch7DGWO4LIHeDpCtd6RMvOgbCfDNICl4LYr1IDPAY5dZv6ZINErg8p7Vi3a5jMXGWL4Mkr0ksENkLZvBJChyDMkf14Hx56V%2Bb2nRqUTK6NqmhPLvsfMNYCRyESom9rukNSbUImRNUXXv70cfMSn4OrmEd%2B59Ab34CROfim3rsAsgLyURlANnLmWXsBWli69uhbNnAbZYcg7J3StkKJM1%2BqRuxH0Yc%2BuOjXvNDpUk6G7%2B2ze2ETmdC%2FraD10QaC9KnqXjbt698Q%3D%3D; BAIDUID_BFESS=90B996B2BCB42015D7470F897FBF7BFB:FG=1; Hm_lvt_182d6d59474cf78db37e0b2248640ea5=1775418576; newlogin=1; ploganondeg=1; ppfuid=FOCoIC3q5fKa8fgJnwzbE3sZaS3poGTofPItBD67MTHOloTQtOTfZukshuG+jikLybArGBMGkcl3D0n7OfYYBeeuMJbyvedtMOkHUXMQ/wcvUmvSFoFnt6cL142DvIB/fx8gRLk7JeWDA3kj4XzAejClZZ9eRAnDz/0Cw7lDZU6+dzYmUcYiUZLxWrbPg4Dz5zjC6J2VZADEQ1e1sq/zq4nfXktmQlxVo4DI6UwJAk2vaZmouLIwdB2TeZfY9lwsOCQTO9Od0PlMgkxI+xYHeILcwPvQ+SSsagGp9hRSGn9n9cPgTbFGfmOa7igyYqKa7Uad26lBYGHjZD92i0E+ZGIwIfAPMn7frNweEbSkbvFc4wWHN1WTvAtxSSj3/1aTNmR9zbVoccdRrfytLDEvOxloaHF6z6eWPHrwPHt6udHcEuGg0AJIhaOSArAjPD1lDocf5LvdCPD1XFodWK9agrguQ9X7tNE4swbRXqvQD77ORY52MWLLV4P/RHwdxFZi0SwHTBzijU3UiD16FDlUvtD7//B2ufpJTPtrS8QybtCoaoEkkgsZyEL9kzRrGKeJVErHhHdypWlNU2pM/W1YacYa78BUtLc1w8Xdd6YmRnKLovQE8DrrUkOPSWZkiBwIebSUY4OhhbO4vtkOLMGbR3wEkglRLWVQ4815uODk4KPCRKrXqDriC6Cs786E35eNx60PK/dPPTpYZ4xHikqR35OQpKVjqdV6/wyFpPcBQ/B35PlBM3+PfapqEoUehtzp54HMSn6tTlOHCkgqonyEhkAxjRer+a3slsL588nOBR8k3P8Ux6dOE9QtywAx3XFwVaSI9A67EzF+ygjtpnv9ghZYlkcjMyoe5PmJ1+mc7wkckxzjF65GDtt+kRj+/BuhHnXd8JWxbTSPch7DGWO4LIHeDpCtd6RMvOgbCfDNICl4LYr1IDPAY5dZv6ZINErg8p7Vi3a5jMXGWL4Mkr0ksENkLZvBJChyDMkf14Hx56V+b2nRqUTK6NqmhPLvsfMNYCRyESom9rukNSbUImRNUXXv70cfMSn4OrmEd+59Ab34CROfim3rsAsgLyURlANnLmWXsBWli69uhbNnAbZYcg7J3StkKJM1+qRuxH0Yc+uOjXvNDpUk6G7+2ze2ETmdC/raD10QaC9KnqXjbt698Q==; XFI=c70e1bf0-3163-11f1-b489-2dadfe6cde41; XFCS=695FBCC5D7DBD962C5D6DC2E48C236F15408E81FF0D00C786890B62D0BB96DB0; XFT=Gv9S50jW8Dsti0Pz3zFxK9Ve/hIn8ukc/h6sbzitoVo=; BDUSS=ERPZTRtVVlpaXVuWHZsZXBmMVF6d0Y0VDREUVFUd1NsUENwRnczbkplNWdyZnBwRVFBQUFBJCQAAAAAAAAAAAEAAABxDzMHtePQx7DJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGAg02lgINNpN; BDUSS_BFESS=ERPZTRtVVlpaXVuWHZsZXBmMVF6d0Y0VDREUVFUd1NsUENwRnczbkplNWdyZnBwRVFBQUFBJCQAAAAAAAAAAAEAAABxDzMHtePQx7DJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGAg02lgINNpN; STOKEN=c731a7472f0ea4328ca9fe063bc9ac1e3b7629ff8a434d37466e0b1ef1cba6d5; ndut_fmt=91E3099FC2A1F4B2AE025B2794C8B295A231617201B7757703A3EBB2339DBC95; ab_sr=1.0.1_NjM2YzQ0YjYxYzg2Njk4M2Q1MjZhOGM2NzVhMmUwNWRhYjQ0YTNiOWE0NTU0NDg0OWI2OTg2M2EwZTIzZDU2MGFkZDA2MGNhZjJjMGQzMjQxYzBiZmYwMWJkMGJmMWFkYWMwYWIwOTdlMDdkYzI2MzQ3YWMxNDRkMzBkYzExZmI3OGMyOTk0MDIxMTRhZTkzZTY4MjFiYWNjNzk4M2EwZDIyYWU0ZWQ1NWVjNDg4NDc1N2E2MWE2YWM0YzU5NmY4ZmRjM2ZmOGFlYWQ4ODU4NmY3NjQ4OTEzMzU1ZDY2ZjE=; PANPSC=3445149947565138879%3AN%2BPEInrc9NWV4VG606Eco1cS2d9ns3O5C61tf8CKQkg7dT1BfV14cyNfm7R%2FsRJCyOIAxPrXaQpB3Y7%2FFyFzG7koUQnE6IY91zhKvcy%2B6ReZWV1LKJofoWjKBn0niB9o2fNZfjs7wBb2j4TVvzwIkOwaD5dJfjitc4vRdeSBy8z7ChwBYhqyMmYhU1y6mfSpu1tPRVPr6y6VHXzozvQa4TYwU1Xo84sw8BLdi%2B4atdWYJ9TOrOjxYeshvc%2FmBFdoRzFCRrWG2Ixyx4n1zr2IJ7VutOF4Vhht26muO7WOw27o824g1Xiy7ZKxVlqrIDxM; Hm_lpvt_182d6d59474cf78db37e0b2248640ea5=1775444160"
+).strip()
+
+# 网盘类型 -> Cookie 映射（键为 normalize_drive_type 规范名）
+PAN_COOKIES = {
+    "115": COOKIE_115,
+    "baidu": COOKIE_BAIDU,
+}
+
+
+def pan_cookie(drive_type=""):
+    """取指定网盘的 Cookie；未配置返回空串。"""
+    return PAN_COOKIES.get(normalize_drive_type(drive_type), "") or ""
+
+
+DRIVE_ORDER = [
+    x.lower()
+    for x in _split_cfg(
+        os.environ.get("DRIVE_ORDER", "115;baidu;quark;uc;tianyi;xunlei;ali;123pan")
+    )
+]
+
+PAN_META = {
+    "baidu": {"name": "百度网盘", "short": "百度"},
+    "aliyun": {"name": "阿里云盘", "short": "阿里"},
+    "quark": {"name": "夸克网盘", "short": "夸克"},
+    "tianyi": {"name": "天翼云盘", "short": "天翼"},
+    "uc": {"name": "UC网盘", "short": "UC"},
+    "115": {"name": "115网盘", "short": "115"},
+    "xunlei": {"name": "迅雷网盘", "short": "迅雷"},
+    "pan123": {"name": "123云盘", "short": "123"},
+    "cmcc": {"name": "移动云盘", "short": "移动"},
+    "others": {"name": "其他网盘", "short": "其他"},
+}
+
+PAN_PICS = {
+    "aliyun": "https://gh-proxy.org/https://github.com//power721/alist-tvbox/raw/refs/heads/master/web-ui/public/ali.jpg",
+    "quark": "https://gh-proxy.org/https://github.com//power721/alist-tvbox/raw/refs/heads/master/web-ui/public/quark.png",
+    "uc": "https://gh-proxy.org/https://github.com//power721/alist-tvbox/raw/refs/heads/master/web-ui/public/uc.png",
+    "xunlei": "https://gh-proxy.org/https://github.com//power721/alist-tvbox/raw/refs/heads/master/web-ui/public/thunder.png",
+    "pan123": "https://gh-proxy.org/https://github.com//power721/alist-tvbox/raw/refs/heads/master/web-ui/public/123.png",
+    "tianyi": "https://gh-proxy.org/https://github.com//power721/alist-tvbox/raw/refs/heads/master/web-ui/public/189.png",
+    "cmcc": "https://gh-proxy.org/https://github.com//power721/alist-tvbox/raw/refs/heads/master/web-ui/public/139.jpg",
+    "115": "https://gh-proxy.org/https://github.com//power721/alist-tvbox/raw/refs/heads/master/web-ui/public/115.jpg",
+    "baidu": "https://gh-proxy.org/https://github.com//power721/alist-tvbox/raw/refs/heads/master/web-ui/public/baidu.jpg",
+    "others": "https://gh-proxy.org/https://github.com//power721/alist-tvbox/raw/refs/heads/master/web-ui/public/folder.png",
+}
+
+FILTER_KEY_NAME_MAP = {
+    "class": "类型",
+    "area": "地区",
+    "lang": "语言",
+    "year": "年份",
+    "letter": "字母",
+    "by": "排序",
+    "sort": "排序",
+    "id": "分类",
+}
+
+PAN_URL_RE = re.compile(
+    r"https?://(?:115cdn\.com|115\.com|anxia\.com|pan\.quark\.cn|www\.aliyundrive\.com|"
+    r"www\.alipan\.com|pan\.baidu\.com|drive\.uc\.cn|fast\.uc\.cn|cloud\.189\.cn|"
+    r"www\.123pan\.com|pan\.xunlei\.com|yun\.139\.com)/[^\s\"'<>]+",
+    re.I,
+)
+IS_PAN_SHARE_RE = re.compile(
+    r"115|quark|aliyun|alipan|baidu|uc\.cn|123pan|189\.cn|xunlei|anxia|139\.com",
+    re.I,
+)
+ID_HREF_RE = re.compile(
+    r"/voddetail/(\d+)/?|/vodplay/(\d+)-\d+-\d+/?"
+    r"|/vod/detail/id/(\d+)\.html|/index\.php/vod/detail/id/(\d+)\.html",
+    re.I,
+)
+
+
+# ==================== encodeId / decodeId (觅盘) ====================
+def _b64url_encode(raw_bytes):
+    return base64.urlsafe_b64encode(raw_bytes).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(text):
+    s = str(text or "").replace("-", "+").replace("_", "/")
+    s += "=" * ((4 - len(s) % 4) % 4)
+    return base64.urlsafe_b64decode(s.encode("ascii"))
+
+
+def encode_id(typ, data):
+    try:
+        raw = json.dumps(data or {}, ensure_ascii=False, separators=(",", ":"))
+        return "mp|%s|%s" % (typ, _b64url_encode(raw.encode("utf-8")))
+    except Exception:
+        return ""
+
+
+def decode_id(raw):
+    parts = str(raw or "").split("|")
+    if len(parts) < 3 or parts[0] != "mp":
+        return "", {}
+    try:
+        data = json.loads(_b64url_decode("|".join(parts[2:])).decode("utf-8"))
+        if not isinstance(data, dict):
+            return "", {}
+        return parts[1], data
+    except Exception:
+        return "", {}
+
+
+def normalize_drive_type(raw):
+    value = str(raw or "").lower().strip()
+    if not value:
+        return "others"
+    if "baidu" in value or "百度" in value:
+        return "baidu"
+    if "aliyun" in value or "alipan" in value or "ali" in value or "阿里" in value:
+        return "aliyun"
+    if "quark" in value or "夸克" in value:
+        return "quark"
+    if "tianyi" in value or "189" in value or "天翼" in value:
+        return "tianyi"
+    if "115" in value:
+        return "115"
+    if "xunlei" in value or "thunder" in value or "迅雷" in value:
+        return "xunlei"
+    if "pan123" in value or "123pan" in value or value == "123":
+        return "pan123"
+    if "cmcc" in value or "139" in value or "移动" in value:
+        return "cmcc"
+    if "uc" in value:
+        return "uc"
+    return "others"
+
+
+def pan_name(drive_type):
+    key = normalize_drive_type(drive_type)
+    return PAN_META.get(key, PAN_META["others"])["name"]
+
+
+def pan_pic(drive_type):
+    key = normalize_drive_type(drive_type)
+    return PAN_PICS.get(key, PAN_PICS["others"])
+
+
+def sort_drive_keys(keys):
+    if not keys or len(keys) <= 1 or not DRIVE_ORDER:
+        return list(keys)
+    order_map = {name: i for i, name in enumerate(DRIVE_ORDER)}
+
+    def _key(k):
+        return order_map.get(normalize_drive_type(k), 10 ** 9)
+
+    return sorted(keys, key=_key)
+
+
+def infer_drive_type_from_share_url(share_url=""):
+    raw = str(share_url or "").lower()
+    if not raw:
+        return ""
+    if "pan.quark.cn" in raw or "drive.quark.cn" in raw:
+        return "quark"
+    if "drive.uc.cn" in raw or "fast.uc.cn" in raw:
+        return "uc"
+    if "pan.baidu.com" in raw:
+        return "baidu"
+    if "cloud.189.cn" in raw:
+        return "tianyi"
+    if "yun.139.com" in raw:
+        return "cmcc"
+    if "aliyundrive.com" in raw or "alipan.com" in raw:
+        return "aliyun"
+    if "pan.xunlei.com" in raw:
+        return "xunlei"
+    if "115.com" in raw or "115cdn.com" in raw or "anxia.com" in raw:
+        return "115"
+    if any(x in raw for x in ("123pan.com", "123684.com", "123865.com", "123912.com")):
+        return "pan123"
+    return ""
+
+
+# ==================== 工具 ====================
+def remove_trailing_slash(url):
+    return str(url or "").rstrip("/")
+
+
+def abs_url(url, base_url=""):
+    base = remove_trailing_slash(base_url or (WEB_SITES[0] if WEB_SITES else ""))
+    if not url:
+        return ""
+    if url.startswith("//"):
+        return "https:" + url
+    if re.match(r"^https?://", url, re.I):
+        return url
+    if url.startswith("/"):
+        return base + url
+    return base + "/" + url.lstrip("/")
+
+
+def get_id_from_href(href):
+    m = ID_HREF_RE.search(str(href or ""))
+    if not m:
+        return ""
+    return next((g for g in m.groups() if g), "")
+
+
+def normalize_video_id(video_id=""):
+    raw = str(video_id or "").strip()
+    if not raw:
+        return ""
+    if re.match(r"^https?://", raw, re.I) or raw.startswith("/"):
+        return get_id_from_href(raw) or raw
+    return raw
+
+
+def normalize_share_url(url):
+    u = str(url or "").strip().replace("&amp;", "&")
+    if not u:
+        return ""
+    u = re.sub(r"^https?://(?:www\.)?115cdn\.com/", "https://115.com/", u, flags=re.I)
+    u = re.sub(r"^https?://(?:www\.)?anxia\.com/", "https://115.com/", u, flags=re.I)
+    return re.sub(r"[),.;]+$", "", u)
+
+
+def extract_pan_url(raw):
+    s = str(raw or "").replace("&amp;", "&").strip()
+    m = re.search(r"https?://[^\s\"'<>]+", s, re.I)
+    return normalize_share_url(m.group(0)) if m else ""
+
+
+def is_pan_share_url(url=""):
+    return bool(IS_PAN_SHARE_RE.search(str(url or "")))
+
+
+def clean_content(s):
+    return re.sub(r"\s+", " ", re.sub(r"收起|展开全部|内详", "", str(s or ""))).strip()
+
+
+def build_category_path(category_id, page=1):
+    tid = str(category_id or "").strip()
+    pg = max(1, int(page) if str(page).isdigit() else 1)
+    if pg <= 1:
+        return "/vodtype/%s/" % tid
+    return "/vodtype/%s-%d/" % (tid, pg)
+
+
+def build_search_path(keyword, page=1):
+    enc = quote(str(keyword or "").strip())
+    pg = max(1, int(page) if str(page).isdigit() else 1)
+    if pg <= 1:
+        return "/vodsearch/%s-------------/" % enc
+    return "/vodsearch/%s----------%d---/" % (enc, pg)
+
+
+def build_detail_path(video_id):
+    vid = normalize_video_id(video_id)
+    if re.match(r"^https?://", str(vid), re.I):
+        return str(vid)
+    if str(vid).startswith("/"):
+        return str(vid)
+    return "/voddetail/%s/" % vid
+
+
+def wrap_movie_as_group_item(movie):
+    vid = normalize_video_id(movie.get("vod_id") or movie.get("vod_name") or "")
+    if not vid:
+        return movie
+    return {
+        "vod_id": encode_id("m", {"v": vid}),
+        "vod_name": movie.get("vod_name") or "",
+        "vod_pic": movie.get("vod_pic") or "",
+        "vod_remarks": movie.get("vod_remarks") or "",
+        "type_id": "pan_category",
+        "type_name": "网盘",
+        "vod_tag": "folder",
+        "panType": "mvg",
+    }
+
+
+def parse_page_count(html_text, current=1):
+    max_pg = max(1, int(current) if str(current).isdigit() else 1)
+    for href in re.findall(r"href=\"([^\"]+)\"", html_text or ""):
+        m = re.search(r"/vodtype/\d+-(\d+)/?", href, re.I)
+        if m:
+            max_pg = max(max_pg, int(m.group(1)))
+        m = re.search(r"/vodsearch/[^/]*?----------+(\d+)---+/?", href, re.I)
+        if m:
+            max_pg = max(max_pg, int(m.group(1)))
+    return max_pg or 1
+
+
+def is_blocked_html(body=""):
+    lower = str(body or "").lower()
+    if not lower:
+        return False
+    return any(x in lower for x in ("just a moment", "cf-browser-verification", "访问验证"))
+
+
+# ==================== HTML 解析 ====================
+def _class_xpath(cls):
+    return '//*[contains(concat(" ", normalize-space(@class), " "), " %s ")]' % cls
+
+
+def _first_text(nodes):
+    for n in nodes:
+        t = "".join(n.itertext())
+        t = re.sub(r"\s+", " ", t).strip()
+        if t:
+            return t
+    return ""
+
+
+def parse_list_from_html(html_text, base_url=""):
+    seen = set()
+    result = []
+    if not html_text:
+        return result
+
+    tree = None
+    if lxml_html is not None:
+        try:
+            tree = lxml_html.fromstring(html_text)
+        except Exception:
+            tree = None
+
+    if tree is not None:
+        for a in tree.xpath('//a[contains(concat(" ", normalize-space(@class), " "), " video-card ")]'):
+            href = a.get("href") or ""
+            vid = get_id_from_href(href)
+            if not vid or vid in seen:
+                continue
+            title = (a.get("title") or "").strip()
+            if not title:
+                title = _first_text(a.xpath(
+                    './/*[contains(concat(" ", normalize-space(@class), " "), " video-title ")]'
+                ))
+            title = re.sub(r"\s+", " ", title).strip()
+            if not title:
+                continue
+            seen.add(vid)
+            pic = ""
+            imgs = a.xpath(".//img")
+            if imgs:
+                img = imgs[0]
+                pic = img.get("data-src") or img.get("data-original") or img.get("src") or ""
+                if "loading.gif" in pic:
+                    pic = img.get("data-src") or img.get("data-original") or ""
+            note = _first_text(a.xpath(
+                './/*[contains(concat(" ", normalize-space(@class), " "), " video-episode ")]'
+            ))
+            result.append({
+                "vod_id": vid,
+                "vod_name": title,
+                "vod_pic": abs_url(pic, base_url),
+                "type_id": "",
+                "type_name": "",
+                "vod_remarks": re.sub(r"\s+", " ", note).strip(),
+            })
+
+        if not result:
+            for cls in ("module-item", "module-search-item"):
+                for el in tree.xpath(_class_xpath(cls)):
+                    anchors = el.xpath(
+                        './/a[contains(@href, "/voddetail/") or contains(@href, "/vodplay/")]'
+                    )
+                    if not anchors:
+                        continue
+                    a = anchors[0]
+                    vid = get_id_from_href(a.get("href") or "")
+                    if not vid or vid in seen:
+                        continue
+                    title = (a.get("title") or "").strip()
+                    if not title:
+                        for sel in (
+                            './/*[contains(concat(" ", normalize-space(@class), " "), " module-poster-item-title ")]',
+                            './/*[contains(concat(" ", normalize-space(@class), " "), " module-item-title ")]',
+                            './/*[contains(concat(" ", normalize-space(@class), " "), " video-name ")]',
+                            ".//h3",
+                            ".//h4",
+                        ):
+                            title = _first_text(el.xpath(sel))
+                            if title:
+                                break
+                    title = re.sub(r"\s+", " ", title or "").strip()
+                    title = re.sub(r"^立刻播放|^下载", "", title).strip()
+                    if not title:
+                        continue
+                    seen.add(vid)
+                    pic = ""
+                    imgs = el.xpath(".//img")
+                    if imgs:
+                        img = imgs[0]
+                        pic = img.get("data-src") or img.get("data-original") or img.get("src") or ""
+                        if "loading.gif" in pic:
+                            pic = img.get("data-src") or img.get("data-original") or ""
+                    note = ""
+                    for sel in (
+                        './/*[contains(concat(" ", normalize-space(@class), " "), " module-item-note ")]',
+                        './/*[contains(concat(" ", normalize-space(@class), " "), " module-poster-item-note ")]',
+                        './/*[contains(concat(" ", normalize-space(@class), " "), " video-serial ")]',
+                    ):
+                        note = _first_text(el.xpath(sel))
+                        if note:
+                            break
+                    result.append({
+                        "vod_id": vid,
+                        "vod_name": title,
+                        "vod_pic": abs_url(pic, base_url),
+                        "type_id": "",
+                        "type_name": "",
+                        "vod_remarks": re.sub(r"\s+", " ", note).strip(),
+                    })
+
+    if not result:
+        for m in re.finditer(
+            r'<a[^>]+href="(/voddetail/\d+/)"[^>]*>(.*?)</a>', html_text, re.S | re.I
+        ):
+            vid = get_id_from_href(m.group(1))
+            if not vid or vid in seen:
+                continue
+            inner = m.group(2)
+            tm = re.search(r'title="([^"]+)"', m.group(0))
+            title = unescape(tm.group(1)).strip() if tm else ""
+            if not title:
+                tm = re.search(r'class="[^"]*video-title[^"]*"[^>]*>([^<]+)', inner)
+                title = unescape(tm.group(1)).strip() if tm else ""
+            if not title:
+                tm = re.search(r'<img[^>]+alt="([^"]+)"', inner)
+                title = unescape(tm.group(1)).strip() if tm else ""
+            if not title:
+                continue
+            seen.add(vid)
+            pm = re.search(r'<img[^>]+(?:data-src|src)="([^"]+)"', inner)
+            pic = abs_url(pm.group(1), base_url) if pm else ""
+            nm = re.search(r'class="[^"]*video-episode[^"]*"[^>]*>([^<]+)', inner)
+            note = unescape(nm.group(1)).strip() if nm else ""
+            result.append({
+                "vod_id": vid,
+                "vod_name": title,
+                "vod_pic": pic,
+                "type_id": "",
+                "type_name": "",
+                "vod_remarks": note,
+            })
+
+    return result
+
+
+def parse_vod_base_info(html_text, base_url=""):
+    info = {
+        "vodName": "",
+        "vodPic": "",
+        "vodYear": "",
+        "vodDirector": "",
+        "vodActor": "",
+        "vodContent": "",
+    }
+    if not html_text:
+        return info
+    if lxml_html is None:
+        tm = re.search(r"<title>([^<]+)</title>", html_text, re.I)
+        if tm:
+            info["vodName"] = re.sub(r"\s+", " ", unescape(tm.group(1))).split(" - ")[0].strip()
+        return info
+    try:
+        tree = lxml_html.fromstring(html_text)
+    except Exception:
+        return info
+
+    for sel in (
+        "//h1",
+        '//*[contains(concat(" ", normalize-space(@class), " "), " page-title ")]',
+        '//*[contains(concat(" ", normalize-space(@class), " "), " video-info-header ")]//h1',
+        '//*[contains(concat(" ", normalize-space(@class), " "), " module-info-heading ")]//h1',
+        '//*[contains(concat(" ", normalize-space(@class), " "), " mobile-detail-title ")]',
+        '//*[contains(concat(" ", normalize-space(@class), " "), " premium-title ")]',
+    ):
+        name = _first_text(tree.xpath(sel))
+        if name:
+            info["vodName"] = name
+            break
+
+    for sel in (
+        '//*[contains(concat(" ", normalize-space(@class), " "), " module-item-pic ")]//img',
+        '//*[contains(concat(" ", normalize-space(@class), " "), " module-info-poster ")]//img',
+        '//*[contains(concat(" ", normalize-space(@class), " "), " video-cover ")]//img',
+        '//img[contains(@class, "lazyload") or contains(@class, "lazy")]',
+        '//*[contains(concat(" ", normalize-space(@class), " "), " premium-poster ")]//img',
+        "//meta[@property='og:image']",
+    ):
+        nodes = tree.xpath(sel)
+        if not nodes:
+            continue
+        n = nodes[0]
+        pic = n.get("data-src") or n.get("data-original") or n.get("src") or n.get("content") or ""
+        if pic and "loading.gif" not in pic:
+            info["vodPic"] = abs_url(pic, base_url)
+            break
+
+    for el in tree.xpath(
+        '//*[contains(concat(" ", normalize-space(@class), " "), " video-info-itemtitle ")]'
+    ):
+        key = _first_text([el])
+        nxt = el.getnext()
+        if nxt is None:
+            continue
+        if "剧情" in key:
+            info["vodContent"] = clean_content(_first_text(nxt.xpath(".//p")))
+        elif "导演" in key:
+            val = ", ".join(t for t in (_first_text([a]) for a in nxt.xpath(".//a")) if t)
+            if val:
+                info["vodDirector"] = val
+        elif "主演" in key:
+            val = ", ".join(t for t in (_first_text([a]) for a in nxt.xpath(".//a")) if t)
+            if val:
+                info["vodActor"] = val
+        elif any(k in key for k in ("年代", "年份", "上映")):
+            m = re.search(r"(19|20)\d{2}", _first_text([nxt]))
+            if m:
+                info["vodYear"] = m.group(0)
+
+    for el in tree.xpath(
+        '//*[contains(concat(" ", normalize-space(@class), " "), " premium-meta-grid ")]'
+        '//*[contains(concat(" ", normalize-space(@class), " "), " meta-item ")]'
+    ):
+        label = _first_text(el.xpath(
+            './/*[contains(concat(" ", normalize-space(@class), " "), " m-label ")]'
+        ))
+        val = _first_text(el.xpath(
+            './/*[contains(concat(" ", normalize-space(@class), " "), " m-val ")]'
+        ))
+        if not label or not val:
+            continue
+        if not info["vodDirector"] and "导演" in label:
+            info["vodDirector"] = val
+        if not info["vodActor"] and "主演" in label:
+            info["vodActor"] = val
+        if not info["vodYear"] and any(k in label for k in ("年代", "年份", "上映")):
+            m = re.search(r"(19|20)\d{2}", val)
+            if m:
+                info["vodYear"] = m.group(0)
+
+    if not info["vodYear"]:
+        for el in tree.xpath(
+            '//*[contains(concat(" ", normalize-space(@class), " "), " premium-tags-top ")]'
+            '//*[contains(concat(" ", normalize-space(@class), " "), " p-tag ")]'
+        ):
+            txt = _first_text([el])
+            if re.match(r"^(19|20)\d{2}$", txt):
+                info["vodYear"] = txt
+                break
+
+    if not info["vodContent"]:
+        for sel in (
+            '//*[contains(concat(" ", normalize-space(@class), " "), " vod_content ")]',
+            '//*[contains(concat(" ", normalize-space(@class), " "), " module-info-introduction ")]',
+            '//*[contains(concat(" ", normalize-space(@class), " "), " video-info-content ")]',
+            '//*[contains(concat(" ", normalize-space(@class), " "), " detail-desc-text ")]',
+            '//*[contains(concat(" ", normalize-space(@class), " "), " premium-plot ")]',
+        ):
+            nodes = tree.xpath(sel)
+            if nodes:
+                info["vodContent"] = clean_content(_first_text(nodes[-1:]))
+                if info["vodContent"]:
+                    break
+
+    return info
+
+
+def _collect_candidates(el):
+    out = []
+    for attr in ("data-clipboard-text", "data-copy", "data-pan-item"):
+        for n in el.xpath(".//*[@%s]" % attr):
+            v = n.get(attr)
+            if v:
+                out.append(v)
+    for n in el.xpath('.//a[starts-with(@href, "http")]'):
+        out.append(n.get("href") or "")
+    for n in el.xpath(".//p | .//span | .//i"):
+        t = _first_text([n])
+        if t:
+            out.append(t)
+    for n in el.xpath(
+        './/*[contains(concat(" ", normalize-space(@class), " "), " pan-link-meta ")]'
+        ' | .//*[contains(concat(" ", normalize-space(@class), " "), " pan-link-title ")]'
+        ' | .//*[contains(concat(" ", normalize-space(@class), " "), " module-row-title ")]'
+    ):
+        t = _first_text([n])
+        if t:
+            out.append(t)
+    return out
+
+
+def extract_pan_urls(html_text):
+    urls = []
+    seen = set()
+    if not html_text:
+        return urls
+    if lxml_html is not None:
+        try:
+            tree = lxml_html.fromstring(html_text)
+        except Exception:
+            tree = None
+        if tree is not None:
+            for sel in (
+                '//*[contains(concat(" ", normalize-space(@class), " "), " module-row-info ")]',
+                '//*[@data-pan-item]',
+                '//*[contains(concat(" ", normalize-space(@class), " "), " pan-link-item ")]',
+            ):
+                for el in tree.xpath(sel):
+                    for raw in _collect_candidates(el):
+                        url = extract_pan_url(raw)
+                        if not url or not is_pan_share_url(url) or url in seen:
+                            continue
+                        seen.add(url)
+                        urls.append(url)
+    if not urls:
+        for m in PAN_URL_RE.finditer(html_text):
+            url = normalize_share_url(m.group(0))
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            urls.append(url)
+    return urls
+
+
+def extract_pan_items(html_text):
+    items = []
+    seen = set()
+    if not html_text:
+        return items
+
+    def push(raw, name):
+        url = extract_pan_url(raw)
+        if not url or not is_pan_share_url(url) or url in seen:
+            return
+        seen.add(url)
+        clean_name = re.sub(r"https?://\S+", "", str(name or ""))
+        clean_name = re.sub(r"\s+", " ", clean_name).strip()
+        items.append({"url": url, "name": clean_name})
+
+    if lxml_html is not None:
+        try:
+            tree = lxml_html.fromstring(html_text)
+        except Exception:
+            tree = None
+        if tree is not None:
+            for sel in (
+                '//*[@data-pan-item]',
+                '//*[contains(concat(" ", normalize-space(@class), " "), " pan-link-item ")]',
+                '//*[contains(concat(" ", normalize-space(@class), " "), " module-row-info ")]',
+            ):
+                for el in tree.xpath(sel):
+                    name = ""
+                    for nsel in (
+                        './/*[contains(concat(" ", normalize-space(@class), " "), " pan-link-title ")]',
+                        './/*[contains(concat(" ", normalize-space(@class), " "), " pan-link-label ")]',
+                        './/*[contains(concat(" ", normalize-space(@class), " "), " pan-link-name ")]',
+                        './/*[contains(concat(" ", normalize-space(@class), " "), " link-title ")]',
+                        './/*[contains(concat(" ", normalize-space(@class), " "), " module-row-title ")]',
+                    ):
+                        name = _first_text(el.xpath(nsel))
+                        if name:
+                            break
+                    if not name:
+                        name = _first_text(el.xpath(
+                            './/*[contains(concat(" ", normalize-space(@class), " "), " pan-link-meta ")]'
+                        ))
+                    for raw in _collect_candidates(el):
+                        push(raw, name)
+    if not items:
+        for m in PAN_URL_RE.finditer(html_text):
+            push(m.group(0), "")
+    return items
+
+
+def parse_nav_classes(html_text):
+    classes = []
+    if not html_text:
+        return classes
+    seen = set()
+    for m in re.finditer(
+        r'<a[^>]+href="(/vodtype/(\d+)/?)"[^>]*>([^<]{1,20})</a>', html_text, re.I
+    ):
+        tid, name = m.group(2), unescape(m.group(3)).strip()
+        name = re.sub(r"\s+", " ", name)
+        if not tid or tid == "0" or not name:
+            continue
+        if re.search(r"首页|最近|排行|专题|求片|留言|更多", name):
+            continue
+        if tid in seen:
+            continue
+        seen.add(tid)
+        classes.append({"type_id": tid, "type_name": name})
+    return classes
+
+
+def parse_filters_from_html(html_text):
+    groups = []
+    if not html_text or lxml_html is None:
+        return groups
+    try:
+        tree = lxml_html.fromstring(html_text)
+    except Exception:
+        return groups
+    boxes = tree.xpath(
+        '//*[contains(concat(" ", normalize-space(@class), " "), " library-box ")]'
+    )
+    for box in boxes[1:] if len(boxes) > 1 else []:
+        links = box.xpath(
+            './/*[contains(concat(" ", normalize-space(@class), " "), " library-list ")]//a'
+        )
+        if not links:
+            continue
+        first_href = links[0].get("href") or ""
+        key = None
+        for k in FILTER_KEY_NAME_MAP:
+            if ("%s/" % k) in first_href or ("/%s/" % k) in first_href:
+                key = k
+                break
+        if not key and re.search(r"/vodshow/|/vodtype/\d+|/id/\d+", first_href):
+            key = "id"
+        if not key:
+            continue
+        values = [{"name": "全部", "value": ""}]
+        dedupe = {"__ALL__"}
+        for a in links:
+            href = a.get("href") or ""
+            if not href:
+                continue
+            value = ""
+            marker = "%s/" % key
+            idx = href.find(marker)
+            if idx >= 0:
+                rest = href[idx + len(marker):]
+                value = unescape(rest.split("/")[0].split(".")[0] or "")
+            elif key == "id":
+                m = re.search(r"/vodtype/(\d+)", href) or re.search(r"/id/(\d+)", href)
+                value = m.group(1) if m else ""
+            name = _first_text([a])
+            dk = "%s::%s" % (name, value)
+            if (not name and not value) or dk in dedupe:
+                continue
+            dedupe.add(dk)
+            values.append({"name": name, "value": value})
+        if len(values) > 1:
+            groups.append({
+                "key": key,
+                "name": FILTER_KEY_NAME_MAP.get(key, key),
+                "init": "",
+                "value": values,
+            })
+    return groups
+
+
+# ==================== HTTP / 登录 ====================
+if requests is not None and HTTPAdapter is not object and create_urllib3_context is not None:
+    class _InsecureSSLAdapter(HTTPAdapter):
+        def init_poolmanager(self, connections, maxsize, block=False, **kwargs):
+            ctx = create_urllib3_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = 0
+            try:
+                ctx.set_ciphers("DEFAULT@SECLEVEL=1")
+            except Exception:
+                pass
+            kwargs["ssl_context"] = ctx
+            return super().init_poolmanager(connections, maxsize, block, **kwargs)
+else:
+    _InsecureSSLAdapter = None
+
+
+class HttpClient(object):
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._session = None
+        self._logged_in = False
+        self._cookie_header = WONIU4K_COOKIE
+        if requests is not None:
+            s = requests.Session()
+            if _InsecureSSLAdapter is not None:
+                try:
+                    s.mount("https://", _InsecureSSLAdapter())
+                except Exception:
+                    pass
+            s.headers.update({
+                "User-Agent": SITE_UA,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9",
+            })
+            if self._cookie_header:
+                s.headers["Cookie"] = self._cookie_header
+            self._session = s
+
+    def _headers(self, extra=None):
+        h = {"User-Agent": SITE_UA}
+        if self._cookie_header:
+            h["Cookie"] = self._cookie_header
+        if extra:
+            h.update(extra)
+        return h
+
+    def get(self, path, timeout=20, referer=None):
+        if requests is None:
+            raise RuntimeError("requests 模块不可用")
+        last_err = None
+        for site in WEB_SITES:
+            base = remove_trailing_slash(site)
+            url = path if str(path).startswith("http") else base + path
+            headers = self._headers()
+            if referer:
+                headers["Referer"] = referer
+            elif not str(path).startswith("http"):
+                headers["Referer"] = base + "/"
+            try:
+                resp = self._session.get(url, headers=headers, timeout=timeout, verify=False)
+                if resp.status_code != 200:
+                    last_err = Exception("HTTP %s" % resp.status_code)
+                    continue
+                body = resp.text or ""
+                if not body:
+                    last_err = Exception("empty body")
+                    continue
+                if is_blocked_html(body):
+                    last_err = Exception("blocked")
+                    continue
+                sc = resp.headers.get("Set-Cookie")
+                if sc:
+                    self._merge_set_cookie(sc)
+                final_base = remove_trailing_slash(str(resp.url).rsplit("/", 1)[0])
+                return body, final_base
+            except Exception as e:
+                last_err = e
+                continue
+        raise last_err or Exception("所有域名请求均失败")
+
+    def post_form(self, path, data, timeout=15, referer=None, ajax=False):
+        if requests is None:
+            raise RuntimeError("requests 模块不可用")
+        last_err = None
+        for site in WEB_SITES:
+            base = remove_trailing_slash(site)
+            url = path if str(path).startswith("http") else base + path
+            headers = self._headers({
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": referer or (base + "/"),
+            })
+            if ajax:
+                headers["X-Requested-With"] = "XMLHttpRequest"
+            try:
+                resp = self._session.post(url, data=data, headers=headers, timeout=timeout, verify=False)
+                sc = resp.headers.get("Set-Cookie")
+                if sc:
+                    self._merge_set_cookie(sc)
+                return resp
+            except Exception as e:
+                last_err = e
+                continue
+        raise last_err or Exception("登录请求失败")
+
+    def _merge_set_cookie(self, set_cookie_text):
+        pairs = re.findall(r"([^=;,]+)=([^;,]*)", set_cookie_text or "")
+        if not pairs:
+            return
+        jar = {}
+        if self._cookie_header:
+            for kv in self._cookie_header.split(";"):
+                if "=" in kv:
+                    k, v = kv.split("=", 1)
+                    jar[k.strip()] = v.strip()
+        skip = {"path", "expires", "max-age", "domain", "httponly", "secure"}
+        for k, v in pairs:
+            k = k.strip()
+            if k.lower() in skip:
+                continue
+            jar[k] = v.strip()
+        self._cookie_header = "; ".join("%s=%s" % (k, v) for k, v in jar.items())
+        if self._session is not None:
+            self._session.headers["Cookie"] = self._cookie_header
+
+
+_http = HttpClient()
+_detail_cache = {}
+_cache_lock = threading.Lock()
+_CACHE_TTL = 43200
+
+
+def _cache_get(key):
+    with _cache_lock:
+        hit = _detail_cache.get(key)
+        if not hit:
+            return None
+        ts, val = hit
+        if time.time() - ts > _CACHE_TTL:
+            _detail_cache.pop(key, None)
+            return None
+        return val
+
+
+def _cache_set(key, val):
+    with _cache_lock:
+        if len(_detail_cache) > 200:
+            oldest = sorted(_detail_cache.items(), key=lambda kv: kv[1][0])
+            for k, _ in oldest[:50]:
+                _detail_cache.pop(k, None)
+        _detail_cache[key] = (time.time(), val)
+
+
+def _download_image_b64(url, timeout=10):
+    if requests is None:
+        return ""
+    try:
+        resp = requests.get(
+            url,
+            headers={"User-Agent": SITE_UA, "Referer": WEB_SITES[0] + "/"},
+            timeout=timeout,
+            verify=False,
+        )
+        if resp.status_code != 200 or not resp.content:
+            return ""
+        return base64.b64encode(resp.content).decode("ascii")
+    except Exception:
+        return ""
+
+
+def _solve_captcha(verify_url):
+    if not verify_url or not CAPTCHA_SERVICE_URL:
+        return ""
+    b64 = _download_image_b64(verify_url)
+    if not b64:
+        return ""
+    try:
+        resp = requests.post(
+            CAPTCHA_SERVICE_URL + "/ocr/",
+            json={"data": b64},
+            timeout=30,
+            verify=False,
+        )
+        data = resp.json() if resp.text else {}
+        if data.get("status") == 0 and data.get("data"):
+            d = data["data"]
+            return str(d.get("code") or d.get("result") or d.get("text") or "").strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def ensure_login():
+    """登录后才能看到完整网盘链接。已登录则跳过。"""
+    if _http._logged_in:
+        return True
+    if _http._cookie_header and _http._cookie_header != WONIU4K_COOKIE:
+        try:
+            body, _ = _http.get("/user/index/", timeout=12)
+            if "退出登录" in body or "user-name" in body:
+                _http._logged_in = True
+                return True
+        except Exception:
+            pass
+    if not LOGIN_USERNAME or not LOGIN_PASSWORD:
+        return False
+
+    for attempt in range(1, 3):
+        try:
+            body, _ = _http.get("/user/login/", timeout=15)
+            verify_url = ""
+            m = re.search(r'id="(?:verify_img|verify-img)"[^>]+src="([^"]+)"', body or "")
+            if not m:
+                m = re.search(r'src="([^"]+)"[^>]+id="(?:verify_img|verify-img)"', body or "")
+            if m:
+                verify_url = abs_url(m.group(1), WEB_SITES[0])
+            code = ""
+            if verify_url:
+                code = _solve_captcha(verify_url)
+                if not code:
+                    time.sleep(0.8)
+                    continue
+            form = {"user_name": LOGIN_USERNAME, "user_pwd": LOGIN_PASSWORD}
+            if code:
+                form["verify"] = code
+            resp = _http.post_form(
+                "/user/login.html",
+                form,
+                referer=remove_trailing_slash(WEB_SITES[0]) + "/user/login/",
+                ajax=True,
+            )
+            try:
+                result = resp.json()
+            except Exception:
+                result = {"code": 0, "msg": "登录响应解析失败"}
+            if result.get("code") == 1:
+                _http._logged_in = True
+                return True
+            msg = str(result.get("msg") or "")
+            if re.search(r"验证码|verify", msg, re.I) and attempt < 2:
+                time.sleep(0.8)
+                continue
+            return False
+        except Exception:
+            if attempt < 2:
+                time.sleep(1.0)
+            continue
+    return False
+
+
+# ==================== 业务：分组 ====================
+def build_movie_drive_groups(video_id, vod_name, vod_pic, pan_urls):
+    by_type = {}
+    unknown = 0
+    for url in pan_urls or []:
+        t = infer_drive_type_from_share_url(url)
+        if t:
+            by_type[t] = by_type.get(t, 0) + 1
+        else:
+            unknown += 1
+    items = []
+    for drive_type, count in by_type.items():
+        items.append({
+            "vod_id": encode_id("g", {"v": video_id, "t": drive_type}),
+            "vod_name": pan_name(drive_type),
+            "vod_pic": vod_pic or pan_pic(drive_type),
+            "type_id": "pan_category",
+            "type_name": "网盘分类",
+            "vod_remarks": "%d条" % count,
+            "vod_tag": "folder",
+            "panType": drive_type,
+        })
+    if unknown > 0:
+        items.append({
+            "vod_id": encode_id("g", {"v": video_id, "t": "others"}),
+            "vod_name": pan_name("others"),
+            "vod_pic": vod_pic or pan_pic("others"),
+            "type_id": "pan_category",
+            "type_name": "网盘分类",
+            "vod_remarks": "%d条" % unknown,
+            "vod_tag": "folder",
+            "panType": "others",
+        })
+    if len(items) > 1:
+        items.sort(key=lambda x: x.get("vod_name") or "")
+    return items
+
+
+def _link_item_to_vod(share_url, name, vod_pic, drive_type, movie_title=""):
+    rid = encode_id("r", {"u": share_url, "n": name or "", "t": drive_type})
+    display = name or (pan_name(drive_type) if drive_type else "网盘资源")
+    if movie_title and movie_title not in display:
+        display = "%s · %s" % (movie_title[:20], display[:30])
+    return {
+        "vod_id": rid,
+        "vod_name": display,
+        "vod_pic": vod_pic or pan_pic(drive_type),
+        "type_id": drive_type or "others",
+        "type_name": pan_name(drive_type) if drive_type else "网盘",
+        "vod_remarks": movie_title or pan_name(drive_type),
+        "vod_tag": "file",
+        "panType": drive_type or "others",
+        "panUrl": share_url,
+        "vod_play_from": pan_name(drive_type) if drive_type else "网盘",
+        "vod_play_url": "播放$%s" % share_url,
+    }
+
+
+def _get_detail_cached(video_id):
+    key = "detail:%s" % video_id
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    ensure_login()
+    path = build_detail_path(video_id)
+    body, base = _http.get(path, timeout=20)
+    _cache_set(key, (body, base))
+    return body, base
+
+
+def _movie_drive_groups_by_vid(video_id):
+    vid = normalize_video_id(video_id)
+    body, base = _get_detail_cached(vid)
+    info = parse_vod_base_info(body, base)
+    pan_urls = extract_pan_urls(body)
+    groups = build_movie_drive_groups(vid, info["vodName"], info["vodPic"], pan_urls)
+    return {
+        "list": groups,
+        "page": 1,
+        "pagecount": 1,
+        "limit": PAGE_SIZE,
+        "total": len(groups),
+    }
+
+
+def _movie_links_by_drive(video_id, drive_type):
+    vid = normalize_video_id(video_id)
+    body, base = _get_detail_cached(vid)
+    info = parse_vod_base_info(body, base)
+    dt = normalize_drive_type(drive_type)
+    link_items = []
+    seen = set()
+    for url in extract_pan_urls(body):
+        u = normalize_share_url(url)
+        if not u or u in seen:
+            continue
+        inferred = infer_drive_type_from_share_url(u)
+        if dt not in ("others", "all", "") and inferred != dt:
+            continue
+        if dt == "others" and inferred:
+            continue
+        seen.add(u)
+        link_items.append(_link_item_to_vod(u, "", info["vodPic"], inferred or "others", info["vodName"]))
+    return {
+        "list": link_items,
+        "page": 1,
+        "pagecount": 1,
+        "limit": PAGE_SIZE,
+        "total": len(link_items),
+    }
+
+
+def _share_url_detail(share_url, title=""):
+    u = normalize_share_url(share_url)
+    dt = infer_drive_type_from_share_url(u) or "others"
+    name = title or "网盘推送"
+    vod = _link_item_to_vod(u, name, pan_pic(dt), dt, title)
+    vod["vod_name"] = name
+    vod["vod_content"] = name
+    return {
+        "list": [vod],
+        "page": 1,
+        "pagecount": 1,
+        "limit": PAGE_SIZE,
+        "total": 1,
+    }
+
+
+def _search_videos_by_drive(keyword, page, drive_type):
+    """搜索关键词下、指定网盘类型的链接列表（探测各详情页）。"""
+    ensure_login()
+    path = build_search_path(keyword, page)
+    body, base = _http.get(path, timeout=20)
+    videos = parse_list_from_html(body, base)
+    dt = normalize_drive_type(drive_type)
+    link_items = []
+    seen = set()
+    idx = 0
+    # 限制探测数量，避免过慢
+    for video in videos[:12]:
+        try:
+            dbody, dbase = _get_detail_cached(video.get("vod_id") or "")
+        except Exception:
+            continue
+        for item in extract_pan_items(dbody):
+            u = normalize_share_url(item.get("url") or "")
+            if not u or u in seen:
+                continue
+            inferred = infer_drive_type_from_share_url(u)
+            if dt not in ("others", "all", "") and inferred != dt:
+                continue
+            if dt == "others" and inferred:
+                continue
+            seen.add(u)
+            idx += 1
+            link_items.append(
+                _link_item_to_vod(u, item.get("name") or "", video.get("vod_pic") or "",
+                                  inferred or "others", video.get("vod_name") or "")
+            )
+    return {
+        "list": link_items,
+        "page": page,
+        "pagecount": parse_page_count(body, page),
+        "limit": PAGE_SIZE,
+        "total": len(link_items),
+    }
+
+
+# ==================== Spider ====================
+class Spider(BaseSpider):
+    def init(self, extend=""):
+        if isinstance(extend, dict):
+            self.options = extend
+        elif extend:
+            try:
+                self.options = json.loads(extend)
+            except Exception:
+                self.options = {}
+        else:
+            self.options = {}
+
+    def getName(self):
+        return "蜗牛4K"
+
+    def _empty(self, page=1, msg=""):
+        out = {
+            "list": [],
+            "page": int(page) if str(page).isdigit() else 1,
+            "pagecount": 0,
+            "limit": PAGE_SIZE,
+            "total": 0,
+        }
+        if msg:
+            out["msg"] = msg
+        return out
+
+    def _page_list(self, videos, page=1, pagecount=1, total=None, wrap=True):
+        items = [wrap_movie_as_group_item(v) for v in (videos or [])] if wrap else list(videos or [])
+        return {
+            "list": items,
+            "page": int(page) if str(page).isdigit() else 1,
+            "pagecount": max(1, int(pagecount) if str(pagecount).isdigit() else 1),
+            "limit": PAGE_SIZE,
+            "total": len(items) if total is None else int(total),
+        }
+
+    # ---------- 首页 ----------
+    def homeContent(self, filter):
+        classes = list(STATIC_CLASSES)
+        try:
+            body, base = _http.get("/", timeout=20)
+            nav = parse_nav_classes(body)
+            if nav:
+                classes = nav
+        except Exception:
+            pass
+        result = {"class": classes}
+        if filter:
+            filters = {}
+            try:
+                body, _ = _http.get("/", timeout=15)
+                # 首页通常无筛选；分类页在 category 时再解析
+            except Exception:
+                body = ""
+            if body:
+                groups = parse_filters_from_html(body)
+                if groups:
+                    for c in classes:
+                        filters[c["type_id"]] = groups
+            result["filters"] = filters
+        return result
+
+    def homeVideoContent(self):
+        try:
+            body, base = _http.get("/", timeout=20)
+            videos = parse_list_from_html(body, base)
+            return self._page_list(videos, 1, 1)
+        except Exception as e:
+            return self._empty(1, "首页推荐加载失败：" + str(e))
+
+    # ---------- 分类 ----------
+    def categoryContent(self, tid, pg, filter, extend):
+        page = int(pg) if str(pg).isdigit() else 1
+        cat_id = str(tid or "")
+        try:
+            ext = {}
+            if isinstance(extend, dict):
+                ext = extend
+            elif extend:
+                try:
+                    ext = json.loads(extend)
+                except Exception:
+                    ext = {}
+
+            # 分组跳转
+            typ, data = decode_id(cat_id)
+            if typ == "m":
+                return _movie_drive_groups_by_vid(data.get("v") or "")
+            if typ == "g":
+                return _movie_links_by_drive(data.get("v") or "", data.get("t") or "")
+            if typ == "k":
+                return _search_videos_by_drive(data.get("k") or "", page, data.get("t") or "")
+            if typ == "r":
+                return _share_url_detail(data.get("u") or "", data.get("n") or "")
+            # 旧格式兼容
+            if cat_id.startswith("mvg:"):
+                return _movie_drive_groups_by_vid(cat_id[4:])
+            if cat_id.startswith("mv:"):
+                rest = cat_id[3:].split(":", 1)
+                if len(rest) == 2:
+                    return _movie_links_by_drive(rest[1], rest[0])
+            if "|" in cat_id and not cat_id.startswith("mp|"):
+                parts = cat_id.split("|", 1)
+                if len(parts) == 2 and parts[0]:
+                    return _search_videos_by_drive(parts[1], page, parts[0])
+
+            # 筛选路径
+            has_filter = any(
+                ext.get(k) or ext.get(k + "#")
+                for k in ("area", "class", "lang", "letter", "year", "sort", "by", "tid", "id")
+            )
+            if has_filter:
+                url = "/index.php/vod/show"
+                if ext.get("area"):
+                    url += "/area/%s" % quote(str(ext["area"]))
+                sort_value = ext.get("sort") or ext.get("by")
+                if sort_value:
+                    url += "/by/%s" % quote(str(sort_value))
+                if ext.get("class"):
+                    url += "/class/%s" % quote(str(ext["class"]))
+                if ext.get("lang"):
+                    url += "/lang/%s" % quote(str(ext["lang"]))
+                if ext.get("letter"):
+                    url += "/letter/%s" % quote(str(ext["letter"]))
+                if ext.get("year"):
+                    url += "/year/%s" % quote(str(ext["year"]))
+                tid_value = ext.get("tid") or ext.get("id") or cat_id
+                url += "/id/%s" % quote(str(tid_value))
+                if page > 1:
+                    url += "/page/%d" % page
+                url += ".html"
+            else:
+                url = build_category_path(cat_id, page)
+
+            body, base = _http.get(url, timeout=20)
+            videos = parse_list_from_html(body, base)
+            for v in videos:
+                v["type_id"] = cat_id
+            pagecount = parse_page_count(body, page)
+            result = self._page_list(videos, page, pagecount, len(videos))
+            if page == 1:
+                groups = parse_filters_from_html(body)
+                if groups:
+                    result["filters"] = {cat_id: groups}
+            return result
+        except Exception as e:
+            return self._empty(page, "分类加载失败：" + str(e))
+
+    # ---------- 搜索 ----------
+    @staticmethod
+    def _is_rate_limited(body):
+        if not body:
+            return False
+        return ("跳转提示" in body) or ("频繁操作" in body) or ("搜索时间间隔" in body)
+
+    def _search_fetch(self, keyword, page, retries=3):
+        """带限流退避的搜索抓取（站点要求搜索间隔 >=3 秒）。"""
+        path = build_search_path(keyword, page)
+        last = None
+        for attempt in range(retries):
+            body, base = _http.get(path, timeout=20)
+            if not self._is_rate_limited(body):
+                return body, base
+            last = (body, base)
+            if attempt < retries - 1:
+                time.sleep(3.2)
+        return last
+
+    def searchContent(self, key, quick, pg="1"):
+        page = int(pg) if str(pg).isdigit() else 1
+        keyword = str(key or "").strip()
+        try:
+            if not keyword:
+                return self._empty(page, "搜索关键词为空")
+            # 直接推送分享链接
+            if re.match(r"^https?://", keyword, re.I) and is_pan_share_url(keyword):
+                return _share_url_detail(keyword, "网盘推送")
+
+            body, base = self._search_fetch(keyword, page)
+            if self._is_rate_limited(body):
+                return self._empty(page, "搜索过于频繁，请稍后再试")
+            videos = parse_list_from_html(body, base)
+            pagecount = parse_page_count(body, page)
+            # 统一包成影片文件夹，点击后进入网盘分组
+            return self._page_list(videos, page, pagecount, len(videos))
+        except Exception as e:
+            return self._empty(page, "搜索失败：" + str(e))
+
+    # ---------- 详情 ----------
+    def detailContent(self, ids):
+        raw = ""
+        if isinstance(ids, (list, tuple)):
+            raw = str(ids[0] if ids else "")
+        else:
+            raw = str(ids or "")
+        try:
+            typ, data = decode_id(raw)
+            if typ == "m":
+                return _movie_drive_groups_by_vid(data.get("v") or "")
+            if typ == "g":
+                return _movie_links_by_drive(data.get("v") or "", data.get("t") or "")
+            if typ == "k":
+                return _search_videos_by_drive(data.get("k") or "", 1, data.get("t") or "")
+            if typ == "r":
+                return _share_url_detail(data.get("u") or "", data.get("n") or "")
+
+            # 旧格式
+            if raw.startswith("mvg:"):
+                return _movie_drive_groups_by_vid(raw[4:])
+            if raw.startswith("mv:"):
+                rest = raw[3:].split(":", 1)
+                if len(rest) == 2:
+                    return _movie_links_by_drive(rest[1], rest[0])
+            if "|" in raw and not raw.startswith("mp|"):
+                # 分享链接|剧名  或  网盘类型|关键词
+                if is_pan_share_url(raw.split("|", 1)[0]):
+                    parts = raw.split("|", 1)
+                    return _share_url_detail(parts[0], parts[1] if len(parts) > 1 else "")
+                parts = raw.split("|", 1)
+                if len(parts) == 2 and parts[0] and not parts[0].startswith("/"):
+                    # 可能是 driveType|keyword
+                    if infer_drive_type_from_share_url(parts[0]) or normalize_drive_type(parts[0]) != "others":
+                        return _search_videos_by_drive(parts[1], 1, parts[0])
+
+            # 直接分享链接推送
+            if re.match(r"^https?://", raw, re.I) and is_pan_share_url(raw):
+                return _share_url_detail(raw, "")
+
+            vid = normalize_video_id(raw)
+            if not vid:
+                return {"list": [], "page": 1, "pagecount": 0, "limit": PAGE_SIZE, "total": 0}
+
+            body, base = _get_detail_cached(vid)
+            info = parse_vod_base_info(body, base)
+            pan_urls = extract_pan_urls(body)
+            groups = build_movie_drive_groups(vid, info["vodName"], info["vodPic"], pan_urls)
+            if groups:
+                return {
+                    "list": groups,
+                    "page": 1,
+                    "pagecount": 1,
+                    "limit": PAGE_SIZE,
+                    "total": len(groups),
+                }
+            return {"list": [], "page": 1, "pagecount": 0, "limit": PAGE_SIZE, "total": 0}
+        except Exception as e:
+            return {"list": [], "page": 1, "pagecount": 0, "limit": PAGE_SIZE, "total": 0,
+                    "msg": "详情加载失败：" + str(e)}
+
+    # ---------- 播放 ----------
+    def playerContent(self, flag, id, vipFlags):
+        play_id = str(id or "").strip()
+        if not play_id:
+            return {"parse": 1, "jx": 1, "playUrl": "", "url": "", "header": {}}
+
+        share_url = play_id
+        # 支持 shareURL|fileId|... 取首段
+        if "|" in play_id:
+            share_url = play_id.split("|", 1)[0]
+        # encodeId r
+        typ, data = decode_id(play_id)
+        if typ == "r" and data.get("u"):
+            share_url = normalize_share_url(data.get("u"))
+        share_url = normalize_share_url(share_url)
+        if not share_url and re.match(r"^https?://", play_id, re.I):
+            share_url = play_id
+        if not share_url:
+            return {"parse": 1, "jx": 1, "playUrl": "", "url": "", "header": {}}
+
+        header = {
+            "User-Agent": SITE_UA,
+            "Referer": remove_trailing_slash(WEB_SITES[0]) + "/",
+        }
+        # 按分享链接类型注入对应网盘 Cookie（115 / 百度 等，见配置区 PAN_COOKIES）
+        drive_type = ""
+        if typ == "r" and data.get("t"):
+            drive_type = data.get("t") or ""
+        if not drive_type:
+            drive_type = infer_drive_type_from_share_url(share_url)
+        ck = pan_cookie(drive_type)
+        if ck:
+            header["Cookie"] = ck
+        # 无 OmniBox：交宿主嗅探/网盘插件解析
+        return {
+            "parse": 1,
+            "jx": 1,
+            "playUrl": "",
+            "url": share_url,
+            "header": header,
+            "flag": flag or "",
+        }
+
+    def destroy(self):
+        pass
