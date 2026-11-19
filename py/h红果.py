@@ -6812,8 +6812,112 @@ class Spider(_BaseSpider):
                 "url": SITE + "/",
                 "header": {"User-Agent": UA},
             }
-        # OK影视32位TV等环境下播放器可能无法访问插件内置 127.0.0.1 流服务，导致全剧不可播。
-        # 优先走壳代理(getProxyUrl/localProxy)，localProxy 已支持 Range 按需取流；本机流服务仅作兜底。
+
+        # 32位壳/OK影视兼容：优先返回本地解密缓存 file://，避免依赖 127.0.0.1 流服务或壳代理 Range。
+        def _cached_ready_path(v, qq):
+            try:
+                p = _hg_cache_path(v, qq)
+                if os.path.isfile(p) and os.path.getsize(p) > 65536:
+                    try:
+                        os.utime(p, None)
+                    except Exception:
+                        pass
+                    return p
+            except Exception:
+                pass
+            return None
+
+        cfg = {
+            "device_id": self.device_id or "",
+            "install_id": self.install_id or "",
+            "cdid": getattr(self, "cdid", "") or "",
+        }
+        if q in ("2160", "1440"):
+            preferred = q
+        elif _aes_is_fast():
+            preferred = q
+        else:
+            preferred = q if q in ("360", "480", "540") else "360"
+        q_candidates = []
+        for qq in [preferred, q, "480", "360", "720", "540", "1080"]:
+            if qq in _QUALITY_LINE_NAME_TO_Q and qq not in q_candidates:
+                q_candidates.append(qq)
+
+        # 1) 命中已解密缓存 → 直接 file:// 播放
+        for qq in q_candidates:
+            p = _cached_ready_path(vid, qq)
+            if p:
+                return {"parse": 0, "jx": 0, "playUrl": "", "url": "file://" + p, "header": {}}
+
+        # 2) 无缓存：按清晰度回退尝试拉取模型/媒体并流式解密落盘，再返回 file://
+        file_err = None
+        for qq in q_candidates:
+            try:
+                session = _stream_session(vid, dict(cfg), qq)
+                total = int(getattr(session, "total", 0) or 0)
+                if total <= 0:
+                    continue
+                final_path = _hg_cache_path(vid, qq)
+                tmp_path = final_path + ".tmp"
+                ok = False
+                try:
+                    _hg_cache_cleanup(False)
+                    written = 0
+                    with open(tmp_path, "wb") as fh:
+                        for block in session.iter_range(0, total - 1):
+                            if not block:
+                                continue
+                            fh.write(block)
+                            written += len(block)
+                    if written >= min(total, 65536):
+                        os.replace(tmp_path, final_path)
+                        ok = True
+                    else:
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+                except Exception as werr:
+                    try:
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+                    except Exception:
+                        pass
+                    raise werr
+                if ok:
+                    p = _cached_ready_path(vid, qq)
+                    if p:
+                        try:
+                            _hg_cache_cleanup(False)
+                        except Exception:
+                            pass
+                        return {"parse": 0, "jx": 0, "playUrl": "", "url": "file://" + p, "header": {}}
+            except Exception as err:
+                file_err = err
+                try:
+                    _hg_trace("file解密失败 vid=%s q=%s %s" % (vid, qq, str(err)[:100]))
+                except Exception:
+                    pass
+                try:
+                    if _is_empty_model_error(err):
+                        pair = _rotate_stream_device()
+                        cfg = {
+                            "device_id": pair.get("device_id", ""),
+                            "install_id": pair.get("install_id", ""),
+                            "cdid": pair.get("cdid", ""),
+                        }
+                        self.device_id = cfg["device_id"]
+                        self.install_id = cfg["install_id"]
+                        self.cdid = cfg.get("cdid", "")
+                except Exception:
+                    pass
+                continue
+
+        # 3) file:// 路径失败时回退壳代理/本机流服务（兼容其他环境）
+        try:
+            _hg_trace("file播放失败 vid=%s q=%s err=%s" % (vid, q, str(file_err or "")[:120]))
+        except Exception:
+            pass
         proxy = ""
         try:
             if hasattr(self, "getProxyUrl"):
@@ -6842,12 +6946,13 @@ class Spider(_BaseSpider):
                     "Referer": "https://novel.snssdk.com/",
                 },
             }
-        # 回退：本机 Range 流服务（壳不提供代理 URL 时）
+
         def _warm_session():
             try:
                 _stream_session(vid, {
                     "device_id": self.device_id or "",
                     "install_id": self.install_id or "",
+                    "cdid": getattr(self, "cdid", "") or "",
                 }, q)
             except Exception:
                 pass
