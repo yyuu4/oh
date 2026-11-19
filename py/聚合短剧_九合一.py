@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
 #  更新简介（按修复先后排列，最新一条在最上面）
+#  23. 红果(HG)取流二次翻脸修复（对照 h红果.py v1.7.6，上游实测）：15 条换用的
+#     dm 签名(_dm_sign_headers)现对任意设备对恒回 200 空包；老张同款 x-gorgon/
+#     x-helios 签名（7.4.3.32 App query + gzip body + 大写 x-ss-stub）实测可通。
+#     _video_model 改双路径——gorgon 优先、空包/非 JSON 回退原 dm 签名，两路皆空
+#     抛错触发既有设备轮换；移植 _vg_* helper（复用 _dm_sm3），payload 补
+#     dr_scene/player 与 use_server_dns 等老张字段。弹幕/分类/详情/搜索不动。
 #  22. pyflakes 全文静态扫描清理（无行为变化）：① 删死代码 _parse_ref——引用未定义
 #     _VIDEO_ID 且全库零调用方（h红果.py 源头亦无此函数，播放引用实际走
 #     _split_episode_token），一旦被调必 NameError；② 删重复定义 _aes_is_fast
@@ -4289,6 +4295,190 @@ def _core_sixgod(url: str, params: Mapping[str, Any], devices: Mapping[str, Any]
     result_headers["x-tt-dt"] = str(devices.get("x_tt_dt", ""))
     return result_headers, encrypted_url
 
+# ---- multi_video_model 老张式 gorgon 签名 helper（1.7.6 起播修复，移植自老张hongguo_full.py）----
+# 上游翻脸记录：1.7.1 起用的 dm 签名(_dm_sign_headers)现恒回 200 空包；
+# 老张同款 x-gorgon/x-helios 签名对 DEF_DEV 与新注册设备对均可拿到 video_model。
+# 本组函数加 _vg_ 前缀，仅服务于 _video_model 回退路径，不影响弹幕/详情/分类。
+
+_VG_AID = "8662"
+_VG_VERSION_CODE = "74332"
+_VG_VERSION_NAME = "7.4.3.32"
+_VG_MODEL = "25053RT47C"
+_VG_UA = (
+    "com.phoenix.read/%s (Linux; U; Android 16; zh_CN; %s; "
+    "Build/BP2A.250605.031.A3; Cronet/TTNetVersion:8d40f833 2026-03-03 "
+    "QuicVersion:21ac1950 2025-11-18)" % (_VG_VERSION_CODE, _VG_MODEL)
+)
+
+
+def _vg_le32(n: int) -> bytes:
+    return struct.pack("<I", n & 0xFFFFFFFF)
+
+
+def _vg_le64(n: int) -> bytes:
+    return struct.pack("<Q", n & 0xFFFFFFFFFFFFFFFF)
+
+
+def _vg_rotr64(x: int, n: int) -> int:
+    n &= 63
+    return ((x >> n) | (x << (64 - n))) & 0xFFFFFFFFFFFFFFFF
+
+
+def _vg_m998a(seed: int, data: bytes) -> int:
+    v = seed & 0xFFFFFFFF
+    for i, b in enumerate(data):
+        if i & 1 == 0:
+            v = (((v << 6) & 0xFFFFFFFF) ^ ((v >> 4) ^ v)) ^ b
+        else:
+            v = ((((v << 12) & 0xFFFFFFFF) | b) ^ ((v >> 7) ^ v)) ^ 0xFFFFFFFF
+        v &= 0xFFFFFFFF
+    return v
+
+
+def _vg_rc4_var(key: bytes, data: bytes) -> bytes:
+    s = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + s[i] + key[i % len(key)]) & 0xFF
+        s[i], s[j] = s[j], s[i]
+    out = bytearray(len(data))
+    i = k = 0
+    while i < len(data):
+        i += 1
+        k = (k + s[i]) & 0xFF
+        v = s[k]
+        s[i] = v
+        out[i - 1] = data[i - 1] ^ s[(v + v) & 0xFF]
+    return bytes(out)
+
+
+def _vg_bitrev8(v: int) -> int:
+    r = 0
+    for i in range(8):
+        r = (r << 1) | ((v >> i) & 1)
+    return r
+
+
+def _vg_x_gorgon(query: str, body: bytes = b"", now_ms: int | None = None, rnd16: int | None = None):
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    ts = (now_ms // 1000) & 0xFFFFFFFF
+    bmd5 = hashlib.md5(body).digest() if body else bytes(16)
+    q = ""
+    off = 0
+    for off in range(128):
+        q = query + ("&" if query else "") + "_rticket=%d" % (now_ms + off)
+        h = _vg_m998a(_vg_m998a(539167016, _dm_sm3(q.encode())), bmd5)
+        if (_vg_m998a(h, _vg_le32(ts)) & 15) % 3 == 0:
+            break
+    if rnd16 is None:
+        rnd16 = random.getrandbits(16)
+    hi, lo = (rnd16 >> 8) & 0xFF, rnd16 & 0xFF
+    key = bytes([74, 64, 22, hi, 71, 108, 1, lo])
+    payload = hashlib.md5(q.encode()).digest()[:4] + bmd5[:4] + bytes(4) + _vg_le32(67503104) + struct.pack(">I", ts)
+    c = bytearray(_vg_rc4_var(key, payload))
+    n = len(c)
+    for i in range(n):
+        b = c[i] & 0xFF
+        a = ((b >> 4) | (b << 4)) & 0xFF
+        c[i] = _vg_bitrev8((c[(i + 1) % n] & 0xFF) ^ a) ^ 0xEB
+    out = bytearray(b"\x84\x04" + bytes([rnd16 & 0xFF, hi, 64, 1]) + bytes(c))
+    out[4] = 0
+    out[5] = 0x81
+    return out.hex(), q, (now_ms + off)
+
+
+def _vg_x_helios(now_ms: int | None = None, rnd32: int | None = None) -> str:
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    ts = (now_ms // 1000) & 0xFFFFFFFF
+    if rnd32 is None:
+        rnd32 = random.getrandbits(32)
+    hexstr = hashlib.md5(_vg_le32(rnd32) + _VG_AID.encode()).hexdigest()
+    stage = [struct.unpack("<Q", hexstr[i * 8:i * 8 + 8].encode())[0] for i in range(4)]
+    keys = []
+    buf = [stage[2], stage[3]]
+    v0, v1 = stage[0], stage[1]
+    for i in range(34):
+        w = ((_vg_rotr64(v1, 8) + v0) & 0xFFFFFFFFFFFFFFFF) ^ i
+        buf.append(w)
+        v0 = _vg_rotr64(v0, 61) ^ w
+        keys.append(v0)
+        v1 = buf.pop(0)
+    msg = ("%d-646637794-%s" % (ts, _VG_AID)).encode()
+    pad = 16 - len(msg) % 16
+    msg += bytes([pad]) * pad
+    acc = _vg_le32(rnd32)
+    for off in range(0, len(msg), 16):
+        l = struct.unpack("<Q", msg[off:off + 8])[0]
+        r = struct.unpack("<Q", msg[off + 8:off + 16])[0]
+        for i in range(34):
+            r = (keys[i] ^ ((_vg_rotr64(r, 8) + l) & 0xFFFFFFFFFFFFFFFF)) & 0xFFFFFFFFFFFFFFFF
+            l = _vg_rotr64(l, 61) ^ r
+        acc += _vg_le64(l) + _vg_le64(r)
+    return base64.b64encode(acc).decode()
+
+
+def _vg_q_enc(value: Any) -> str:
+    return quote(str(value), safe=".-*_").replace("+", "%20").replace("%7E", "~")
+
+
+def _vg_build_query(params: Mapping[str, Any]) -> str:
+    return "&".join("%s=%s" % (_vg_q_enc(k), _vg_q_enc(v)) for k, v in params.items())
+
+
+def _vg_device_params() -> dict[str, str]:
+    return {
+        "ac": "wifi", "aid": _VG_AID, "app_name": "novelread",
+        "channel": "69310258a", "ssmix": "a", "device_platform": "android",
+        "os": "android", "language": "zh", "compliance_status": "0",
+        "need_personal_recommend": "1", "player_so_load": "1", "host_abi": "arm64-v8a",
+    }
+
+
+def _vg_build_params(dev: Mapping[str, Any]) -> dict[str, str]:
+    p = {
+        "device_id": str(dev.get("device_id") or ""),
+        "iid": str(dev.get("install_id") or ""),
+        "install_id": str(dev.get("install_id") or ""),
+    }
+    p.update(_vg_device_params())
+    for k in ("version_code", "manifest_version_code", "update_version_code", "pv_player"):
+        p[k] = _VG_VERSION_CODE
+    p["version_name"] = _VG_VERSION_NAME
+    return p
+
+
+def _vg_sign_headers(params: Mapping[str, Any], body: bytes) -> tuple[dict[str, str], str]:
+    now = int(time.time() * 1000)
+    ts = now // 1000
+    rnd16 = random.getrandbits(16)
+    g, q, tick = _vg_x_gorgon(_vg_build_query(params) + "&ts=%d" % ts, body, now, rnd16)
+    headers = {
+        "User-Agent": _VG_UA,
+        "Accept": "application/json; charset=utf-8,application/x-protobuf",
+        "x-ss-req-ticket": str(tick),
+        "x-tt-request-tag": "t=0;n=0",
+        "sdk-version": "2",
+        "passport-sdk-version": "6031190",
+        "x-xs-from-web": "0",
+        "x-khronos": str(ts),
+        "x-ladon": base64.b64encode(bytes(random.getrandbits(8) for _ in range(4))).decode(),
+        "x-argus": base64.b64encode(_vg_le32(ts)).decode(),
+        "x-gorgon": g,
+        "x-helios": _vg_x_helios(now, random.getrandbits(32)),
+        "x-medusa": g,
+        "x-ss-dp": _VG_AID,
+        "x-vc-bdturing-sdk-version": "4.0.3.cn",
+        "x-neptune": "-11|50:51:59",
+        "lc": "101",
+        "Content-Encoding": "gzip",
+        "Content-Type": "application/json; charset=UTF-8",
+    }
+    return headers, q
+
+
+
 def _device_config(config: Mapping[str, Any]) -> dict[str, str]:
     device_id = _text(config.get("device_id"))
     install_id = _text(config.get("install_id"))
@@ -4513,33 +4703,56 @@ def _video_model(video_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
             "detail_page_version": 0,
             "device_level": 3,
             "disable_digg_stat": False,
+            "disable_video_relate_book": False,
             "need_all_video_definition": True,
             "need_mp4_align": False,
             "use_os_player": False,
-            "use_server_dns": False,
+            "use_server_dns": True,
+            "use_server_dns_scene": "cold_start_stage",
             "video_platform": 1024,
         },
-        "mixed_video_id_map": {"1004": [video_id]},
+        "dr_scene": "player",
+        "mixed_video_id_map": {"1004": [str(video_id)]},
     }
-    # 修起播(见头部第 15 条)：multi_video_model 上游已弃用旧 x-gorgon/x-medusa
-    # 签名（200 空包），改走弹幕同款 SM3/SIMON Argus+Ladon 新签名与 7.3.9.32 App query。
-    # x-ss-stub 必须对同一份字节做 md5 → 先序列化 body 再签名。
-    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    query = _dm_query(devices["device_id"]) + "&iid=" + devices["install_id"]
-    request_headers = {
-        "content-type": "application/json; charset=utf-8",
-        "User-Agent": "com.dragon.read",
-        "accept": "application/json",
-    }
-    request_headers.update(
-        _dm_sign_headers(query, body, devices["device_id"], devices["install_id"])
-    )
-    response = requests.post(
-        VIDEO_URL.split("?")[0] + "?" + query,
-        headers=request_headers,
-        data=body,
-        timeout=30,
-    )
+    # 修起播(见头部第 15 条,二次翻脸)：上游对 1.7.1 的 dm 签名恒回 200 空包，
+    # 改走老张同款 x-gorgon/x-helios 签名（7.4.3.32 App query + gzip body +
+    # 大写 x-ss-stub），拿不到 video_model 再回退原 dm 签名；两路皆空抛错触发设备轮换。
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    gz_body = gzip.compress(raw, mtime=0)
+    response: Any = None
+    try:
+        request_headers, query = _vg_sign_headers(_vg_build_params(devices), gz_body)
+        request_headers["x-ss-stub"] = hashlib.md5(gz_body).hexdigest().upper()
+        candidate = requests.post(
+            VIDEO_URL.split("?")[0] + "?" + query,
+            headers=request_headers,
+            data=gz_body,
+            timeout=30,
+        )
+        if candidate.content:
+            try:
+                candidate.json()
+                response = candidate
+            except ValueError:
+                response = None
+    except requests.RequestException:
+        response = None
+    if response is None:
+        query = _dm_query(devices["device_id"]) + "&iid=" + devices["install_id"]
+        request_headers = {
+            "content-type": "application/json; charset=utf-8",
+            "User-Agent": "com.dragon.read",
+            "accept": "application/json",
+        }
+        request_headers.update(
+            _dm_sign_headers(query, raw, devices["device_id"], devices["install_id"])
+        )
+        response = requests.post(
+            VIDEO_URL.split("?")[0] + "?" + query,
+            headers=request_headers,
+            data=raw,
+            timeout=30,
+        )
     response_data = _json_response(response)
     data = response_data.get("data") or {}
     if not isinstance(data, Mapping):
