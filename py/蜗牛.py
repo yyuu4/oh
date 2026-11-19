@@ -11,7 +11,7 @@
   mp|k|...  搜索关键词+网盘类型 -> 链接列表
   纯数字    站点影片 ID
 
-播放: 无 OmniBox SDK, playerContent 返回 parse=1 + 分享链接交宿主解析。
+播放: 无 OmniBox SDK, playerContent 返回 parse=0 + 网盘分享直链（交宿主网盘插件/直链播放）。
 """
 import base64
 import json
@@ -20,7 +20,7 @@ import re
 import threading
 import time
 from html import unescape
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urljoin
 
 try:
     from base.spider import Spider as BaseSpider
@@ -59,6 +59,7 @@ VERSION = "1.0.0"
 PAGE_SIZE = 20
 
 STATIC_CLASSES = [
+    {"type_id": "0", "type_name": "首页"},
     {"type_id": "1", "type_name": "电影"},
     {"type_id": "2", "type_name": "连续剧"},
     {"type_id": "3", "type_name": "综艺"},
@@ -277,16 +278,28 @@ def remove_trailing_slash(url):
 
 
 def abs_url(url, base_url=""):
-    base = remove_trailing_slash(base_url or (WEB_SITES[0] if WEB_SITES else ""))
     if not url:
         return ""
     if url.startswith("//"):
         return "https:" + url
     if re.match(r"^https?://", url, re.I):
         return url
-    if url.startswith("/"):
-        return base + url
-    return base + "/" + url.lstrip("/")
+    # 站点 img.php?url=... 代理常 404：目标为完整 http(s) 时改直连
+    if "img.php" in url:
+        m = re.search(r"[?&]url=(https?%3A%2F%2F[^&]+|https?://[^&]+)", url, re.I)
+        if m:
+            target = unquote(m.group(1))
+            if re.match(r"^https?://", target, re.I):
+                return target
+    # 以页面 URL 为 base 做标准解析：
+    # - 以 / 开头的绝对路径 → 挂到源站根（避免 /vodsearch/xxx + /upload/... 错拼）
+    # - 相对路径 → 相对当前页面目录
+    base = base_url or (WEB_SITES[0] if WEB_SITES else "")
+    if not base:
+        base = "https://wn4k.com/"
+    if not base.endswith("/"):
+        base = base + "/"
+    return urljoin(base, url)
 
 
 def get_id_from_href(href):
@@ -326,6 +339,71 @@ def is_pan_share_url(url=""):
 
 def clean_content(s):
     return re.sub(r"\s+", " ", re.sub(r"收起|展开全部|内详", "", str(s or ""))).strip()
+
+
+def format_movie_meta(info):
+    """详情页可拿到的导演/主演/年份/备注/更新时间/简介拼接（无则空串）。"""
+    if not info:
+        return ""
+    bits = []
+    if info.get("vodContent"):
+        bits.append(str(info["vodContent"]).strip())
+    if info.get("vodDirector"):
+        bits.append("导演：" + str(info["vodDirector"]).strip())
+    if info.get("vodActor"):
+        bits.append("主演：" + str(info["vodActor"]).strip())
+    if info.get("vodYear"):
+        bits.append("年份：" + str(info["vodYear"]).strip())
+    if info.get("vodRemarks"):
+        bits.append("备注：" + str(info["vodRemarks"]).strip())
+    if info.get("vodPubDate"):
+        bits.append("更新时间：" + str(info["vodPubDate"]).strip())
+    return "\n".join(x for x in bits if x)
+
+
+def apply_detail_meta(item, info, count=None):
+    """把网页详情字段对齐到 CatVod 条目（导演/主演/备注/更新时间）。"""
+    if not item:
+        return item
+    if info:
+        if info.get("vodDirector"):
+            item["vod_director"] = info["vodDirector"]
+        if info.get("vodActor"):
+            item["vod_actor"] = info["vodActor"]
+        if info.get("vodYear"):
+            item["vod_year"] = info["vodYear"]
+        if info.get("vodPubDate"):
+            item["vod_pubdate"] = info["vodPubDate"]
+            item["vod_time"] = info["vodPubDate"]
+        # 备注与网页 m-label=备注 对齐（如 1080P蓝光REMUX）
+        if info.get("vodRemarks"):
+            item["vod_remarks"] = info["vodRemarks"]
+        elif count is not None and not item.get("vod_remarks"):
+            item["vod_remarks"] = "%d条" % count
+    if count is not None:
+        # 链接数保留在简介里，避免挤掉网页备注
+        content = str(item.get("vod_content") or "")
+        head = "共%d条网盘链接" % count
+        if head not in content:
+            item["vod_content"] = (head + "\n" + content) if content else head
+    return item
+
+
+def build_link_content(share_url, info=None):
+    """简介 = 真实分享链接；有影片元数据则接在链接后面。"""
+    url = str(share_url or "").strip()
+    meta = format_movie_meta(info)
+    if meta:
+        return url + "\n" + meta if url else meta
+    return url
+
+
+def pan_referer(share_url=""):
+    """网盘分享页 Referer 取分享域名根，避免误用站点头。"""
+    m = re.match(r"^(https?://[^/]+)", str(share_url or ""))
+    if m:
+        return m.group(1) + "/"
+    return remove_trailing_slash(WEB_SITES[0]) + "/"
 
 
 def build_category_path(category_id, page=1):
@@ -546,6 +624,8 @@ def parse_vod_base_info(html_text, base_url=""):
         "vodDirector": "",
         "vodActor": "",
         "vodContent": "",
+        "vodRemarks": "",
+        "vodPubDate": "",
     }
     if not html_text:
         return info
@@ -596,38 +676,75 @@ def parse_vod_base_info(html_text, base_url=""):
         nxt = el.getnext()
         if nxt is None:
             continue
-        if "剧情" in key:
-            info["vodContent"] = clean_content(_first_text(nxt.xpath(".//p")))
+        if "剧情" in key or "简介" in key:
+            info["vodContent"] = clean_content(_first_text(nxt.xpath(".//p")) or _first_text([nxt]))
         elif "导演" in key:
             val = ", ".join(t for t in (_first_text([a]) for a in nxt.xpath(".//a")) if t)
+            if not val:
+                val = _first_text([nxt])
             if val:
                 info["vodDirector"] = val
-        elif "主演" in key:
+        elif any(k in key for k in ("主演", "演员")):
             val = ", ".join(t for t in (_first_text([a]) for a in nxt.xpath(".//a")) if t)
+            if not val:
+                val = _first_text([nxt])
             if val:
                 info["vodActor"] = val
+        elif "备注" in key or "清晰" in key:
+            val = _first_text([nxt])
+            if val:
+                info["vodRemarks"] = val
+        elif "更新" in key:
+            val = _first_text([nxt])
+            if val:
+                info["vodPubDate"] = val
         elif any(k in key for k in ("年代", "年份", "上映")):
             m = re.search(r"(19|20)\d{2}", _first_text([nxt]))
             if m:
                 info["vodYear"] = m.group(0)
 
+    # 网页 premium-meta-grid：导演 / 主演 / 备注 / 更新时间（多选择器用 | 并集，勿串成后代链）
     for el in tree.xpath(
-        '//*[contains(concat(" ", normalize-space(@class), " "), " premium-meta-grid ")]'
-        '//*[contains(concat(" ", normalize-space(@class), " "), " meta-item ")]'
+        '(//*[contains(concat(" ", normalize-space(@class), " "), " premium-meta-grid ")]'
+        '//*[contains(concat(" ", normalize-space(@class), " "), " meta-item ")])'
+        ' | (//*[contains(concat(" ", normalize-space(@class), " "), " meta-item ")])'
+        ' | (//*[contains(concat(" ", normalize-space(@class), " "), " video-info-meta ")]'
+        '//*[contains(concat(" ", normalize-space(@class), " "), " meta-item ")])'
+        ' | (//*[contains(concat(" ", normalize-space(@class), " "), " module-info-item ")])'
     ):
         label = _first_text(el.xpath(
             './/*[contains(concat(" ", normalize-space(@class), " "), " m-label ")]'
+            ' | .//*[contains(concat(" ", normalize-space(@class), " "), " meta-label ")]'
+            ' | .//*[contains(concat(" ", normalize-space(@class), " "), " info-label ")]'
+            ' | .//*[contains(concat(" ", normalize-space(@class), " "), " module-info-title ")]'
         ))
         val = _first_text(el.xpath(
             './/*[contains(concat(" ", normalize-space(@class), " "), " m-val ")]'
+            ' | .//*[contains(concat(" ", normalize-space(@class), " "), " meta-value ")]'
+            ' | .//*[contains(concat(" ", normalize-space(@class), " "), " info-value ")]'
+            ' | .//*[contains(concat(" ", normalize-space(@class), " "), " module-info-content ")]'
         ))
         if not label or not val:
-            continue
+            # 退化：整格文本「标签 值」
+            whole = _first_text([el])
+            if not whole:
+                continue
+            for lab in ("导演", "主演", "演员", "备注", "更新时间", "更新", "年份", "年代", "上映"):
+                if whole.startswith(lab) or lab in whole[:6]:
+                    label = lab
+                    val = whole.replace(lab, "", 1).strip(" ：:").strip()
+                    break
+            if not label or not val:
+                continue
         if not info["vodDirector"] and "导演" in label:
             info["vodDirector"] = val
-        if not info["vodActor"] and "主演" in label:
+        elif not info["vodActor"] and any(k in label for k in ("主演", "演员")):
             info["vodActor"] = val
-        if not info["vodYear"] and any(k in label for k in ("年代", "年份", "上映")):
+        elif not info["vodRemarks"] and "备注" in label:
+            info["vodRemarks"] = val
+        elif not info["vodPubDate"] and "更新" in label:
+            info["vodPubDate"] = val
+        elif not info["vodYear"] and any(k in label for k in ("年代", "年份", "上映")):
             m = re.search(r"(19|20)\d{2}", val)
             if m:
                 info["vodYear"] = m.group(0)
@@ -767,10 +884,11 @@ def extract_pan_items(html_text):
 
 
 def parse_nav_classes(html_text):
-    classes = []
+    """与网页导航对齐：首页在电影等分类之前。"""
+    classes = [{"type_id": "0", "type_name": "首页"}]
     if not html_text:
         return classes
-    seen = set()
+    seen = {"0"}
     for m in re.finditer(
         r'<a[^>]+href="(/vodtype/(\d+)/?)"[^>]*>([^<]{1,20})</a>', html_text, re.I
     ):
@@ -1096,7 +1214,7 @@ def ensure_login():
 
 
 # ==================== 业务：分组 ====================
-def build_movie_drive_groups(video_id, vod_name, vod_pic, pan_urls):
+def build_movie_drive_groups(video_id, vod_name, vod_pic, pan_urls, info=None):
     by_type = {}
     unknown = 0
     for url in pan_urls or []:
@@ -1105,9 +1223,11 @@ def build_movie_drive_groups(video_id, vod_name, vod_pic, pan_urls):
             by_type[t] = by_type.get(t, 0) + 1
         else:
             unknown += 1
+    # 分组卡无分享链接：简介放影片元数据（导演/主演/备注/更新时间/剧情）
+    folder_content = format_movie_meta(info)
     items = []
     for drive_type, count in by_type.items():
-        items.append({
+        item = {
             "vod_id": encode_id("g", {"v": video_id, "t": drive_type}),
             "vod_name": pan_name(drive_type),
             "vod_pic": vod_pic or pan_pic(drive_type),
@@ -1116,9 +1236,12 @@ def build_movie_drive_groups(video_id, vod_name, vod_pic, pan_urls):
             "vod_remarks": "%d条" % count,
             "vod_tag": "folder",
             "panType": drive_type,
-        })
+            "vod_content": folder_content,
+        }
+        apply_detail_meta(item, info, count=count)
+        items.append(item)
     if unknown > 0:
-        items.append({
+        item = {
             "vod_id": encode_id("g", {"v": video_id, "t": "others"}),
             "vod_name": pan_name("others"),
             "vod_pic": vod_pic or pan_pic("others"),
@@ -1127,18 +1250,21 @@ def build_movie_drive_groups(video_id, vod_name, vod_pic, pan_urls):
             "vod_remarks": "%d条" % unknown,
             "vod_tag": "folder",
             "panType": "others",
-        })
+            "vod_content": folder_content,
+        }
+        apply_detail_meta(item, info, count=unknown)
+        items.append(item)
     if len(items) > 1:
         items.sort(key=lambda x: x.get("vod_name") or "")
     return items
 
 
-def _link_item_to_vod(share_url, name, vod_pic, drive_type, movie_title=""):
+def _link_item_to_vod(share_url, name, vod_pic, drive_type, movie_title="", info=None):
     rid = encode_id("r", {"u": share_url, "n": name or "", "t": drive_type})
     display = name or (pan_name(drive_type) if drive_type else "网盘资源")
     if movie_title and movie_title not in display:
         display = "%s · %s" % (movie_title[:20], display[:30])
-    return {
+    item = {
         "vod_id": rid,
         "vod_name": display,
         "vod_pic": vod_pic or pan_pic(drive_type),
@@ -1148,9 +1274,16 @@ def _link_item_to_vod(share_url, name, vod_pic, drive_type, movie_title=""):
         "vod_tag": "file",
         "panType": drive_type or "others",
         "panUrl": share_url,
+        # 简介：真实分享链接，影片元数据接在后面（无则仅链接）
+        "vod_content": build_link_content(share_url, info),
         "vod_play_from": pan_name(drive_type) if drive_type else "网盘",
         "vod_play_url": "播放$%s" % share_url,
     }
+    # 导演/主演/备注/更新时间与网页详情对齐
+    apply_detail_meta(item, info)
+    if info and info.get("vodRemarks"):
+        item["vod_remarks"] = info["vodRemarks"]
+    return item
 
 
 def _get_detail_cached(video_id):
@@ -1170,7 +1303,7 @@ def _movie_drive_groups_by_vid(video_id):
     body, base = _get_detail_cached(vid)
     info = parse_vod_base_info(body, base)
     pan_urls = extract_pan_urls(body)
-    groups = build_movie_drive_groups(vid, info["vodName"], info["vodPic"], pan_urls)
+    groups = build_movie_drive_groups(vid, info["vodName"], info["vodPic"], pan_urls, info)
     return {
         "list": groups,
         "page": 1,
@@ -1197,7 +1330,7 @@ def _movie_links_by_drive(video_id, drive_type):
         if dt == "others" and inferred:
             continue
         seen.add(u)
-        link_items.append(_link_item_to_vod(u, "", info["vodPic"], inferred or "others", info["vodName"]))
+        link_items.append(_link_item_to_vod(u, "", info["vodPic"], inferred or "others", info["vodName"], info))
     return {
         "list": link_items,
         "page": 1,
@@ -1207,13 +1340,14 @@ def _movie_links_by_drive(video_id, drive_type):
     }
 
 
-def _share_url_detail(share_url, title=""):
+def _share_url_detail(share_url, title="", info=None):
     u = normalize_share_url(share_url)
     dt = infer_drive_type_from_share_url(u) or "others"
-    name = title or "网盘推送"
-    vod = _link_item_to_vod(u, name, pan_pic(dt), dt, title)
+    # 名称：有标题用标题，否则用网盘名；简介一律放真实分享链接（+元数据），不用「网盘推送」
+    name = title or (pan_name(dt) + "分享")
+    vod = _link_item_to_vod(u, name, pan_pic(dt), dt, title or "", info)
     vod["vod_name"] = name
-    vod["vod_content"] = name
+    vod["vod_content"] = build_link_content(u, info)
     return {
         "list": [vod],
         "page": 1,
@@ -1250,9 +1384,11 @@ def _search_videos_by_drive(keyword, page, drive_type):
                 continue
             seen.add(u)
             idx += 1
+            # 该片详情元数据（导演/主演/剧情）接在分享链接后
+            dinfo = parse_vod_base_info(dbody, dbase)
             link_items.append(
                 _link_item_to_vod(u, item.get("name") or "", video.get("vod_pic") or "",
-                                  inferred or "others", video.get("vod_name") or "")
+                                  inferred or "others", video.get("vod_name") or "", dinfo)
             )
     return {
         "list": link_items,
@@ -1371,6 +1507,14 @@ class Spider(BaseSpider):
                 if len(parts) == 2 and parts[0]:
                     return _search_videos_by_drive(parts[1], page, parts[0])
 
+            # 首页分类（type_id=0）：与网页导航对齐，返回首页推荐
+            if cat_id in ("0", "", "home", "index"):
+                body, base = _http.get("/", timeout=20)
+                videos = parse_list_from_html(body, base)
+                for v in videos:
+                    v["type_id"] = "0"
+                return self._page_list(videos, page, 1, len(videos))
+
             # 筛选路径
             has_filter = any(
                 ext.get(k) or ext.get(k + "#")
@@ -1439,9 +1583,9 @@ class Spider(BaseSpider):
         try:
             if not keyword:
                 return self._empty(page, "搜索关键词为空")
-            # 直接推送分享链接
+            # 直接推送分享链接（无站点标题，名称用网盘名，简介=真实链接）
             if re.match(r"^https?://", keyword, re.I) and is_pan_share_url(keyword):
-                return _share_url_detail(keyword, "网盘推送")
+                return _share_url_detail(keyword, "")
 
             body, base = self._search_fetch(keyword, page)
             if self._is_rate_limited(body):
@@ -1500,7 +1644,7 @@ class Spider(BaseSpider):
             body, base = _get_detail_cached(vid)
             info = parse_vod_base_info(body, base)
             pan_urls = extract_pan_urls(body)
-            groups = build_movie_drive_groups(vid, info["vodName"], info["vodPic"], pan_urls)
+            groups = build_movie_drive_groups(vid, info["vodName"], info["vodPic"], pan_urls, info)
             if groups:
                 return {
                     "list": groups,
@@ -1518,7 +1662,8 @@ class Spider(BaseSpider):
     def playerContent(self, flag, id, vipFlags):
         play_id = str(id or "").strip()
         if not play_id:
-            return {"parse": 1, "jx": 1, "playUrl": "", "url": "", "header": {}}
+            return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                    "msg": "播放地址为空"}
 
         share_url = play_id
         # 支持 shareURL|fileId|... 取首段
@@ -1532,25 +1677,27 @@ class Spider(BaseSpider):
         if not share_url and re.match(r"^https?://", play_id, re.I):
             share_url = play_id
         if not share_url:
-            return {"parse": 1, "jx": 1, "playUrl": "", "url": "", "header": {}}
+            return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {},
+                    "msg": "播放地址解析失败：无效链接"}
 
-        header = {
-            "User-Agent": SITE_UA,
-            "Referer": remove_trailing_slash(WEB_SITES[0]) + "/",
-        }
         # 按分享链接类型注入对应网盘 Cookie（115 / 百度 等，见配置区 PAN_COOKIES）
         drive_type = ""
         if typ == "r" and data.get("t"):
             drive_type = data.get("t") or ""
         if not drive_type:
             drive_type = infer_drive_type_from_share_url(share_url)
+        header = {
+            "User-Agent": SITE_UA,
+            "Referer": pan_referer(share_url),
+        }
         ck = pan_cookie(drive_type)
         if ck:
             header["Cookie"] = ck
-        # 无 OmniBox：交宿主嗅探/网盘插件解析
+        # 网盘分享页非视频流：parse=0 直链交宿主网盘插件/直链播放，
+        # parse=1 会当普通网页嗅探导致「播放地址解析失败」
         return {
-            "parse": 1,
-            "jx": 1,
+            "parse": 0,
+            "jx": 0,
             "playUrl": "",
             "url": share_url,
             "header": header,
