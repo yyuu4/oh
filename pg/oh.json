@@ -429,6 +429,17 @@
             "order_num": 0,
             "ext": ""
         },
+		{
+            "key": "蜗牛.py",
+            "name": "蜗牛.py",
+            "type": 3,
+            "api": "https://v6.gh-proxy.org/https://raw.githubusercontent.com/yyuu4/oh/refs/heads/main/py/蜗牛.py",
+            "searchable": 1,
+            "quickSearch": 1,
+            "filterable": 1,
+            "order_num": 0,
+            "ext": ""
+        },
 		//{
             //"key": "javdbui.py",
             //"name": "javdbui.py",
