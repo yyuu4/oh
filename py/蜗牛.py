@@ -99,7 +99,7 @@ WONIU4K_COOKIE = (
 CAPTCHA_SERVICE_URL = (os.environ.get("DDDDOCR_API") or "").rstrip("/")
 
 # ---- 网盘 Cookie（playerContent 按分享链接类型注入对应 Cookie）----
-# 115 网盘 Cookie：浏览器登录 115 后 F12 -> Network -> 任意请求 -> Request Headers -> Cookie 整串粘贴 不支持.iso格式在线播放
+# 115 网盘 Cookie：浏览器登录 115 后 F12 -> Network -> 任意请求 -> Request Headers -> Cookie 整串粘贴 支持.iso格式在线播放
 COOKIE_115 = (
     os.environ.get("DRIVE_COOKIE_115")
     or os.environ.get("PAN_COOKIE_115")
@@ -1456,11 +1456,6 @@ def _attach_episodes(item, share_url, drive_type):
     if videos:
         item["vod_play_from"] = pan_name(drive_type)
         item["vod_play_url"] = _build_episode_play_url(share_url, videos)
-    if videos and all(
-        _file_ext(v.get("name") or "", v.get("ext") or "") == "iso" for v in videos
-    ):
-        # 纯原盘分享：列表层明示不可在线播放，别让用户逐条点过去试
-        item["vod_remarks"] = "原盘ISO·不可在线播放"
     return item
 
 
@@ -2904,22 +2899,11 @@ class Spider(BaseSpider):
         if ck:
             header["Cookie"] = ck
 
-        # 解析成真视频流（m3u8/mp4）；失败绝不回退分享页 HTML
+        # 解析成真视频流（m3u8/mp4/iso）；失败绝不回退分享页 HTML
         resolved = resolve_share_media(share_url, drive_type, fid=file_id)
         if resolved and resolved[0]:
             stream_url, stream_header = resolved
-            # 蓝光原盘直链拿得到，但主流播放器（ExoPlayer/ijk）解不了 ISO：
-            # 与其黑屏报 codec 错，不如直说（列表层另有「原盘ISO」备注）
-            if re.search(r"\.iso(?:\?|$)", str(stream_url or ""), re.I):
-                return {
-                    "parse": 0,
-                    "jx": 0,
-                    "playUrl": "",
-                    "url": "",
-                    "header": {},
-                    "flag": flag or "",
-                    "msg": "原盘 ISO 文件不支持在线播放（需支持蓝光原盘的播放器）",
-                }
+            # iso 原盘：直链原样交给播放器（OK影视 5.1.6+ 可播 115 iso；不再空 url 拦截）
             return {
                 "parse": 0,
                 "jx": 0,
@@ -2948,7 +2932,7 @@ class Spider(BaseSpider):
 
     def isVideoFormat(self, url):
         u = str(url or "").lower().split("?")[0].split("#")[0]
-        return u.endswith((".mp4", ".m3u8", ".flv", ".mkv", ".ts", ".avi", ".m4v", ".webm"))
+        return u.endswith((".mp4", ".m3u8", ".flv", ".mkv", ".ts", ".avi", ".m4v", ".webm", ".iso"))
 
     def manualVideoCheck(self):
         return False
