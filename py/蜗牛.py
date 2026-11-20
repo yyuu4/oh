@@ -1433,8 +1433,6 @@ def _build_episode_play_url(share_url, videos):
     ordered = _order_episodes(videos)
     if not ordered:
         return "播放$%s" % _sanitize_play_url(share_url)
-    if len(ordered) == 1:
-        return "播放$%s" % _sanitize_play_url(share_url)
     parts = []
     for v in ordered:
         raw = str(v.get("name") or "")
@@ -1450,11 +1448,11 @@ def _build_episode_play_url(share_url, videos):
 
 
 def _attach_episodes(item, share_url, drive_type):
-    """把分享内的多集展开到列表项，播放器可直接选集。"""
+    """把分享内的视频展开成选集（单集同样带 [大小 扩展名] 文件名标签）。"""
     if not item or drive_type not in ("115", "baidu"):
         return item
     videos = _list_share_videos(share_url, drive_type)
-    if len(videos) > 1:
+    if videos:
         item["vod_play_from"] = pan_name(drive_type)
         item["vod_play_url"] = _build_episode_play_url(share_url, videos)
     if videos and all(
@@ -1484,7 +1482,7 @@ def _share_url_detail(share_url, title="", info=None, video_id=""):
     )
     vod["vod_name"] = name
     vod["vod_content"] = build_link_content(u, info)
-    # 多集分享展开选集（115/百度），单集保持原样
+    # 分享展开成选集（115/百度）：单集也带 [大小 扩展名] 文件名标签，失败回落「播放」
     _attach_episodes(vod, u, dt)
     return _single_vod_result(vod)
 
@@ -2159,6 +2157,9 @@ def resolve_baidu_share(share_url="", fid=""):
         # 分享页拿不到 yunData：绝大多数是链接已取消/不存在（页面标题「链接不存在」）
         if "链接不存在" in raw or "share_page_type" in raw:
             _LAST_RESOLVE_ERR = "百度分享链接已失效或已取消"
+        elif str(verify.get("errno", "")) == "105":
+            # 正确提取码也会回 105（IP 风控/要求验证码），别误导用户去查提取码
+            _LAST_RESOLVE_ERR = "百度接口风控拦截（errno 105，要求验证码），请稍后重试"
         elif str(verify.get("errno", "")) in ("-9", "-12"):
             _LAST_RESOLVE_ERR = "百度分享提取码错误"
         elif str(verify.get("errno", "")) == "-62":
@@ -2247,7 +2248,10 @@ def resolve_baidu_share(share_url="", fid=""):
         if list_err == "-21":
             _LAST_RESOLVE_ERR = "百度分享链接已取消或不存在"
         elif list_err in ("105", "115", "-9", "-12"):
-            _LAST_RESOLVE_ERR = "百度分享需要正确提取码"
+            if str(verify.get("errno", "")) == "105":
+                _LAST_RESOLVE_ERR = "百度接口风控拦截（errno 105，要求验证码），请稍后重试"
+            else:
+                _LAST_RESOLVE_ERR = "百度分享需要正确提取码"
         elif list_err == "-62":
             _LAST_RESOLVE_ERR = "百度接口访问过于频繁，请稍后重试"
         elif list_err:
