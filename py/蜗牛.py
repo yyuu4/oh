@@ -3,6 +3,7 @@
 
 业务参照: omn蜗牛.js (MacCMS panlian_dark/mxone, 网盘资源分组)
 分组参照: omnibox觅盘.js (encodeId: mp|type|base64url(JSON))
+业务指导: trae提供大力支持，特别是网盘分组；deepseek诊断的根因和参考方案有巨大帮助
 
 分组 ID（trae 三级：m → 分组卡 g → 分享列表 r）:
   mp|m|...  影片 -> 按网盘类型拆成多张分组卡
@@ -98,13 +99,13 @@ WONIU4K_COOKIE = (
 CAPTCHA_SERVICE_URL = (os.environ.get("DDDDOCR_API") or "").rstrip("/")
 
 # ---- 网盘 Cookie（playerContent 按分享链接类型注入对应 Cookie）----
-# 115 网盘 Cookie：浏览器登录 115 后 F12 -> Network -> 任意请求 -> Request Headers -> Cookie 整串粘贴
+# 115 网盘 Cookie：浏览器登录 115 后 F12 -> Network -> 任意请求 -> Request Headers -> Cookie 整串粘贴 不支持.iso格式在线播放
 COOKIE_115 = (
     os.environ.get("DRIVE_COOKIE_115")
     or os.environ.get("PAN_COOKIE_115")
     or "UID=7090991_R1_1785487771; CID=3c1a3ab03cfc92b0b7c80db6efa950c6; SEID=81ec0f1ad4aa99de925b609465a91c20d8894da910834a59f27cb239ebc5eb70412b456e8e91fff5654dc089a9d0c153f5fcec844b4cf7fa1b8aac84; KID=bc573815d056010f1b8373db03247c3b"
 ).strip()
-# 百度网盘 Cookie：浏览器登录百度网盘后 F12 -> Network -> 任意请求 -> Request Headers -> Cookie 整串粘贴
+# 百度网盘 Cookie：浏览器登录百度网盘后 F12 -> Network -> 任意请求 -> Request Headers -> Cookie 整串粘贴 不支持原画播放
 # 至少需含 BDUSS（分享页公开访问可不填；解析/下载通常需要）
 COOKIE_BAIDU = (
     os.environ.get("DRIVE_COOKIE_BAIDU")
