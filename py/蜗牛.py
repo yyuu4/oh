@@ -1377,8 +1377,9 @@ def _episode_meta(name):
     m = re.search(r"第\s*(\d{1,4})\s*[集话話期]", s)
     if m:
         return 1, int(m.group(1))
-    # 「剧名 - 01 [1080P]」这类：1~3 位数字，避免把年份/1080P 当集数
-    m = re.search(r"(?:^|[\s._-])(\d{1,3})(?=[\s._\[]|$)", s)
+    # 「剧名 - 01 [1080P]」这类：1~3 位数字，避免把年份/1080P/音轨规格当集数：
+    # (?<![Hh\d]\.) 拦 H.265、7.1 小数第二位；(?!\.\d) 拦 7.1 小数第一位
+    m = re.search(r"(?:^|[\s._-])(?<![Hh\d]\.)(\d{1,3})(?=[\s._\[]|$)(?!\.\d)", s)
     if m:
         return 1, int(m.group(1))
     return 0, 0
@@ -1456,6 +1457,11 @@ def _attach_episodes(item, share_url, drive_type):
     if len(videos) > 1:
         item["vod_play_from"] = pan_name(drive_type)
         item["vod_play_url"] = _build_episode_play_url(share_url, videos)
+    if videos and all(
+        _file_ext(v.get("name") or "", v.get("ext") or "") == "iso" for v in videos
+    ):
+        # 纯原盘分享：列表层明示不可在线播放，别让用户逐条点过去试
+        item["vod_remarks"] = "原盘ISO·不可在线播放"
     return item
 
 
@@ -1531,7 +1537,8 @@ def _search_videos_by_drive(keyword, page, drive_type):
 # 下列 resolve_* 把分享链接解析成真视频流（m3u8/mp4），失败返回 None。
 
 _VIDEO_EXT_RE = re.compile(
-    r"\.(mp4|mkv|flv|ts|m3u8|avi|wmv|mov|rmvb|mpg|mpeg|m4v|webm)(?:\?|$)",
+    # iso：115 蓝光原盘分享也要能列出来（在线播放层另行拦截，见 playerContent）
+    r"\.(mp4|mkv|flv|ts|m3u8|avi|wmv|mov|rmvb|mpg|mpeg|m4v|webm|iso)(?:\?|$)",
     re.I,
 )
 
@@ -2061,6 +2068,10 @@ def _baidu_list_videos(share_url=""):
     return out
 
 
+# resolve_baidu_share 最近一次失败原因（playerContent 透给用户，见 play msg）
+_LAST_RESOLVE_ERR = ""
+
+
 def resolve_baidu_share(share_url="", fid=""):
     """百度分享 → 真视频流。成功返回 (url, header_dict)，失败 None。
 
@@ -2069,6 +2080,8 @@ def resolve_baidu_share(share_url="", fid=""):
       → tplconfig 拿 sign/timestamp → streaming 出 m3u8
     streaming 必须带 Cookie + Referer(分享页) + Origin，否则 errno=31341。
     """
+    global _LAST_RESOLVE_ERR
+    _LAST_RESOLVE_ERR = ""
     if requests is None:
         return None
     u = str(share_url or "")
@@ -2143,12 +2156,23 @@ def resolve_baidu_share(share_url="", fid=""):
     mm = re.search(r'''["']?shareid["']?\s*:\s*["']?(\d+)''', seg)
     shareid = mm.group(1) if mm else ""
     if not uk or not shareid:
+        # 分享页拿不到 yunData：绝大多数是链接已取消/不存在（页面标题「链接不存在」）
+        if "链接不存在" in raw or "share_page_type" in raw:
+            _LAST_RESOLVE_ERR = "百度分享链接已失效或已取消"
+        elif str(verify.get("errno", "")) in ("-9", "-12"):
+            _LAST_RESOLVE_ERR = "百度分享提取码错误"
+        elif str(verify.get("errno", "")) == "-62":
+            _LAST_RESOLVE_ERR = "百度接口访问过于频繁，请稍后重试"
+        else:
+            _LAST_RESOLVE_ERR = "百度分享页面解析失败（链接可能已失效）"
         return None
 
     # 3) list 递归找第一个视频 fs_id（channel=channellist；sekey 仅在有 BDCLND 时带）
     sekey = unquote(s.cookies.get("BDCLND") or "")
+    list_err = ""
 
     def _list(dir_path=""):
+        nonlocal list_err
         params = {
             "shareid": shareid,
             "uk": uk,
@@ -2177,6 +2201,7 @@ def resolve_baidu_share(share_url="", fid=""):
             headers={"Referer": page_url, "Accept": "application/json, text/plain, */*"},
         )
         if not isinstance(data, dict) or str(data.get("errno", "0")) not in ("0", ""):
+            list_err = str((data or {}).get("errno", ""))
             return []
         lst = data.get("list")
         return lst if isinstance(lst, list) else []
@@ -2219,6 +2244,16 @@ def resolve_baidu_share(share_url="", fid=""):
 
     target = _find_video()
     if not target:
+        if list_err == "-21":
+            _LAST_RESOLVE_ERR = "百度分享链接已取消或不存在"
+        elif list_err in ("105", "115", "-9", "-12"):
+            _LAST_RESOLVE_ERR = "百度分享需要正确提取码"
+        elif list_err == "-62":
+            _LAST_RESOLVE_ERR = "百度接口访问过于频繁，请稍后重试"
+        elif list_err:
+            _LAST_RESOLVE_ERR = "百度分享列表获取失败（errno %s）" % list_err
+        else:
+            _LAST_RESOLVE_ERR = "百度分享内没有可播放的视频文件"
         return None
     fs_id = str(fid or "") or target["fid"]
 
@@ -2246,6 +2281,7 @@ def resolve_baidu_share(share_url="", fid=""):
             sign = str(inner.get("sign") or "")
             timestamp = str(inner.get("timestamp") or timestamp)
     if not sign:
+        _LAST_RESOLVE_ERR = "获取百度签名失败（分享可能已失效）"
         return None
 
     # 5) streaming → m3u8/mp4（Cookie + Referer + Origin 必带）
@@ -2275,6 +2311,7 @@ def resolve_baidu_share(share_url="", fid=""):
         except Exception:
             pass
         if r.status_code != 200:
+            _LAST_RESOLVE_ERR = "获取百度视频流失败（分享可能已失效或接口限流）"
             return None
         text_head = head.decode("utf-8", "ignore") if head else ""
         looks_m3u8 = "mpegurl" in ctype or text_head.lstrip().startswith("#EXTM3U")
@@ -2286,8 +2323,10 @@ def resolve_baidu_share(share_url="", fid=""):
         )
         if looks_m3u8 or looks_mp4:
             return stream_url, headers
+        _LAST_RESOLVE_ERR = "获取百度视频流失败（分享可能已失效或接口限流）"
         return None
     except Exception:
+        _LAST_RESOLVE_ERR = "获取百度视频流失败（网络异常或分享受限）"
         return None
 
 
@@ -2316,14 +2355,20 @@ def _115_snap_list(session, code, pwd, cid="0", depth=0):
     lst = payload.get("list") if isinstance(payload, dict) else None
     if not isinstance(lst, list):
         return None
-    # 先找视频文件（字段 fid，fc=1）
+    # 先找视频文件（字段 fid，fc=1）；iso 原盘仅兜底，混排分享点播优先普通视频
+    iso_fallback = None
     for it in lst:
         if not isinstance(it, dict):
             continue
         fid = str(it.get("fid") or it.get("file_id") or "")
         name = str(it.get("n") or it.get("name") or it.get("server_filename") or "")
-        if fid and _is_video_name(name):
-            return {"name": name, "fid": fid}
+        if not fid or not _is_video_name(name):
+            continue
+        if _file_ext(name, it.get("ico") or "") == "iso":
+            if iso_fallback is None:
+                iso_fallback = {"name": name, "fid": fid}
+            continue
+        return {"name": name, "fid": fid}
     # 再进子目录（fc=0 且有 cid、无 fid）
     for it in lst:
         if not isinstance(it, dict):
@@ -2337,7 +2382,7 @@ def _115_snap_list(session, code, pwd, cid="0", depth=0):
         got = _115_snap_list(session, code, pwd, sub_cid, depth + 1)
         if got:
             return got
-    return None
+    return iso_fallback
 
 
 def _115_collect_videos(session, code, pwd, out, cid="0", depth=0):
@@ -2437,7 +2482,8 @@ def _115_probe_stream(session, url, referer="https://115.com/"):
             return url, h
         return None
     except Exception:
-        return url, h
+        # 连接都没建立（超时/拒连）→ 直链大概率对播放器同样不可用，别当成功交出去
+        return None
 
 
 def resolve_115_share(share_url="", fid=""):
@@ -2857,6 +2903,18 @@ class Spider(BaseSpider):
         resolved = resolve_share_media(share_url, drive_type, fid=file_id)
         if resolved and resolved[0]:
             stream_url, stream_header = resolved
+            # 蓝光原盘直链拿得到，但主流播放器（ExoPlayer/ijk）解不了 ISO：
+            # 与其黑屏报 codec 错，不如直说（列表层另有「原盘ISO」备注）
+            if re.search(r"\.iso(?:\?|$)", str(stream_url or ""), re.I):
+                return {
+                    "parse": 0,
+                    "jx": 0,
+                    "playUrl": "",
+                    "url": "",
+                    "header": {},
+                    "flag": flag or "",
+                    "msg": "原盘 ISO 文件不支持在线播放（需支持蓝光原盘的播放器）",
+                }
             return {
                 "parse": 0,
                 "jx": 0,
@@ -2866,6 +2924,9 @@ class Spider(BaseSpider):
                 "flag": flag or "",
             }
 
+        msg = "网盘分享无法解析为视频直链（需有效 Cookie 或分享可直链）"
+        if drive_type == "baidu" and _LAST_RESOLVE_ERR:
+            msg = _LAST_RESOLVE_ERR
         return {
             "parse": 0,
             "jx": 0,
@@ -2873,7 +2934,7 @@ class Spider(BaseSpider):
             "url": "",
             "header": {},
             "flag": flag or "",
-            "msg": "网盘分享无法解析为视频直链（需有效 Cookie 或分享可直链）",
+            "msg": msg,
         }
 
     # ---------- CatVod 挂载契约（对齐 hsck） ----------
