@@ -896,13 +896,18 @@ _QUALITY_LINE_NAME_TO_Q = {
 
 def _split_episode_token(token: str) -> tuple[str, str]:
     """把 'hg-episode-v1:<q>:<vid>' 解析为 (清晰度, vid)；兼容旧格式 'hg-episode-v1:<vid>'。"""
-    body = str(token or "")
+    body = str(token or "").strip()
+    # 壳（TVBox / fongmi / OK影视）回传的是 vod_play_url 里的整条播放值
+    # '第1集$hg-episode-v1:1080:<vid>'，先剥掉集名再解协议头；
+    # 少了这一步 vid 会带着 '第1集$...' 前缀，isdigit() 判否直接走兜底。
+    if "$" in body:
+        body = body.rsplit("$", 1)[-1].strip()
     if body.startswith(EPISODE_PREFIX):
         body = body[len(EPISODE_PREFIX):]
     if ":" in body:
         head, tail = body.split(":", 1)
         if head.isdigit():
-            return head, tail
+            return head, tail.strip()
     return "1080", body
 
 # 官网搜索 SSR 固定约 10 条且几乎不认 page；用多关键词轮换实现“翻页”
@@ -3685,7 +3690,10 @@ def hash_f13(query_sm3, body_md5_bytes, ts_bytes, khronos):
         raise Exception("no branch: " + str(branch))
 
 def branch_0(iv_v0, khronos, query_sm3, body_md5_bytes, ts_bytes):
-    tt01 = [0xc4a78580, 0xb3c0fd39, 0xc58c5686, 0xc9aa3ba7, 0xf5a7adf2, 0x963c2ed1]
+    # docs/hongguo.js branch0 的 base 表有 7 项（idx 0..6）。v3 的 F13 分支只会用到
+    # idx 0..5（iv&15 <= 15 -> idx <= 5），idx=6 只被 v5 的 medusaV5 直接调用，
+    # 所以补齐这一项不会改变 v3 的任何输出。
+    tt01 = [0xc4a78580, 0xb3c0fd39, 0xc58c5686, 0xc9aa3ba7, 0xf5a7adf2, 0x963c2ed1, 0x9d4a97c2]
     iv_v1 = tt01[iv_v0]
 
     count_v1 = (iv_v1 + khronos + 1) & 0xff
@@ -3735,7 +3743,11 @@ def branch_0(iv_v0, khronos, query_sm3, body_md5_bytes, ts_bytes):
         di.append(di0 & 0xffffffff)
         di0 = di1
 
-    if iv_v0 == 5:
+    if iv_v0 == 6:
+        # v5 (medusaV5) 固定使用 branch0(6, ...)：config = [rounds,x1..x10]
+        # = [96,1,3,4,0,6,5,2,0,7,7]
+        v_j = branch0_xor(init_value, iv_v1, di, tt03, 96, 1, 3, 4, 0, 6, 5, 2, 0, 7, 7)
+    elif iv_v0 == 5:
         v_j = branch0_xor(init_value, iv_v1, di, tt03, 100, 2, 0, 3, 5, 4, 6, 7, 2, 1, 5)
     elif iv_v0 == 4:
         v_j = branch0_xor(init_value, iv_v1, di, tt03, 96, 0, 5, 6, 7, 3, 1, 2, 5, 4, 4)
@@ -3754,6 +3766,10 @@ def branch_0(iv_v0, khronos, query_sm3, body_md5_bytes, ts_bytes):
 
     ret = bxor(ret[:16], ret[16:])
     sum = sum_md5(ret)
+    if iv_v0 == 6:
+        # docs/hongguo.js branch0：idx===6（v5 medusaV5 专用分支）会把校验值
+        # 额外置位 0x20；idx 0..5（v3）没有这一步。
+        sum |= 32
     ret += sum.to_bytes(4, "little")
     return ret
 
@@ -4295,6 +4311,419 @@ def _core_sixgod(url: str, params: Mapping[str, Any], devices: Mapping[str, Any]
     result_headers["x-tt-dt"] = str(devices.get("x_tt_dt", ""))
     return result_headers, encrypted_url
 
+# ===== Medusa v5 / signMobile（docs/hongguo.js v04.10.03 协议）=====
+# v3 用于目录/详情（POST sixgod），v5 用于播放取流（GET video_tab）。
+# 两者材料完全不同：v5 用 mobileLicense/mobileKey/mobileMagic + 独立的
+# 4096 位 SBOX（mobileCipher.box）与 0xca 前缀，不能复用 v3 的 AES_V3/config_key。
+# 协议来源见 docs/hongguo.js 的 __hgSecurity.medusaV5/signMobile。
+
+_MOBILE_LICENSE = "646637794"
+_MOBILE_KEY = bytes.fromhex(
+    "b23c2a470a20d105dc3f8c4438f8272ed46d6c89ffdcdedd5108698d26e9489d"
+)
+_MOBILE_MAGIC = bytes.fromhex("2d4b4fca49750d433fb5ae2c226dcc56")
+# mobileCipher.box：1024 字节（4 组 × 256），base64 存放避免源码里塞 2048 个十六进制字符。
+_MOBILE_BOX_B64 = (
+    "UykP6eUfMW+Q90p+A002d4SrSSN80BNc3GMsMi/Tvg4mJKQX7NkVGn/2T2BzCof5RF7G"
+    "raL4ZdIraWxBiPJMDfN7dVELk59rwv5og+aLyMciGBugvbCMmHG1DJoWtG7qju0gukuK"
+    "FOD88UaNu+8FqT5anX3PBomGNcH9mfXeKHqAxZTaqrGbYnn711Bwy1LrJVXEVuOeeDmF"
+    "OHTi8AE6wLZHQtjKEOS3nJVd6LhDzk7UZKanLtUICRyS57Pu3R4d0Sr6wyFhj6PWX5Fn"
+    "yYL0PWalPGoZl1hbNG2/lnL/N828BzstrhFFMwTfAIFUdrKhP8zbMLlXqKyv4SdAAkhZ"
+    "EjiSJWPjZAbTeiQQC3kCoCgETiGEU8KjmRmcnRPcQMVbpn5QInOFDr3BouIYi48tnjy5"
+    "CbjEaiqfSm3ZMAfq+mW3s6iBqpCMx08K12u7tYYXw3ASygWkaf1E5i7s8eQnLOhgwK5e"
+    "rfmbINjwI0F0AG8/EQ12V9AWRdTv+PcUccv+HLL1Jkhye/PJ3lUVPgMbTWF1fbY9v3eC"
+    "7q/pAYqIkTYvsUdZrDK6sDs0mutaN3xRVr5MjfvhOmhL2jnPg2aXyJRUX+DySRrOqfxi"
+    "UvT/Hg/nK9Lfbmen9jXlvMbRpd2VHYmWCIehjrQMeFzbH4DtQimTM6uYzdZ/MWzVQ0ZY"
+    "XczXWftyJ4mwiAfMD9opP35eGBm7A1NRcCCzHT0AN0lSvqLEIehiBAqeyJKgWyZreg0M"
+    "wxb0g7ga85cVZX/+Mq2N4MEwd2RgNSNu5TY+X5AOmnz4UKgc2ZYLbfczFyJvmeqm//Fc"
+    "7DSsuYJGY5uRirKFFGanzfxK0bUsKulaWNNzTkfd1bdWAZP2RO+cQIt97jm01qq/Tedh"
+    "4yUtTHujhDGHdF1V5qXbBdQrRcrtQ8DF0LZL+p2UpKnY8vDhoQjc/SiP0rwfx71nVBIT"
+    "gWnLCSSYdbo7aM+xEYCvrhBPyXiVccbfzgJBOIZ5auIePEiMwhufQjoGbC6r+Y4v3utX"
+    "duT10JpRW6WMu6s+N7Cf1PbZJE34BRLoTNeVa+MBz2TxQp1YV3zCQfOixlUUT4Gq+VpO"
+    "EI2olLOJcFYa6QAmGfu6yR+pIu0gK/xiywjg3ip/NjFDX4tHyKPFY7TbQHHOdMRtpvpp"
+    "ap4oLR6CXWY7k7/VbEjc4YhLsQ/M6gY5KfdGRD/YMKQjLlPaIaHy0b3+vDoCwQobitMd"
+    "BP1hZZDScqxzfpjrM69gUocWvueOwO6GmQMRdyd9nP8yVCxnyvX0RZFoEzWuDhePNAmn"
+    "gD24OJLd5bm38MdQ4krvB3ut1nigm4ULhOwVl+SWPLXmdd8cDW+2GEluzXbDXHmDJVkM"
+    "L7J6Xg=="
+)
+
+_MOBILE_ROWS = ((2, 0, 3, 1), (1, 3, 2, 0), (3, 2, 1, 0), (2, 3, 1, 0))
+_MOBILE_ORDER = (
+    (0, 9, 14, 15, 4, 13, 2, 7, 8, 1, 6, 3, 12, 5, 10, 11),
+    (0, 9, 14, 11, 4, 13, 2, 3, 8, 1, 6, 15, 12, 5, 10, 7),
+    (0, 9, 14, 3, 4, 13, 2, 15, 8, 1, 6, 11, 12, 5, 10, 7),
+    (0, 9, 14, 15, 4, 13, 2, 3, 8, 1, 6, 11, 12, 5, 10, 7),
+)
+_MOBILE_INITIAL = (0xBBB5DE72, 0xD4638D5B, 0x92A5F73B, 0x89F8A1C9)
+_MOBILE_WIRE = (6, 5, 3, 4, 2, 7, 1, 0)
+_MOBILE_COMPACT = (1, 7, 3, 6, 2, 0, 4, 5)
+
+def _mobile_cipher_profile() -> dict[str, Any]:
+    """v5 专用的 Medusa 密码学档案（docs/hongguo.js mobileCipher）。"""
+    return {
+        "box": base64.b64decode(_MOBILE_BOX_B64),
+        "rows": _MOBILE_ROWS,
+        "order": _MOBILE_ORDER,
+        "initial": _MOBILE_INITIAL,
+        "wire": _MOBILE_WIRE,
+        "compact": _MOBILE_COMPACT,
+        "key": hashlib.md5(_MOBILE_KEY[:16]).digest(),
+        "iv": hashlib.md5(_MOBILE_KEY[16:]).digest(),
+    }
+
+def _medusa_cipher(data: bytes, khronos: int, profile: Mapping[str, Any]) -> bytes:
+    """docs/hongguo.js medusaCipher：把 packed 载荷按 khronos&3 选表加密。"""
+    word = khronos & 3
+    box = bytes(profile["box"][word * 256:(word + 1) * 256])
+    con = profile["rows"][word]
+    order = profile["order"][word]
+    init = profile["initial"][word]
+    key = bytes(profile["key"])
+    mk = bytearray(48)
+    for i in range(16):
+        mk[i] = key[i] ^ ((init >> ((i & 3) * 8)) & 0xFF)
+    rounds = 8
+    for i in range(4, 12):
+        off = 4 * (i - 1)
+        a, b, c, d = mk[off], mk[off + 1], mk[off + 2], mk[off + 3]
+        if (i & 3) == 0:
+            # JS 里是同时赋值，四个取值都来自旧值，这里必须先留副本。
+            oa, ob, oc, od = a, b, c, d
+            a = ((init >> (rounds & 24)) ^ box[ob]) & 0xFF
+            b = box[oc]
+            c = box[od]
+            d = box[oa]
+        for j, value in enumerate((a, b, c, d)):
+            mk[off + 4 + j] = value ^ mk[off - 12 + j]
+        rounds += 2
+
+    def _add(block: bytes, off: int) -> bytearray:
+        return bytearray(
+            block[i] ^ mk[off + (i & ~3) + con[i & 3]] for i in range(len(block))
+        )
+
+    def _xt(value: int) -> int:
+        return ((value << 1) ^ (27 if (value & 0x80) else 0)) & 0xFF
+
+    def _encrypt(block: bytes) -> bytearray:
+        state = _add(block, 0)
+        for rnd in range(1, 3):
+            state = bytearray(box[v] for v in state)
+            state = bytearray(state[con[i >> 2] * 4 + (i & 3)] for i in range(16))
+            state = bytearray(state[i] for i in order)
+            if rnd == 1:
+                state = bytearray(state[(i & ~3) + con[i & 3]] for i in range(16))
+                for j in range(4):
+                    a = state[j]
+                    b = state[4 + j]
+                    c = state[8 + j]
+                    d = state[12 + j]
+                    t = a ^ b ^ c ^ d
+                    state[j] ^= t ^ _xt(a ^ b)
+                    state[4 + j] ^= t ^ _xt(b ^ c)
+                    state[8 + j] ^= t ^ _xt(c ^ d)
+                    state[12 + j] ^= t ^ _xt(d ^ a)
+            state = _add(state, rnd * 16)
+        return bytearray(state[i] ^ mk[16 + i] for i in range(16))
+
+    if len(data) < 248:
+        raise HongguoPluginError("Medusa 载荷过短")
+    wire = profile["wire"]
+    compact = profile["compact"]
+    summary = bytearray(32)
+    summary[31] = 1
+    for i in range(31):
+        for j in range(8):
+            summary[i] |= ((data[i * 8 + j] >> wire[j]) & 1) << compact[j]
+    prev = bytes(profile["iv"])
+    enc = bytearray(32)
+    for off in (0, 16):
+        block = bytearray(summary[off + i] ^ prev[i] for i in range(16))
+        prev = _encrypt(block)
+        enc[off:off + 16] = prev
+    out = bytearray(data)
+    for i in range(31):
+        for j in range(8):
+            at = i * 8 + j
+            bit = (enc[i] >> compact[j]) & 1
+            out[at] = (out[at] & ~(1 << wire[j])) | (bit << wire[j])
+    return bytes(enc[31:]) + bytes(out)
+
+def _mix_medusa(data: bytes, sign_key: bytes, hash_random: int, flags: bytes) -> bytes:
+    """docs/hongguo.js mixMedusa：SM3 派生 key/seed 后做反向混合。"""
+    key, seed = get_key_hash(sign_key, hash_random)
+    mixed = _xmxor(data, key)
+    combined = bytearray(bytes(flags) + bytes(mixed))
+    combined.reverse()
+    for index in range(len(combined)):
+        combined[index] ^= seed[(~index) & 3]
+    return bytes(combined)
+
+def _pack_medusa(data: bytes, q: bytes, digest: bytes, khronos: int,
+    hash_random: int, xm_random: int, sign_key: bytes, magic: bytes,
+    flags: bytes, prefix: int, version: int,
+    profile: Mapping[str, Any]) -> str:
+    """docs/hongguo.js packMedusa。"""
+    mixed = _mix_medusa(data, sign_key, hash_random, flags)
+    check = 0x18000001 | ((q[0] & 63) << 14) | ((digest[0] & 63) << 8)
+    hash_bytes = hash_random.to_bytes(4, "little")
+    packed = (bytes([prefix]) + xm_random.to_bytes(4, "little")
+        + check.to_bytes(4, "little") + mixed + hash_bytes[2:])
+    carrier = _medusa_cipher(packed, khronos, profile)
+    stamp = khronos.to_bytes(4, "little")
+    header = bytes((version.to_bytes(4, "little") + magic)[i] ^ stamp[i & 3]
+        for i in range(20))
+    return base64.b64encode(
+        header + hash_bytes[:2] + (256).to_bytes(2, "little") + carrier
+    ).decode()
+
+def _speck_signature(message: str, aid: str, rand_value: int) -> str:
+    """docs/hongguo.js speckSignature（v3 的 X-Helios 与 v5 的 X-Helios 共用）。
+
+    注意：JS 里是 toBytes(md5Hex(...))，md5Hex 返回的是十六进制**字符串**，
+    toBytes 再把这个字符串按 ASCII 编码，所以密钥是 32 个 ASCII 字节而不是
+    16 字节原始摘要。直接用 digest() 会得到完全不同的签名。
+    """
+    prefix = rand_value.to_bytes(4, "little")
+    key = hashlib.md5(prefix + aid.encode("utf-8")).hexdigest().encode("ascii")
+    mask = 0xFFFFFFFFFFFFFFFF
+    a = int.from_bytes(key[0:8], "little")
+    b = int.from_bytes(key[8:16], "little")
+    queue = [int.from_bytes(key[16:24], "little"),
+        int.from_bytes(key[24:32], "little")]
+    schedule = [a]
+    for i in range(34):
+        nxt = ((_ror64(b, 8) + a) ^ i) & mask
+        queue.append(nxt)
+        a = nxt ^ _ror64(a, 61)
+        schedule.append(a)
+        b = queue.pop(0)
+    raw = message.encode("utf-8")
+    pad = 16 - len(raw) % 16
+    block_in = raw + bytes([pad]) * pad
+    out = bytearray(len(block_in))
+    for i in range(0, len(block_in), 16):
+        a = int.from_bytes(block_in[i:i + 8], "little")
+        b = int.from_bytes(block_in[i + 8:i + 16], "little")
+        for j in range(34):
+            b = (schedule[j] ^ ((a + _ror64(b, 8)) & mask)) & mask
+            a = b ^ _ror64(a, 61)
+        out[i:i + 8] = a.to_bytes(8, "little")
+        out[i + 8:i + 16] = b.to_bytes(8, "little")
+    return base64.b64encode(prefix + bytes(out)).decode()
+
+def _encode_query(params: Mapping[str, Any]) -> str:
+    """docs/hongguo.js encodeQuery/enc。
+
+    JS 的 enc 是 encodeURIComponent 之后再把 !'()* 换成 %XX。
+    注意 encodeURIComponent **不转义** *，所以 resolution=1280*2772 会变成
+    1280%2A2772；Python 的 quote(safe="*") 默认也不转义 *，这里必须显式
+    把 * 换成 %2A，否则 query 与服务端计算签名用的原文不一致。
+    """
+    def _enc(value: Any) -> str:
+        text = quote(str(value), safe="")
+        for char in "!'()*":
+            text = text.replace(char, "%%%02X" % ord(char))
+        return text
+
+    return "&".join("%s=%s" % (_enc(key), _enc(value)) for key, value in params.items())
+
+def _medusa_v5(q: bytes, digest: bytes, stamp: int, params: Mapping[str, Any],
+    nonce: str, started: int) -> str:
+    """docs/hongguo.js medusaV5。"""
+    aid = str(params.get("aid") or "8662")
+    device_id = str(params.get("device_id") or "")
+    version_name = str(params.get("version_name") or VIDEO_TAB_VERSION_NAME)
+    os_version = str(params.get("os_version") or "16")
+    device_type = str(params.get("device_type") or "25053RT47C")
+    channel = str(params.get("channel") or "update_64")
+    device = _proto([
+        (1, 1, "sint32"), (2, 2, "sint32"), (3, aid, "string"),
+        (4, device_id, "string"), (5, nonce, "string"), (6, "!noperm!", "string"),
+        (12, "Asia/Shanghai,8", "string"), (13, "zh_CN", "string"),
+        (22, os_version, "string"), (25, started, "sint64"),
+        (30, device_type, "string"), (31, "HONOR", "string"),
+        (32, device_type, "string"), (34, "HONOR", "string"),
+    ])
+    env = _proto([
+        (6, "v04.10.03.04-bugfix", "string"), (8, channel, "string"),
+        (12, device, "message"), (14, version_name, "string"),
+    ])
+    flags = bytes(8)
+    hash_value = branch_0(6, stamp, q, digest, stamp.to_bytes(4, "little"))
+    data = _proto([
+        (1, _MOBILE_MAGIC, "bytes"), (2, 5, "sint32"),
+        (3, random.randint(0, 0xFFFFFFFF), "sint32"),
+        (4, aid, "string"), (5, device_id, "string"), (6, _MOBILE_LICENSE, "string"),
+        (7, version_name, "string"), (8, "v04.10.03-ml-android", "string"),
+        (9, 0x040A0300, "sint32"), (10, flags, "bytes"), (12, stamp, "sint32"),
+        (13, hash_value, "bytes"), (14, q[:6], "bytes"),
+        (15, _proto([
+            (1, 1, "sint32"), (2, 1, "sint32"), (3, 1, "sint32"), (5, 1, "sint32"),
+        ]), "message"),
+        (17, stamp, "sint32"), (20, "none", "string"), (21, 377, "sint32"),
+        (23, env, "message"),
+        (24, '{"cmr":16777216,"cmr2":16777216,"un_h":11,"vpn":0,"kd":0,'
+            '"dyn":"","do":1,"tk":true}', "string"),
+    ])
+    return _pack_medusa(
+        data, q, hash_value, stamp,
+        random.randint(0, 0xFFFFFFFF), random.randint(0, 0xFFFFFFFF),
+        _MOBILE_KEY, _MOBILE_MAGIC, flags, 0xCA, 5, _mobile_cipher_profile(),
+    )
+
+def _sign_mobile(query_base: str, params: Mapping[str, Any],
+    now: int | None = None) -> tuple[str, dict[str, str]]:
+    """docs/hongguo.js signMobile：返回 (带 _rticket 的 query, 三个签名头)。"""
+    if now is None:
+        now = int(time.time() * 1000)
+    stamp = now // 1000
+    ts = stamp.to_bytes(4, "little")
+    digest = bytes(16)
+    aid = str(params.get("aid") or "8662")
+    for offset in range(1024):
+        query = query_base + "&_rticket=" + str(now + offset)
+        q = SM3(query).digest()
+        # v5 的 F13 实现对应 IV 低四位为 12 的分支（idx=4, branch=0）。
+        if (get_iv(get_iv(get_iv(0x20230928, q), digest), ts) & 15) != 12:
+            continue
+        # JS 里 headers 对象按字面量顺序求值：X-Helios 的 rand32 先于 X-Medusa，
+        # 而 medusaV5 内部的 nonce(randomBytes(18)) 又先于 data/hashRandom/xmRandom。
+        # 随机流的消耗顺序必须一致，否则整条签名都对不上。
+        helios_rand = random.randint(0, 0xFFFFFFFF)
+        nonce = base64.b64encode(os.urandom(18)).decode("ascii")
+        nonce = nonce.replace("+", "-").replace("/", "_")
+        headers = {
+            "X-Khronos": str(stamp),
+            "X-Helios": _speck_signature(
+                "%d-%s-%s" % (stamp, _MOBILE_LICENSE, aid), aid, helios_rand,
+            ),
+            "X-Medusa": _medusa_v5(q, digest, stamp, params, nonce,
+                int(time.time() * 1000)),
+        }
+        return query, headers
+    raise HongguoPluginError("无法产生红果播放签名")
+
+
+
+
+# v3 的 POST sixgod 对 multi_video_model/video_model 一直回空体；JS 参照实现
+# 走的是另一条链路：GET /reading/bookapi/video_tab/multi_video_model/v1/，
+# 用 v5 签名（signMobile），公共参数不带 iid 之外的旧字段，并且版本号是
+# 7.3.9.32 / 73932（与目录接口的 7.3.7.32 不同，是 JS 参照实现的取值）。
+#
+# 2026-11-21 实测（真实 App 设备号 + 真实 series_id）：
+#   GET video_tab + v5 签名 -> code=0 SUCCESS，19~24KB 播放模型，
+#   含 5 档清晰度 + qznovelvod.com CDN 直链 + cenc-aes-ctr 的 kid/spade_a。
+#   同一端点不签名也返回 code=0，说明该路由不强制校验 X-Medusa；
+#   但签名头必须带上，否则换端点/换协议版本时会被静默降级成空体。
+#   vid 形态要求是 App 的 series_id（站点 vod_id），App 内部 v0... bid 会被拒
+#   （code=100103 PARAM_INVALID）。
+VIDEO_TAB_URL = ("https://api5-normal-sinfonlineb.fqnovel.com"
+    "/reading/bookapi/video_tab/multi_video_model/v1/")
+VIDEO_TAB_URL_ALT = ("https://api5-normal-lf.fqnovel.com"
+    "/reading/bookapi/video_tab/multi_video_model/v1/")
+VIDEO_TAB_VERSION_CODE = "73932"
+VIDEO_TAB_VERSION_NAME = "7.3.9.32"
+# JS 参照：UA.replace('/73732 ', '/71332 ')。UA 里的版本号与 query 的
+# version_code 不同源时，服务端会判定客户端身份不一致。
+VIDEO_TAB_UA = APP_UA.replace("/73732 ", "/71332 ")
+
+def _video_tab_params(devices: Mapping[str, Any], video_id: str) -> dict[str, str]:
+    """docs/hongguo.js videoModel 的 params（键顺序即 query 顺序）。"""
+    params: dict[str, str] = {
+        "ac": "wifi",
+        "channel": "update_64",
+        "aid": "8662",
+        "app_name": "novelread",
+        "version_code": VIDEO_TAB_VERSION_CODE,
+        "version_name": VIDEO_TAB_VERSION_NAME,
+        "device_platform": "android",
+        "os": "android",
+        "ssmix": "a",
+        "device_type": str(devices.get("device_type") or "25053RT47C"),
+        "device_brand": str(devices.get("device_brand") or "Redmi"),
+        "language": "zh",
+        "os_api": "36",
+        "os_version": str(devices.get("os_version") or "16"),
+        "manifest_version_code": VIDEO_TAB_VERSION_CODE,
+        "resolution": "1280*2772",
+        "dpi": "520",
+        "update_version_code": VIDEO_TAB_VERSION_CODE,
+        "host_abi": "arm64-v8a",
+        "dragon_device_type": "phone",
+        "pv_player": VIDEO_TAB_VERSION_CODE,
+        "compliance_status": "0",
+        "need_personal_recommend": "1",
+        "player_so_load": "1",
+        "is_android_pad_screen": "0",
+        "iid": str(devices.get("iid") or devices.get("install_id") or ""),
+        "cdid": str(devices.get("cdid") or ""),
+        "device_id": str(devices.get("device_id") or ""),
+        "video_id": str(video_id),
+        "video_id_type": "0",
+        "device_level": "1",
+        "need_all_video_definition": "1",
+        "need_mp4_align": "0",
+        "use_os_player": "0",
+        "video_platform": "1024",
+        "source": "0",
+        "from_video_id": "",
+    }
+    return params
+
+def _video_tab_model(video_id: str, config: Mapping[str, Any],
+    endpoint: str | None = None, timeout: int = 25) -> dict[str, Any]:
+    """用 v5 签名调用 video_tab 取播放模型（docs/hongguo.js videoModel）。
+
+    2026-11-21 实测：真实 series_id + 真实 App 设备号 -> code=0 SUCCESS，
+    返回 19~24KB 的 video_model（5 档清晰度 + CDN 直链 + CENC 密钥材料）。
+    """
+    devices = _device_config(config)
+    params = _video_tab_params(devices, video_id)
+    query, sign_headers = _sign_mobile(_encode_query(params), params)
+    url = (endpoint or VIDEO_TAB_URL) + "?" + query
+    headers = {
+        "User-Agent": VIDEO_TAB_UA,
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Accept": "application/json",
+    }
+    headers.update(sign_headers)
+    response = requests.get(url, headers=headers, timeout=timeout)
+    response_data = _json_response(response)
+    if not isinstance(response_data, Mapping):
+        raise HongguoPluginError("video_tab 响应格式错误")
+    code = response_data.get("code")
+    if code not in (0, None):
+        raise HongguoPluginError(
+            "video_tab 返回 code=%s %s"
+            % (code, str(response_data.get("message") or "")[:60])
+        )
+    data = response_data.get("data")
+    if not isinstance(data, Mapping):
+        data = response_data
+    models = data.get("video_model_data")
+    if not isinstance(models, Mapping):
+        models = data
+    entry = models.get(str(video_id))
+    if entry is None:
+        for value in models.values():
+            if isinstance(value, Mapping):
+                entry = value
+                break
+    raw_model = entry.get("video_model") if isinstance(entry, Mapping) else None
+    if raw_model is None:
+        raw_model = data.get("video_model")
+    if isinstance(raw_model, str):
+        try:
+            raw_model = json.loads(raw_model)
+        except ValueError as exc:
+            raise HongguoPluginError("video_model JSON 无效") from exc
+    if not isinstance(raw_model, Mapping):
+        raise HongguoPluginError("video_model 为空")
+    return dict(raw_model)
+
+
 # ---- multi_video_model 老张式 gorgon 签名 helper（1.7.6 起播修复，移植自老张hongguo_full.py）----
 # 上游翻脸记录：1.7.1 起用的 dm 签名(_dm_sign_headers)现恒回 200 空包；
 # 老张同款 x-gorgon/x-helios 签名对 DEF_DEV 与新注册设备对均可拿到 video_model。
@@ -4698,6 +5127,24 @@ def _video_model_rotating(video_id: str, config: Mapping[str, Any]) -> dict[str,
 
 def _video_model(video_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
     devices = _device_config(config)
+    # 修起播（对照 hongguo.py / h红果.py 2026-11-21 实测）：POST multi_video_model /
+    # video_model 无论走 vg(gorgon) 还是 dm 签名，上游一律回 200 + Content-Length: 0，
+    # 两套签名都拿不到播放模型。现行可用链路是 GET /reading/bookapi/video_tab/
+    # multi_video_model/v1/ + Medusa v5 签名，返回 5 档清晰度 + CDN 直链 + CENC 材料。
+    # 这里先试 video_tab 的两台 host，都拿不到再回退下面的 POST 双路径
+    # （上游哪天翻回去时仍能无感跟上）。
+    tab_err: BaseException | None = None
+    for endpoint in (VIDEO_TAB_URL, VIDEO_TAB_URL_ALT):
+        try:
+            tab_model = _video_tab_model(video_id, config, endpoint)
+        except Exception as err:
+            tab_err = err
+            continue
+        if _video_list_from_model(tab_model):
+            return tab_model
+        tab_err = HongguoPluginError("video_tab 未返回清晰度列表")
+    if tab_err is not None:
+        _hg_trace("video_tab 取流失败 vid=%s %s" % (video_id, str(tab_err)[:80]))
     payload = {
         "biz_param": {
             "detail_page_version": 0,
