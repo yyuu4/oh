@@ -88,6 +88,12 @@ LIST_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "zh-CN,zh;q=0.9,ja;q=0.8,en;q=0.7",
 }
+# 无 curl_cffi 指纹时：Chrome UA + Accept-Language 会被 Cloudflare 打回 403 HTML。
+# 实测 okhttp / 简洁 Mozilla UA 可直接拿到 JSON，作 requests 兜底头。
+LIST_HEADERS_PLAIN = {
+    "User-Agent": "okhttp/3.12.1",
+    "Accept": "application/json, text/plain, */*",
+}
 
 # ============ 115 离线 ============
 DEFAULT_COOKIE_115 = ("UID=7090991_R1_1785487771; CID=3c1a3ab03cfc92b0b7c80db6efa950c6; "
@@ -1007,7 +1013,8 @@ class Spider:
         self.resolve_api = "/api/rv/v1/resolve"
         self._api_action = ""
 
-        # FANZA 有 Cloudflare：curl_cffi TLS 指纹优先，requests 仅作兜底
+        # FANZA 有 Cloudflare：curl_cffi TLS 指纹优先；无指纹时用 okhttp 头，避免 Chrome UA 403
+        self._plain_ua = False
         if creq is not None:
             try:
                 self.s = creq.Session(impersonate="chrome")
@@ -1017,8 +1024,19 @@ class Spider:
                 self.s = None
         if self.s is None and requests:
             self.s = requests.Session()
-            self.s.headers.update(LIST_HEADERS)
+            self.s.headers.update(LIST_HEADERS_PLAIN)
+            self._plain_ua = True
             self._apply_proxy()
+
+    def _has_impersonate(self):
+        return (creq is not None
+                and getattr(self.s, "impersonate", None) is not None)
+
+    def _api_headers(self):
+        """有 TLS 指纹用 Chrome 头；无指纹用 okhttp 头（Chrome UA 会 403）。"""
+        if self._has_impersonate():
+            return dict(LIST_HEADERS)
+        return dict(LIST_HEADERS_PLAIN)
 
     def getDependence(self):
         return []
@@ -1157,51 +1175,97 @@ class Spider:
             self.s.proxies = {}
 
     # ---------- FANZA API ----------
+    def _has_impersonate(self):
+        try:
+            return (creq is not None
+                    and getattr(self.s, "impersonate", None) is not None)
+        except Exception:
+            return False
+
+    def _api_headers(self):
+        """有 TLS 指纹用 Chrome 头；无指纹用 okhttp 头（Chrome UA 会 403）。"""
+        if self._has_impersonate():
+            return dict(LIST_HEADERS)
+        return dict(LIST_HEADERS_PLAIN)
+
     def _http_get(self, url, params=None, headers=None, timeout=None,
                   as_json=True):
         """GET url → dict/list（失败返回 {} / []）。
-        FANZA 有 Cloudflare：优先 curl_cffi TLS 指纹，requests 仅兜底。"""
+        FANZA 有 Cloudflare：优先 curl_cffi TLS 指纹；无指纹用 okhttp 头，
+        403/HTML 再换头重试一次，避免应用侧（无 curl_cffi）整页空列表。"""
         self._api_action = ""
         t = timeout or self.timeout
-        hdrs = dict(LIST_HEADERS)
-        if headers:
-            hdrs.update(headers)
+        base = self._api_headers()
         if _to_text(self.cookie):
-            hdrs["Cookie"] = self.cookie
-        for attempt in range(HTTP_RETRY + 1):
-            try:
-                if creq is not None and getattr(self.s, "impersonate", None) is not None:
-                    r = self.s.get(url, params=params or {}, headers=hdrs,
-                                   timeout=t, verify=self.verify)
-                elif self.s is not None:
-                    r = self.s.get(url, params=params or {}, headers=hdrs,
-                                   timeout=t, verify=self.verify)
-                elif creq is not None:
-                    r = creq.get(url, params=params or {}, headers=hdrs,
-                                 timeout=t, verify=self.verify,
-                                 impersonate="chrome")
-                elif requests:
-                    r = requests.get(url, params=params or {}, headers=hdrs,
-                                     timeout=t, verify=self.verify)
-                else:
-                    return {}
-                if r.status_code in HTTP_RETRY_STATUS and attempt < HTTP_RETRY:
-                    time.sleep(HTTP_RETRY_DELAY)
-                    continue
-                if not as_json:
-                    return {"status_code": r.status_code, "text": r.text or ""}
-                data = r.json()
-                if isinstance(data, dict):
-                    return data
-                if isinstance(data, list):
-                    return {"items": data}
-                return {}
-            except Exception as e:
-                self._api_action = _to_text(e)
-                if attempt < HTTP_RETRY:
-                    time.sleep(HTTP_RETRY_DELAY)
-                    continue
-                return {}
+            base["Cookie"] = self.cookie
+        if headers:
+            base.update(headers)
+        attempts_plan = [base]
+        if self._has_impersonate():
+            alt = dict(LIST_HEADERS_PLAIN)
+        else:
+            alt = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+        if _to_text(self.cookie):
+            alt["Cookie"] = self.cookie
+        if headers:
+            alt.update(headers)
+        if alt != base:
+            attempts_plan.append(alt)
+
+        def _do(hdrs):
+            for i in range(HTTP_RETRY + 1):
+                try:
+                    if creq is not None and getattr(
+                            self.s, "impersonate", None) is not None:
+                        r = self.s.get(url, params=params or {}, headers=hdrs,
+                                       timeout=t, verify=self.verify)
+                    elif self.s is not None:
+                        r = self.s.get(url, params=params or {}, headers=hdrs,
+                                       timeout=t, verify=self.verify)
+                    elif creq is not None:
+                        r = creq.get(url, params=params or {}, headers=hdrs,
+                                     timeout=t, verify=self.verify,
+                                     impersonate="chrome")
+                    elif requests:
+                        r = requests.get(url, params=params or {}, headers=hdrs,
+                                         timeout=t, verify=self.verify)
+                    else:
+                        return None, "no http backend"
+                    if r.status_code in HTTP_RETRY_STATUS and i < HTTP_RETRY:
+                        time.sleep(HTTP_RETRY_DELAY)
+                        continue
+                    # Cloudflare 挑战页 / 非 JSON：换头重试信号
+                    ctype = _to_text(
+                        (getattr(r, "headers", None) or {}).get(
+                            "Content-Type") or "").lower()
+                    if r.status_code == 403 or ctype.startswith("text/html"):
+                        return None, "cf_or_html_%s" % r.status_code
+                    if not as_json:
+                        return {"status_code": r.status_code,
+                                "text": getattr(r, "text", "") or ""}, ""
+                    try:
+                        data = r.json()
+                    except Exception as e:
+                        return None, _to_text(e) or "bad_json"
+                    if isinstance(data, dict):
+                        return data, ""
+                    if isinstance(data, list):
+                        return {"items": data}, ""
+                    return {}, ""
+                except Exception as e:
+                    if i < HTTP_RETRY:
+                        time.sleep(HTTP_RETRY_DELAY)
+                        continue
+                    return None, _to_text(e)
+            return None, "retries_exhausted"
+
+        last_err = ""
+        for hdrs in attempts_plan:
+            data, err = _do(hdrs)
+            if data is not None:
+                return data if isinstance(data, dict) else {}
+            last_err = err
+        self._api_action = last_err
         return {}
 
     def _api_get(self, path, params=None, timeout=None):
