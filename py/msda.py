@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.0.0"
+VERSION = "1.0.2"
 # msda.py —— FANZA METADATA INDEX (fanza.fastcdn.dpdns.org) 爬虫
 # 参照 javdbui.py 结构：分类/筛选与网页端对齐；磁力 + 115 离线可播放。
 # 网页板块：AV档案(/) / 无码档案(/uncensored) / FC2档案(/fc2) / 发售日历(/calendar)
 # 列表页签：全部新作(lists/new) / 有磁链(lists/links) / 可播(lists/playable)
 # 数据 API：fanza-api.fastcdn.dpdns.org/v1/*；播放解析：站点 /api/rv/v1/resolve
-# 说明：Cloudflare 对普通 requests 直接 403，必须走 curl_cffi TLS 指纹。
+# 说明：Cloudflare 对普通 requests + Chrome UA 直接 403；优先 curl_cffi 指纹，无指纹时改 okhttp 头兜底。
+# v1.0.2 详情/磁力/115 对齐参照与网页：①size_bytes 误当 MB 致标签「7235174.40GB」→ 换算成 MB（6.90GB），115 命名不再带天文数字；②实体字段 name_ja（非 name）→ 演员/类别/简介恢复；③磁力只用 hash 重建+公共 tracker（去上游 dn=），115 用裸 btih，与 javdbui 同构；④vod_blurb 按 番号|日期|片商|导演|演员。
+# v1.0.1 修复应用侧（无 curl_cffi）分类空列表：Chrome UA 被 CF 打回 403 HTML → 无指纹时用 okhttp 头，403/HTML/JSON 失败自动换头重试。
+# v1.0.0 初版：板块/筛选/列表/详情/搜索/磁力+115 离线对齐网页端。
 import os
 import re
 import json
@@ -1567,7 +1570,10 @@ class Spider:
             if m:
                 item["hash"] = m.group(1).lower()
             item["name"] = _to_text(g.get("file_name") or "") or code
-            item["size"] = _safe_int(g.get("size_bytes"), 0)
+            # FANZA 给 size_bytes（字节）；_format_size_mb/JavDB 约定是 MB → 换算
+            raw = _safe_int(g.get("size_bytes"), 0)
+            item["size"] = (raw / (1024.0 * 1024)) if raw > 0 else 0
+            item["size_bytes"] = raw
             out.append(item)
         self._magnets_cache[code] = (now, out)
         return out
@@ -1803,7 +1809,9 @@ class Spider:
             out = []
             for a in rows:
                 if isinstance(a, dict):
-                    n = _to_text(a.get("name") or "")
+                    # FANZA 实体用 name_ja / name_en，不是 JavDB 的 name
+                    n = _to_text(a.get("name_ja") or a.get("name")
+                                 or a.get("name_en") or a.get("name_kana") or "")
                     if n:
                         out.append(n)
                 elif isinstance(a, str) and a:
@@ -1850,7 +1858,8 @@ class Spider:
         if self.enable_offline_115:
             info_lines.append("115离线：提交到115云端，完成后自动直连播放 (v%s)" % VERSION)
 
-        # 播放源：预览 → 在线 → 磁力 → 115离线
+        # 播放源：預覽 → 在线 → 磁力 → 115离线
+        # （网页端：预览置顶、可播给在线、磁力列表、115 为本插件转存；磁力/115 与 javdbui 同构）
         play_from = []
         play_url = []
 
@@ -1869,32 +1878,28 @@ class Spider:
             play_url.append("在线$%s" % _sanitize_play(
                 RESOLVE_PREFIX + "%s|%s" % (number, content_class)))
 
-        # 磁力直链
+        # 磁力源（与 javdbui 一致：只用 hash 重建干净磁力，不带上游 dn=）
         if self.enable_magnet and magnets:
             eps = []
             for i, g in enumerate(magnets):
-                uri = _to_text(g.get("uri") or "")
                 h = _to_text(g.get("hash") or "")
-                mag = uri if uri.startswith("magnet:") else (
-                    _magnet_with_trackers(h) if h else "")
-                if not mag:
+                if not h:
                     continue
+                mag = _magnet_with_trackers(h)
                 label = _magnet_label(g, i)
                 eps.append("%s$%s" % (_sanitize_play(label), _sanitize_play(mag)))
             if eps:
                 play_from.append("磁力")
                 play_url.append("#".join(eps))
 
-        # 115离线
+        # 115离线源（与 javdbui 一致：裸 btih 磁力入 115，label/番号参与命名）
         if self.enable_offline_115 and magnets:
             eps = []
             for i, g in enumerate(magnets):
-                uri = _to_text(g.get("uri") or "")
                 h = _to_text(g.get("hash") or "")
-                mag = uri if uri.startswith("magnet:") else (
-                    "magnet:?xt=urn:btih:" + h if h else "")
-                if not mag:
+                if not h:
                     continue
+                mag = "magnet:?xt=urn:btih:" + h
                 label = _magnet_label(g, i)
                 b64 = _off_id_encode(mag, title, label, number)
                 eps.append("%s$%s%s?t=%d" % (
@@ -1903,10 +1908,12 @@ class Spider:
                 play_from.append("115离线")
                 play_url.append("#".join(eps))
 
+        # 一行摘要：对齐 javdbui（番号 | 日期 | 片商 | 导演 | 演员）
         _blurb = " | ".join([b for b in (
             number, (date or "")[:10],
+            makers[0] if makers else "",
+            directors[0] if directors else "",
             "、".join(actors[:4]),
-            "、".join(makers[:1]),
         ) if b])
 
         class_name = {"av": "AV", "uncensored": "无码", "fc2": "FC2"}.get(
