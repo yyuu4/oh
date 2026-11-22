@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 # msda.py —— FANZA METADATA INDEX (fanza.fastcdn.dpdns.org) 爬虫
 # 参照 javdbui.py 结构：分类/筛选与网页端对齐；磁力 + 115 离线可播放。
 # 网页板块：AV档案(/) / 无码档案(/uncensored) / FC2档案(/fc2) / 发售日历(/calendar)
 # 列表页签：全部新作(lists/new) / 有磁链(lists/links) / 可播(lists/playable)
 # 数据 API：fanza-api.fastcdn.dpdns.org/v1/*；播放解析：站点 /api/rv/v1/resolve
 # 说明：Cloudflare 对普通 requests + Chrome UA 直接 403；优先 curl_cffi 指纹，无指纹时改 okhttp 头兜底。
+# v1.0.3 115 离线可用性：①失败任务不再永久卡死——ac=task_del(hash[0]) 删旧后自动重提；②/v1/links 失败/error 不写 120s 空缓存；③等待超时可配 ext.offlinePollTimeout（默认 20s），文案改为「云端下载中非失败」；④详情标注无做种/源站无磁链。
 # v1.0.2 详情/磁力/115 对齐参照与网页：①size_bytes 误当 MB 致标签「7235174.40GB」→ 换算成 MB（6.90GB），115 命名不再带天文数字；②实体字段 name_ja（非 name）→ 演员/类别/简介恢复；③磁力只用 hash 重建+公共 tracker（去上游 dn=），115 用裸 btih，与 javdbui 同构；④vod_blurb 按 番号|日期|片商|导演|演员。
 # v1.0.1 修复应用侧（无 curl_cffi）分类空列表：Chrome UA 被 CF 打回 403 HTML → 无指纹时用 okhttp 头，403/HTML/JSON 失败自动换头重试。
 # v1.0.0 初版：板块/筛选/列表/详情/搜索/磁力+115 离线对齐网页端。
@@ -182,9 +183,10 @@ OFFLINE_VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".flv", ".ts", ".m4v",
                       ".webm", ".m2ts", ".vob", ".mp2")
 OFFLINE_ADD_API = "https://115.com/web/lixian/?ct=lixian&ac=add_task_urls"
 OFFLINE_LIST_API = "https://115.com/web/lixian/?ct=lixian&ac=task_lists"
-OFFLINE_POLL_TIMEOUT = 15
+OFFLINE_POLL_TIMEOUT = 20
 OFFLINE_POLL_INTERVAL = 1
 OFFLINE_FINISH_BUDGET = 9
+OFFLINE_TASK_DEL_API = "https://115.com/web/lixian/?ct=lixian&ac=task_del"
 OFFLINE_TEST_MP4 = ("https://commondatastorage.googleapis.com/gtv-videos-bucket/"
                     "sample/BigBuckBunny.mp4")
 OFFLINE_TEST_HEADER = {
@@ -983,6 +985,7 @@ class Spider:
         self.offline_save_path = "0"
         self.offline_app_ver = "4.8.2"
         self.offline_timeout = 10
+        self.offline_poll_timeout = OFFLINE_POLL_TIMEOUT
         self.offline_proxy = ""
         self.offline_debug = True
         self.offline_test_mp4 = ""
@@ -1136,6 +1139,12 @@ class Spider:
             self.offline_save_path = str(extend["offlineSavePath"])
         if extend.get("offlineAppVer"):
             self.offline_app_ver = str(extend["offlineAppVer"])
+        if extend.get("offlinePollTimeout"):
+            try:
+                self.offline_poll_timeout = max(
+                    5, int(extend["offlinePollTimeout"]))
+            except Exception:
+                pass
         if "offlineProxy" in extend:
             self.offline_proxy = _to_text(extend.get("offlineProxy"))
         if self.s115 is not None:
@@ -1556,7 +1565,10 @@ class Spider:
         if hit and now - hit[0] < 120:
             return hit[1]
         data = self._api_get("/v1/links", {"code": code})
-        links = data.get("links") if isinstance(data, dict) else None
+        # 接口失败 / {"error":...} / 非法响应：不写 120s 缓存，避免抖动后空窗两分钟
+        if not isinstance(data, dict) or "error" in data or "links" not in data:
+            return []
+        links = data.get("links")
         out = []
         for g in links or []:
             if not isinstance(g, dict):
@@ -1575,6 +1587,7 @@ class Spider:
             item["size"] = (raw / (1024.0 * 1024)) if raw > 0 else 0
             item["size_bytes"] = raw
             out.append(item)
+        # 仅成功拿到 links 字段（含合法空列表）才缓存
         self._magnets_cache[code] = (now, out)
         return out
 
@@ -1850,9 +1863,21 @@ class Spider:
             until = ("至 %s" % playable_until[:16]) if playable_until else ""
             info_lines.append("在线可播%s" % until)
         if magnets:
-            info_lines.append("磁力 %d 条" % len(magnets))
+            # 标注死链（seeders=0 / health=unknown），与「有做种」区分
+            def _dead(g):
+                return (_to_text(g.get("health") or "") == "unknown"
+                        or _safe_int(g.get("seeders"), 0) <= 0)
+            dead_n = sum(1 for g in magnets if _dead(g))
+            if dead_n >= len(magnets):
+                info_lines.append(
+                    "磁力 %d 条（均无做种，115可能下不动）" % len(magnets))
+            elif dead_n:
+                info_lines.append(
+                    "磁力 %d 条（%d 条无做种）" % (len(magnets), dead_n))
+            else:
+                info_lines.append("磁力 %d 条" % len(magnets))
         elif number:
-            info_lines.append("暂无磁力")
+            info_lines.append("暂无磁力（源站未提供磁链）")
         if desc:
             info_lines.append(desc[:500])
         if self.enable_offline_115:
@@ -2100,6 +2125,33 @@ class Spider:
                     return t
         return None
 
+    def _offline_task_del(self, info_hash):
+        """删除 115 离线任务（失败任务卡死时删旧重提）。
+        web 端参数为 hash[0]=info_hash；del_source_file=0 不动已下完的源文件。"""
+        info_hash = _to_text(info_hash or "").strip().lower()
+        if not info_hash:
+            return False
+        sess = self._offline_session()
+        if sess is None:
+            return False
+        data = {"hash[0]": info_hash, "del_source_file": "0"}
+        try:
+            r = sess.post(OFFLINE_TASK_DEL_API, data=data,
+                          headers=self._offline_headers(),
+                          timeout=self.offline_timeout, verify=self.verify)
+            out = _safe_json(r.text, {})
+            if not isinstance(out, dict):
+                return False
+            if out.get("state") or _safe_int(out.get("errcode"), -1) == 0:
+                # 删后确认已不在列表（task_del 对不存在 hash 也可能回 suc）
+                try:
+                    return self._offline_find_task(info_hash) is None
+                except Exception:
+                    return True
+        except Exception:
+            return False
+        return False
+
     @staticmethod
     def _task_pickcode(task):
         if not task:
@@ -2132,7 +2184,10 @@ class Spider:
                                  or task.get("message") or "离线任务失败")
         return False, False, name
 
-    def _offline_wait_done(self, info_hash, timeout=OFFLINE_POLL_TIMEOUT):
+    def _offline_wait_done(self, info_hash, timeout=None):
+        if timeout is None:
+            timeout = getattr(self, "offline_poll_timeout",
+                              OFFLINE_POLL_TIMEOUT)
         deadline = time.time() + timeout
         last_name = ""
         while time.time() < deadline:
@@ -2981,6 +3036,12 @@ class Spider:
                     return res0
                 early_fail = res0
             elif failed0:
+                # 失败任务卡死：删旧后走下面重新 add（不再直接放弃）
+                self._off_trace("删除失败任务以便重提", t0)
+                try:
+                    self._offline_task_del(info_hash)
+                except Exception:
+                    pass
                 task = None
 
         if not task:
@@ -2999,6 +3060,28 @@ class Spider:
             except Exception:
                 task = None
 
+            # 「已存在」但列表里其实是失败任务 → 删旧再提一次
+            if task and not add.get("state"):
+                _d, failed_x, _m = self._offline_task_state(task)
+                if failed_x or existed:
+                    self._off_trace("已存在且失败，删旧重提", t0)
+                    try:
+                        self._offline_task_del(info_hash)
+                    except Exception:
+                        pass
+                    try:
+                        add = self._offline_add(magnet)
+                    except Exception as e:
+                        return _play_err("提交离线失败：%s" % e)
+                    add_msg = _to_text(
+                        add.get("message") or add.get("error_msg")
+                        or add.get("error"))
+                    existed = any(k in add_msg for k in ("已存在", "重复"))
+                    try:
+                        task = self._offline_find_task(info_hash)
+                    except Exception:
+                        task = None
+
             if not task and not add.get("state") and not existed:
                 return _play_err("115离线提交失败：%s" % (add_msg or "提交失败"))
 
@@ -3008,7 +3091,9 @@ class Spider:
             if task:
                 done0, failed0, msg0 = self._offline_task_state(task)
                 if failed0:
-                    return _play_err("115离线失败：%s" % msg0)
+                    return _play_err(
+                        "115离线失败（可到115网盘删除该失败任务后重试）：%s"
+                        % msg0)
                 pc0 = self._task_pickcode(task)
                 if done0 and pc0:
                     self._off_trace("任务已完成，整理并取直链", t0)
@@ -3023,8 +3108,10 @@ class Spider:
         self._off_trace("等待离线完成", t0)
         done, name_or_msg = self._offline_wait_done(info_hash)
         if not done:
-            return _play_err("已提交115离线，下载中（%s），请稍后重试"
-                           % (name_or_msg or "等待完成"))
+            # 超时≠失败：115 云端仍在下载，明确告知避免误判
+            return _play_err(
+                "115云端下载中（%s），非失败；请稍后重试或到115网盘查看"
+                % (name_or_msg or "排队/下载中"))
 
         name = _to_text(name_or_msg) or task_name
         try:
