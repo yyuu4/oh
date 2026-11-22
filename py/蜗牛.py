@@ -1133,6 +1133,96 @@ def _cache_set(key, val):
         _detail_cache[key] = (time.time(), val)
 
 
+# ---- 115 风控防护：节流 / 冷却熔断 / 直链缓存 ----
+_PAN_TS_LOCK = threading.Lock()      # 只保护下面三个状态字典（短持，sleep 在锁外）
+_PAN_LAST = {}                       # drive -> 上次请求起始时间戳
+_PAN_BLOCK = {}                      # drive -> 冷却截止时间戳
+_PAN_FAILS = []                      # 近窗失败时间戳（115 共用）
+_PAN_GAP = 1.2                       # 同盘两次请求最小间隔（秒）
+_PAN_COOLDOWN = 60.0                 # 风控/熔断冷却时长（秒）
+_PAN_FAIL_LIMIT = 3                  # 窗内失败几次 → 熔断
+_PAN_FAIL_WINDOW = 30.0              # 失败计数窗口（秒）
+_PAN_115_LOCK = threading.Lock()     # 115 网络操作单飞（整段 resolve/list 串行）
+_RESOLVE_CACHE = {}                  # key -> (expire_ts, (url, header))
+_RESOLVE_CACHE_LOCK = threading.Lock()
+_RESOLVE_TTL = 300                   # 直链缓存秒数（115 直链本身有时效）
+_LAST_115_ERR = ""                   # 最近一次 115 失败原因（playerContent msg 透传）
+_RISK_RE = re.compile(
+    r"频繁|风控|风险|限流|限制|操作过快|拒绝访问|rate.?limit|too many|forbidden|denied",
+    re.I,
+)
+
+
+def _looks_rate_limited(text):
+    return bool(_RISK_RE.search(str(text or "")))
+
+
+def _pan_throttle(drive="115", gap=None):
+    """距上次同盘请求不足 gap 则等待；冷却中返回 (False, 剩余秒)。
+    成功返回 (True, 0)。时间戳在锁内预约，sleep 在锁外。"""
+    gap = _PAN_GAP if gap is None else gap
+    with _PAN_TS_LOCK:
+        now = time.time()
+        until = _PAN_BLOCK.get(drive, 0)
+        if now < until:
+            return False, max(1, int(until - now))
+        last = _PAN_LAST.get(drive, 0)
+        start = max(now, last + gap)
+        _PAN_LAST[drive] = start
+        wait = start - now
+    if wait > 0:
+        time.sleep(wait)
+    return True, 0
+
+
+def _pan_is_blocked(drive="115"):
+    with _PAN_TS_LOCK:
+        return time.time() < _PAN_BLOCK.get(drive, 0)
+
+
+def _pan_block(drive="115", secs=None):
+    with _PAN_TS_LOCK:
+        _PAN_BLOCK[drive] = time.time() + (secs or _PAN_COOLDOWN)
+        _PAN_FAILS[:] = []
+
+
+def _pan_note_fail(drive="115"):
+    """记录一次失败；窗内达限则熔断并返回 True。"""
+    now = time.time()
+    with _PAN_TS_LOCK:
+        _PAN_FAILS[:] = [t for t in _PAN_FAILS if now - t < _PAN_FAIL_WINDOW]
+        _PAN_FAILS.append(now)
+        if len(_PAN_FAILS) >= _PAN_FAIL_LIMIT:
+            _PAN_BLOCK[drive] = now + _PAN_COOLDOWN
+            _PAN_FAILS[:] = []
+            return True
+    return False
+
+
+def _resolve_cache_get(key):
+    with _RESOLVE_CACHE_LOCK:
+        hit = _RESOLVE_CACHE.get(key)
+        if not hit:
+            return None
+        exp, val = hit
+        if time.time() >= exp:
+            _RESOLVE_CACHE.pop(key, None)
+            return None
+        return val
+
+
+def _resolve_cache_set(key, val, ttl=None):
+    with _RESOLVE_CACHE_LOCK:
+        now = time.time()
+        if len(_RESOLVE_CACHE) > 64:
+            for k in [k for k, (e, _) in _RESOLVE_CACHE.items() if e <= now]:
+                _RESOLVE_CACHE.pop(k, None)
+            if len(_RESOLVE_CACHE) > 64:
+                for k in sorted(_RESOLVE_CACHE, key=lambda k: _RESOLVE_CACHE[k][0])[:32]:
+                    _RESOLVE_CACHE.pop(k, None)
+        _RESOLVE_CACHE[key] = (now + (ttl or _RESOLVE_TTL), val)
+
+
 def _download_image_b64(url, timeout=10):
     if requests is None:
         return ""
@@ -1425,7 +1515,9 @@ def _list_share_videos(share_url, drive_type):
         return hit
     videos = list_share_videos(share_url, drive_type) or []
     videos = _pick_main_group(videos)
-    _cache_set(key, videos)
+    # 只缓存非空：失败/风控冷却期返回的 [] 不进 12h 缓存，避免整场戏 12h 无选集
+    if videos:
+        _cache_set(key, videos)
     return videos
 
 
@@ -1444,7 +1536,8 @@ def _build_episode_play_url(share_url, videos):
             "n": raw,
             "h": str(v.get("sha") or ""),
         })
-        parts.append("%s$%s" % (_sanitize_ep_name(label), _sanitize_play_url(eid)))
+        # label 已在 _ep_label 内消毒，这里不再二次 _sanitize_ep_name（防二次截断砍掉扩展名）
+        parts.append("%s$%s" % (label, _sanitize_play_url(eid)))
     return "#".join(parts)
 
 
@@ -1553,10 +1646,12 @@ def _sanitize_play_url(url=""):
 
 
 def _sanitize_ep_name(name=""):
-    """选集名消毒：去掉分隔符，限长。"""
+    """选集名消毒：去掉分隔符；超长时中间省略、保尾（扩展名永不丢）。"""
     s = re.sub(r"[$#\r\n]+", " ", str(name or ""))
     s = re.sub(r"\s+", " ", s).strip()
-    return s[:80]
+    if len(s) <= 120:
+        return s
+    return s[:93] + "..." + s[-24:]
 
 
 def _format_size(n):
@@ -1787,7 +1882,9 @@ class _M115Crypto:
 
 
 def _115_share_downurl(session, code, pwd, fid):
-    """分享文件直链：proapi.115.com/app/share/downurl（不依赖个人盘 pickcode）。"""
+    """分享文件直链：proapi.115.com/app/share/downurl（不依赖个人盘 pickcode）。
+    失败时把服务端错误原因写入 _LAST_115_ERR；识别风控关键词立即冷却。"""
+    global _LAST_115_ERR
     if not _HAS_CRYPTO or requests is None:
         return ""
     crypto = _M115Crypto()
@@ -1823,18 +1920,31 @@ def _115_share_downurl(session, code, pwd, fid):
         )
         resp = r.json()
     except Exception:
+        _LAST_115_ERR = "115 直链请求异常（网络/超时）"
+        _pan_note_fail("115")
         return ""
     if not isinstance(resp, dict):
         return ""
     if resp.get("state") is False:
+        err = " ".join(str(resp.get(k) or "") for k in ("error", "errno", "message", "msg"))
+        if _looks_rate_limited(err):
+            _pan_block("115")
+            _LAST_115_ERR = "115 接口风控拦截，请稍后再试"
+        else:
+            _LAST_115_ERR = ("115 获取直链失败" + ("（%s）" % err[:60] if err else ""))
+            _pan_note_fail("115")
         return ""
     enc_resp = resp.get("data")
     if not isinstance(enc_resp, str) or not enc_resp:
+        _LAST_115_ERR = "115 直链响应为空"
+        _pan_note_fail("115")
         return ""
     try:
         plain = crypto.decode(enc_resp)
         obj = json.loads(plain.decode("utf-8", "ignore"))
     except Exception:
+        _LAST_115_ERR = "115 直链解密失败"
+        _pan_note_fail("115")
         return ""
     if not isinstance(obj, dict):
         return ""
@@ -1846,6 +1956,8 @@ def _115_share_downurl(session, code, pwd, fid):
     for k in ("play_url", "download_url", "file_url"):
         if obj.get(k):
             return str(obj[k])
+    _LAST_115_ERR = "115 直链响应无播放地址"
+    _pan_note_fail("115")
     return ""
 
 
@@ -2389,6 +2501,8 @@ def _115_collect_videos(session, code, pwd, out, cid="0", depth=0):
     """递归收集 115 分享内全部视频到 out（[{name,fid}]），深度/数量封顶。"""
     if depth > 3 or len(out) >= 50:
         return
+    if _pan_is_blocked("115"):
+        return
     data = _json_get(
         session,
         "https://webapi.115.com/share/snap",
@@ -2451,20 +2565,32 @@ def _115_list_videos(share_url=""):
     code = m.group(1)
     mp = re.search(r"[?&]password=([0-9A-Za-z]+)", u or "")
     pwd = mp.group(1) if mp else ""
+    if _pan_is_blocked("115"):
+        return []
+    # 入口节流 + 与 resolve 同一把单飞锁（防详情页多分享连发打爆 API）
+    ok, _ = _pan_throttle("115")
+    if not ok:
+        return []
     s = _new_pan_session("115")
     out = []
-    _115_collect_videos(s, code, pwd, out)
+    with _PAN_115_LOCK:
+        if _pan_is_blocked("115"):
+            return []
+        _115_collect_videos(s, code, pwd, out)
     return out
 
 
 def _115_probe_stream(session, url, referer="https://115.com/"):
-    """探活直链，成功 (url, header)。"""
+    """探活直链，成功 (url, header)。
+    Range 只用于探活请求本身（避免登记整文件下载），绝不写入返回给播放器的 header。"""
     h = {"User-Agent": SITE_UA, "Referer": referer or "https://115.com/"}
     cookie = _cookie_header_for(session, url)
     if cookie:
         h["Cookie"] = cookie
+    req_h = dict(h)
+    req_h["Range"] = "bytes=0-31"
     try:
-        r = session.get(url, headers=h, timeout=15, verify=False, stream=True)
+        r = session.get(url, headers=req_h, timeout=15, verify=False, stream=True)
         status = r.status_code
         head = b""
         try:
@@ -2494,7 +2620,9 @@ def resolve_115_share(share_url="", fid=""):
       snap(+receive_code) 列文件拿 fid
       → 优先 proapi share/downurl（RSA 加密，登录 Cookie）
       → 个人盘 search 有 pc 时再试 m3u8 / files/video
+    防风控：直链结果缓存(TTL 300s) + 1.2s 节流 + 冷却熔断 + 全程单飞。
     """
+    global _LAST_115_ERR
     if requests is None:
         return None
     u = normalize_share_url(share_url)
@@ -2505,88 +2633,170 @@ def resolve_115_share(share_url="", fid=""):
     mp = re.search(r"[?&]password=([0-9A-Za-z]+)", u or "")
     pwd = mp.group(1) if mp else ""
 
-    s = _new_pan_session("115")
-    fname = ""
     fid = str(fid or "").strip()
-    if not fid:
-        target = _115_snap_list(s, code, pwd)
-        if not target:
+    cache_key = "r115:%s|%s|%s" % (code, pwd, fid)
+    hit = _resolve_cache_get(cache_key)
+    if hit:
+        return hit
+
+    # 冷却中：不发任何请求，直接报原因
+    if _pan_is_blocked("115"):
+        left = 0
+        with _PAN_TS_LOCK:
+            left = max(1, int(_PAN_BLOCK.get("115", 0) - time.time()))
+        _LAST_115_ERR = "115 触发风控冷却中，请 %d 秒后再试" % left
+        return None
+
+    with _PAN_115_LOCK:
+        # 错误状态清空放在锁内，避免并发解析互相清掉对方刚写入的失败原因
+        _LAST_115_ERR = ""
+        # 单飞双检：排队期间可能已被前一个请求填好缓存
+        hit = _resolve_cache_get(cache_key)
+        if hit:
+            return hit
+        if _pan_is_blocked("115"):
+            left = 0
+            with _PAN_TS_LOCK:
+                left = max(1, int(_PAN_BLOCK.get("115", 0) - time.time()))
+            _LAST_115_ERR = "115 触发风控冷却中，请 %d 秒后再试" % left
             return None
-        fname = target["name"]
-        fid = target["fid"]
 
-    # 分享直链（不需个人盘副本）
-    direct = _115_share_downurl(s, code, pwd, fid)
-    if direct:
-        got = _115_probe_stream(s, direct, referer="https://115.com/s/%s" % code)
-        if got:
-            return got
+        s = _new_pan_session("115")
+        fname = ""
+        if not fid:
+            ok, _ = _pan_throttle("115")
+            if not ok:
+                if _pan_is_blocked("115"):
+                    left = 0
+                    with _PAN_TS_LOCK:
+                        left = max(1, int(_PAN_BLOCK.get("115", 0) - time.time()))
+                    _LAST_115_ERR = "115 触发风控冷却中，请 %d 秒后再试" % left
+                return None
+            target = _115_snap_list(s, code, pwd)
+            if not target:
+                if not _LAST_115_ERR:
+                    _LAST_115_ERR = "115 分享目录获取失败"
+                return None
+            fname = target["name"]
+            fid = target["fid"]
+            cache_key = "r115:%s|%s|%s" % (code, pwd, fid)
+            hit = _resolve_cache_get(cache_key)
+            if hit:
+                return hit
+        else:
+            # 有 fid 时兜底链需要文件名：从选集列表缓存按 fid 反查（不发网络请求）
+            for v in (_cache_get("eps:%s" % u) or []):
+                if str(v.get("fid") or "") == fid:
+                    fname = str(v.get("name") or "")
+                    break
 
-    # 个人盘按文件名搜 pickcode（用户已转存/接收时可用，m3u8 更稳）；无 fname 则跳过
-    pc = ""
-    if fname:
+        # 分享直链（不需个人盘副本）
+        ok, _ = _pan_throttle("115")
+        if not ok:
+            if _pan_is_blocked("115"):
+                left = 0
+                with _PAN_TS_LOCK:
+                    left = max(1, int(_PAN_BLOCK.get("115", 0) - time.time()))
+                _LAST_115_ERR = "115 触发风控冷却中，请 %d 秒后再试" % left
+            return None
+        direct = _115_share_downurl(s, code, pwd, fid)
+        if direct:
+            got = _115_probe_stream(s, direct, referer="https://115.com/s/%s" % code)
+            if got:
+                _resolve_cache_set(cache_key, got)
+                return got
+
+        # downurl 失败且已冷却 → 不再打兜底（避免风控期间连环请求）
+        if _pan_is_blocked("115"):
+            if not _LAST_115_ERR:
+                left = 0
+                with _PAN_TS_LOCK:
+                    left = max(1, int(_PAN_BLOCK.get("115", 0) - time.time()))
+                _LAST_115_ERR = "115 触发风控冷却中，请 %d 秒后再试" % left
+            return None
+
+        # 个人盘按文件名搜 pickcode（用户已转存/接收时可用，m3u8 更稳）；无 fname 则跳过
+        pc = ""
+        if fname:
+            ok, _ = _pan_throttle("115")
+            if not ok:
+                return None
+            data = _json_get(
+                s,
+                "https://webapi.115.com/files/search",
+                params={"search_value": fname, "offset": "0", "limit": "115", "aid": "1", "cid": "0", "format": "json"},
+                headers={"Referer": "https://115.com/"},
+            )
+            if isinstance(data, dict):
+                raw_list = data.get("data")
+                if isinstance(raw_list, list):
+                    lst = raw_list
+                elif isinstance(raw_list, dict):
+                    lst = raw_list.get("list")
+                    if isinstance(lst, dict):
+                        lst = lst.get("list")
+                else:
+                    lst = data.get("list")
+                    if isinstance(lst, dict):
+                        lst = lst.get("list")
+                if isinstance(lst, list):
+                    for it in lst:
+                        if not isinstance(it, dict):
+                            continue
+                        n = str(it.get("n") or it.get("name") or it.get("server_filename") or "")
+                        p = str(it.get("pc") or it.get("pickcode") or "")
+                        if p and (n == fname or _is_video_name(n) or not n):
+                            pc = p
+                            break
+        if not pc:
+            if not _LAST_115_ERR:
+                _LAST_115_ERR = "115 未获取到可播地址（直链与兜底均失败）"
+            return None
+
+        # 优先 m3u8
+        ok, _ = _pan_throttle("115")
+        if not ok:
+            return None
+        m3u8_url = "https://115.com/api/video/m3u8/%s.m3u8" % pc
+        cookie = _cookie_header_for(s, m3u8_url)
+        h = {"User-Agent": SITE_UA, "Referer": "https://115.com/"}
+        if cookie:
+            h["Cookie"] = cookie
+        try:
+            r = s.get(m3u8_url, headers=h, timeout=15, verify=False)
+            body_head = (r.text or "")[:200]
+            if r.status_code == 200 and "#EXTM3U" in body_head:
+                _resolve_cache_set(cache_key, (m3u8_url, h))
+                return m3u8_url, h
+        except Exception:
+            pass
+
+        # 回退 files/video → origin_file_url
+        ok, _ = _pan_throttle("115")
+        if not ok:
+            return None
         data = _json_get(
             s,
-            "https://webapi.115.com/files/search",
-            params={"search_value": fname, "offset": "0", "limit": "115", "aid": "1", "cid": "0", "format": "json"},
+            "https://webapi.115.com/files/video",
+            params={"pickcode": pc, "format": "json"},
             headers={"Referer": "https://115.com/"},
         )
+        origin = ""
         if isinstance(data, dict):
-            raw_list = data.get("data")
-            if isinstance(raw_list, list):
-                lst = raw_list
-            elif isinstance(raw_list, dict):
-                lst = raw_list.get("list")
-                if isinstance(lst, dict):
-                    lst = lst.get("list")
-            else:
-                lst = data.get("list")
-                if isinstance(lst, dict):
-                    lst = lst.get("list")
-            if isinstance(lst, list):
-                for it in lst:
-                    if not isinstance(it, dict):
-                        continue
-                    n = str(it.get("n") or it.get("name") or it.get("server_filename") or "")
-                    p = str(it.get("pc") or it.get("pickcode") or "")
-                    if p and (n == fname or _is_video_name(n) or not n):
-                        pc = p
-                        break
-    if not pc:
+            payload = data.get("data") if isinstance(data.get("data"), dict) else data
+            if isinstance(payload, dict):
+                origin = str(payload.get("origin_file_url") or payload.get("url") or "")
+        if not origin:
+            if not _LAST_115_ERR:
+                _LAST_115_ERR = "115 未获取到可播地址（直链与兜底均失败）"
+            return None
+        got = _115_probe_stream(s, origin)
+        if got:
+            _resolve_cache_set(cache_key, got)
+            return got
+        if not _LAST_115_ERR:
+            _LAST_115_ERR = "115 未获取到可播地址（直链与兜底均失败）"
         return None
-
-    # 优先 m3u8
-    m3u8_url = "https://115.com/api/video/m3u8/%s.m3u8" % pc
-    cookie = _cookie_header_for(s, m3u8_url)
-    h = {"User-Agent": SITE_UA, "Referer": "https://115.com/"}
-    if cookie:
-        h["Cookie"] = cookie
-    try:
-        r = s.get(m3u8_url, headers=h, timeout=15, verify=False)
-        body_head = (r.text or "")[:200]
-        if r.status_code == 200 and "#EXTM3U" in body_head:
-            return m3u8_url, h
-    except Exception:
-        pass
-
-    # 回退 files/video → origin_file_url
-    data = _json_get(
-        s,
-        "https://webapi.115.com/files/video",
-        params={"pickcode": pc, "format": "json"},
-        headers={"Referer": "https://115.com/"},
-    )
-    origin = ""
-    if isinstance(data, dict):
-        payload = data.get("data") if isinstance(data.get("data"), dict) else data
-        if isinstance(payload, dict):
-            origin = str(payload.get("origin_file_url") or payload.get("url") or "")
-    if not origin:
-        return None
-    got = _115_probe_stream(s, origin)
-    if got:
-        return got
-    return None
 
 
 def resolve_share_media(share_url="", drive_type="", fid=""):
@@ -2916,6 +3126,8 @@ class Spider(BaseSpider):
         msg = "网盘分享无法解析为视频直链（需有效 Cookie 或分享可直链）"
         if drive_type == "baidu" and _LAST_RESOLVE_ERR:
             msg = _LAST_RESOLVE_ERR
+        elif drive_type == "115" and _LAST_115_ERR:
+            msg = _LAST_115_ERR
         return {
             "parse": 0,
             "jx": 0,
