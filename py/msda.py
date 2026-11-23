@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 # msda.py —— FANZA METADATA INDEX (fanza.fastcdn.dpdns.org) 爬虫
 # 参照 javdbui.py 结构：分类/筛选与网页端对齐；磁力 + 115 离线可播放。
 # 网页板块：AV档案(/) / 无码档案(/uncensored) / FC2档案(/fc2) / 发售日历(/calendar)
 # 列表页签：全部新作(lists/new) / 有磁链(lists/links) / 可播(lists/playable)
 # 数据 API：fanza-api.fastcdn.dpdns.org/v1/*；播放解析：站点 /api/rv/v1/resolve
 # 说明：Cloudflare 对普通 requests + Chrome UA 直接 403；优先 curl_cffi 指纹，无指纹时改 okhttp 头兜底。
+# v1.0.4 查验修复：①日历分页锁死 199（total 被 limit 截断）→ 单次拉 500 本地分页、total/pagecount 精确；②时长全链路缺失（duration_sec 在 versions[] 非顶层）→ _work_duration 取版本时长，恒秒转分废除 >10000 启发式（3664 分钟误显消失）；③FC2-* 反查硬编码 class=av 必空 → 按前缀选类+跨类兜底；④playerContent 裸番号分支只认 115 → 115→磁力→预览→在线 四级回退，终兜底带 msg 不再空 url 黑屏；⑤429 移出自动重试（对齐网页）；⑥task_del 删后确认 max_page=2 漏深页误判「已删」→ max_page=0 按 page_count 全页扫（上限 30 页）；⑦日历筛选补未来 14 天「预定」（接口实测有数据）；⑧has_source 消费为「有源」徽章；⑨分类名/顺序对齐网页（AV 档案→FC2 档案→无码档案）+ 筛选同步；⑩时间窗收敛 7/14/30；⑪删 _api_action 死字段；⑫_search_pagecount 用 search_limit、搜索 fetch 触顶 500、空页 pagecount 收口；⑬_vid_meta 超 128 淘汰最旧 1/4。
 # v1.0.3 115 离线可用性：①失败任务不再永久卡死——ac=task_del(hash[0]) 删旧后自动重提；②/v1/links 失败/error 不写 120s 空缓存；③等待超时可配 ext.offlinePollTimeout（默认 20s），文案改为「云端下载中非失败」；④详情标注无做种/源站无磁链。
 # v1.0.2 详情/磁力/115 对齐参照与网页：①size_bytes 误当 MB 致标签「7235174.40GB」→ 换算成 MB（6.90GB），115 命名不再带天文数字；②实体字段 name_ja（非 name）→ 演员/类别/简介恢复；③磁力只用 hash 重建+公共 tracker（去上游 dn=），115 用裸 btih，与 javdbui 同构；④vod_blurb 按 番号|日期|片商|导演|演员。
 # v1.0.1 修复应用侧（无 curl_cffi）分类空列表：Chrome UA 被 CF 打回 403 HTML → 无指纹时用 okhttp 头，403/HTML/JSON 失败自动换头重试。
@@ -71,6 +72,12 @@ RESOLVE_PREFIX = "http://msdars/"
 
 PAGE_SIZE = 24
 SEARCH_LIMIT = 30
+# 日历单日全量上限：接口 total 被 limit 截断，一次拉全后本地分页才能拿到真实总量
+CALENDAR_FETCH_MAX = 500
+# 搜索单次拉取上限（page*limit 线性增长的护栏；30*17=510 → 深页封顶）
+SEARCH_FETCH_MAX = 500
+# 115 离线任务列表扫描上限（删除确认按 page_count 全页扫，防失控）
+OFFLINE_FIND_MAX_PAGES = 30
 
 # 网页板块 type_id → 上游 class 参数（注意：上游认 uncensored，不认 uc）
 # resolve 的 type 参数另用 av/uc/fc2（前端 Hn 映射）
@@ -82,7 +89,8 @@ CONTENT_CLASSES = ("av", "uncensored", "fc2")
 
 HTTP_RETRY = 1
 HTTP_RETRY_DELAY = 0.5
-HTTP_RETRY_STATUS = (429, 500, 502, 503, 504)
+# 429 不自动重试（对齐网页端「HTTP 429 · 不自动重试」），避免限流时反复打接口
+HTTP_RETRY_STATUS = (500, 502, 503, 504)
 
 WEB_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
           "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -315,27 +323,6 @@ def _magnet_label(g, idx):
     return " ".join(parts) or ("磁力%d" % (idx + 1))
 
 
-def _dur_match(d, bucket):
-    """时长档客户端判定（服务端实体 key 不支持时长 → _entity_grid_dur 用）。
-    档位边界对齐服务端实测：lt-45=10~44 / 45-90=45~90 / 90-120=91~120 / gt-120=121~。
-    d<=0（缺时长）一律不命中，避免脏数据混入。"""
-    try:
-        d = int(d)
-    except (TypeError, ValueError):
-        return False
-    if d <= 0:
-        return False
-    if bucket == "lt-45":
-        return d < 45
-    if bucket == "45-90":
-        return 45 <= d <= 90
-    if bucket == "90-120":
-        return 90 < d <= 120
-    if bucket == "gt-120":
-        return d > 120
-    return False
-
-
 # ==================== 日期工具 ====================
 
 def _today():
@@ -555,365 +542,6 @@ def _set_cookie_text(set_cookie):
     return "; ".join(str(v).split(";")[0].strip() for v in set_cookie if str(v).split(";")[0].strip())
 
 
-# ==================== AI 封面 AES-128-CBC ====================
-# GET /api/v/drama/cover-key → {algorithm:"AES-128-CBC", padding:"none",
-# input:"raw-bytes", key:"...", iv:"..."}；key/iv 是 **16 个 ASCII 字符**（不是 hex）。
-# 后端优先级：cryptography → PyCryptodome → 纯 Python（TVBox 运行时可能两者皆无）。
-_AES_BACKEND = []
-_AES_SBOX_HEX = (
-    "637c777bf26b6fc53001672bfed7ab76ca82c97dfa5947f0add4a2af9ca472c0"
-    "b7fd9326363ff7cc34a5e5f171d8311504c723c31896059a071280e2eb27b275"
-    "09832c1a1b6e5aa0523bd6b329e32f8453d100ed20fcb15b6acbbe394a4c58cf"
-    "d0efaafb434d338545f9027f503c9fa851a3408f929d38f5bcb6da2110fff3d2"
-    "cd0c13ec5f974417c4a77e3d645d197360814fdc222a908846eeb814de5e0bdb"
-    "e0323a0a4906245cc2d3ac629195e479e7c8376d8dd54ea96c56f4ea657aae08"
-    "ba78252e1ca6b4c6e8dd741f4bbd8b8a703eb5664803f60e613557b986c11d9e"
-    "e1f8981169d98e949b1e87e9ce5528df8ca1890dbfe6426841992d0fb054bb16"
-)
-_AES_SBOX = [int(_AES_SBOX_HEX[i:i + 2], 16) for i in range(0, 512, 2)]
-_AES_INV_SBOX = [0] * 256
-for _i, _v in enumerate(_AES_SBOX):
-    _AES_INV_SBOX[_v] = _i
-
-
-def _aes_backend():
-    """可用的 AES-128-CBC 后端名；探测一次后缓存（纯 Python 恒可用）。
-    顺序：Android/TVBox（Chaquopy）的 javax.crypto → cryptography → PyCryptodome
-    → 纯 Python。盒子/电视上前两者通常都没有，纯 Python 约 110KB/s，一张 270KB
-    封面要 2.5s，一页 6 张直接撞宿主 15s 超时 → AI 栏目整片无图；走 Java 侧
-    native AES 只要几毫秒，是 AI 封面在真机上唯一能稳稳出图的路径。"""
-    if _AES_BACKEND:
-        return _AES_BACKEND[0]
-    name = "pure"
-    try:
-        from javax.crypto import Cipher  # noqa: F401
-        name = "java"
-    except Exception:
-        try:
-            from cryptography.hazmat.primitives.ciphers import Cipher  # noqa: F401
-            name = "cryptography"
-        except Exception:
-            try:
-                from Crypto.Cipher import AES  # noqa: F401
-                name = "crypto"
-            except Exception:
-                name = "pure"
-    _AES_BACKEND.append(name)
-    return name
-
-
-def _aes_xtime(a):
-    a <<= 1
-    return (a ^ 0x11B) & 0xFF if a & 0x100 else a & 0xFF
-
-
-def _aes_mul(a, b):
-    r = 0
-    for _ in range(8):
-        if b & 1:
-            r ^= a
-        a = _aes_xtime(a)
-        b >>= 1
-    return r
-
-
-def _aes_expand(key):
-    """AES-128 密钥扩展 → 176 字节轮密钥。"""
-    w = list(key)
-    rcon = 1
-    while len(w) < 176:
-        t = w[-4:]
-        if len(w) % 16 == 0:
-            t = [_AES_SBOX[t[1]] ^ rcon, _AES_SBOX[t[2]],
-                 _AES_SBOX[t[3]], _AES_SBOX[t[0]]]
-            rcon = _aes_xtime(rcon)
-        for i in range(4):
-            w.append(w[-16] ^ t[i])
-    return w
-
-
-_AES_MUL_TBL = {}
-_AES_TD = None          # (Td0, Td1, Td2, Td3) 懒构建
-_AES_TD_CACHE = {}      # key(16B) → (rk, td, rk_mix)
-
-
-def _aes_mul_tbl():
-    if not _AES_MUL_TBL:
-        for n in (9, 11, 13, 14):
-            _AES_MUL_TBL[n] = [_aes_mul(i, n) for i in range(256)]
-    return _AES_MUL_TBL
-
-
-def _aes_td_tables():
-    """Td0..Td3：InvSubBytes+InvMixColumns 折叠成 4 张 256 项 32 位表（懒构建一次）。"""
-    global _AES_TD
-    if _AES_TD is None:
-        t = _aes_mul_tbl()
-        m9, m11, m13, m14 = t[9], t[11], t[13], t[14]
-        inv = _AES_INV_SBOX
-        Td0 = [0] * 256
-        Td1 = [0] * 256
-        Td2 = [0] * 256
-        Td3 = [0] * 256
-        for x in range(256):
-            s = inv[x]
-            # InvMixColumns 矩阵 [0e 0b 0d 09 / 09 0e 0b 0d / 0d 09 0e 0b / 0b 0d 09 0e]
-            Td0[x] = (m14[s] | (m9[s] << 8) | (m13[s] << 16) | (m11[s] << 24))
-            Td1[x] = (m11[s] | (m14[s] << 8) | (m9[s] << 16) | (m13[s] << 24))
-            Td2[x] = (m13[s] | (m11[s] << 8) | (m14[s] << 16) | (m9[s] << 24))
-            Td3[x] = (m9[s] | (m13[s] << 8) | (m11[s] << 16) | (m14[s] << 24))
-        _AES_TD = (Td0, Td1, Td2, Td3)
-    return _AES_TD
-
-
-def _aes_inv_mix4(col, t):
-    """单列 4 字节 InvMixColumns。"""
-    m9, m11, m13, m14 = t[9], t[11], t[13], t[14]
-    a, b, c, d = col
-    return (m14[a] ^ m11[b] ^ m13[c] ^ m9[d],
-            m9[a] ^ m14[b] ^ m11[c] ^ m13[d],
-            m13[a] ^ m9[b] ^ m14[c] ^ m11[d],
-            m11[a] ^ m13[b] ^ m9[c] ^ m14[d])
-
-
-def _aes_prep(key):
-    """展开轮密钥 + Td 表 + 预混轮密钥（InvMixColumns 线性，可提前混好）。"""
-    rk = _aes_expand(key)
-    td = _aes_td_tables()
-    t = _aes_mul_tbl()
-    rk_mix = [None] * 10          # 1..9 用
-    for rnd in range(1, 10):
-        k = rk[rnd * 16:(rnd + 1) * 16]
-        mixed = []
-        for c in range(4):
-            mixed.extend(_aes_inv_mix4(k[c * 4:c * 4 + 4], t))
-        rk_mix[rnd] = mixed
-    return rk, td, rk_mix
-
-
-def _aes_get_prep(key):
-    cached = _AES_TD_CACHE.get(key)
-    if cached is None:
-        cached = _aes_prep(key)
-        if len(_AES_TD_CACHE) > 8:
-            _AES_TD_CACHE.clear()
-        _AES_TD_CACHE[key] = cached
-    return cached
-
-
-def _aes_dec_block(rk, td, rk_mix, blk):
-    """T-table 单块解密：AddRoundKey(10) → 9 轮 Td 查表+预混轮密钥 → 末轮。"""
-    Td0, Td1, Td2, Td3 = td
-    s0 = blk[0] ^ rk[160]; s1 = blk[1] ^ rk[161]
-    s2 = blk[2] ^ rk[162]; s3 = blk[3] ^ rk[163]
-    s4 = blk[4] ^ rk[164]; s5 = blk[5] ^ rk[165]
-    s6 = blk[6] ^ rk[166]; s7 = blk[7] ^ rk[167]
-    s8 = blk[8] ^ rk[168]; s9 = blk[9] ^ rk[169]
-    s10 = blk[10] ^ rk[170]; s11 = blk[11] ^ rk[171]
-    s12 = blk[12] ^ rk[172]; s13 = blk[13] ^ rk[173]
-    s14 = blk[14] ^ rk[174]; s15 = blk[15] ^ rk[175]
-    for rnd in range(9, 0, -1):
-        # InvShiftRows
-        s1, s5, s9, s13 = s13, s1, s5, s9
-        s2, s6, s10, s14 = s10, s14, s2, s6
-        s3, s7, s11, s15 = s7, s11, s15, s3
-        km = rk_mix[rnd]
-        # 列 0
-        t = Td0[s0] ^ Td1[s1] ^ Td2[s2] ^ Td3[s3]
-        s0 = (t & 0xFF) ^ km[0]; s1 = ((t >> 8) & 0xFF) ^ km[1]
-        s2 = ((t >> 16) & 0xFF) ^ km[2]; s3 = ((t >> 24) & 0xFF) ^ km[3]
-        # 列 1
-        t = Td0[s4] ^ Td1[s5] ^ Td2[s6] ^ Td3[s7]
-        s4 = (t & 0xFF) ^ km[4]; s5 = ((t >> 8) & 0xFF) ^ km[5]
-        s6 = ((t >> 16) & 0xFF) ^ km[6]; s7 = ((t >> 24) & 0xFF) ^ km[7]
-        # 列 2
-        t = Td0[s8] ^ Td1[s9] ^ Td2[s10] ^ Td3[s11]
-        s8 = (t & 0xFF) ^ km[8]; s9 = ((t >> 8) & 0xFF) ^ km[9]
-        s10 = ((t >> 16) & 0xFF) ^ km[10]; s11 = ((t >> 24) & 0xFF) ^ km[11]
-        # 列 3
-        t = Td0[s12] ^ Td1[s13] ^ Td2[s14] ^ Td3[s15]
-        s12 = (t & 0xFF) ^ km[12]; s13 = ((t >> 8) & 0xFF) ^ km[13]
-        s14 = ((t >> 16) & 0xFF) ^ km[14]; s15 = ((t >> 24) & 0xFF) ^ km[15]
-    # 末轮：InvShiftRows + InvSubBytes + AddRoundKey(0)
-    s1, s5, s9, s13 = s13, s1, s5, s9
-    s2, s6, s10, s14 = s10, s14, s2, s6
-    s3, s7, s11, s15 = s7, s11, s15, s3
-    inv = _AES_INV_SBOX
-    return [inv[s0] ^ rk[0], inv[s1] ^ rk[1],
-            inv[s2] ^ rk[2], inv[s3] ^ rk[3],
-            inv[s4] ^ rk[4], inv[s5] ^ rk[5],
-            inv[s6] ^ rk[6], inv[s7] ^ rk[7],
-            inv[s8] ^ rk[8], inv[s9] ^ rk[9],
-            inv[s10] ^ rk[10], inv[s11] ^ rk[11],
-            inv[s12] ^ rk[12], inv[s13] ^ rk[13],
-            inv[s14] ^ rk[14], inv[s15] ^ rk[15]]
-
-
-def _aes_pure_decrypt(data, key, iv):
-    """纯 Python AES-128-CBC 解密（padding none），T-table 加速，逐块与前块异或。"""
-    rk, td, rk_mix = _aes_get_prep(key)
-    out = bytearray(len(data))
-    prev0, prev1, prev2, prev3 = iv[0], iv[1], iv[2], iv[3]
-    prev4, prev5, prev6, prev7 = iv[4], iv[5], iv[6], iv[7]
-    prev8, prev9, prev10, prev11 = iv[8], iv[9], iv[10], iv[11]
-    prev12, prev13, prev14, prev15 = iv[12], iv[13], iv[14], iv[15]
-    n = len(data)
-    for off in range(0, n, 16):
-        blk = data[off:off + 16]
-        dec = _aes_dec_block(rk, td, rk_mix, blk)
-        out[off] = dec[0] ^ prev0; out[off + 1] = dec[1] ^ prev1
-        out[off + 2] = dec[2] ^ prev2; out[off + 3] = dec[3] ^ prev3
-        out[off + 4] = dec[4] ^ prev4; out[off + 5] = dec[5] ^ prev5
-        out[off + 6] = dec[6] ^ prev6; out[off + 7] = dec[7] ^ prev7
-        out[off + 8] = dec[8] ^ prev8; out[off + 9] = dec[9] ^ prev9
-        out[off + 10] = dec[10] ^ prev10; out[off + 11] = dec[11] ^ prev11
-        out[off + 12] = dec[12] ^ prev12; out[off + 13] = dec[13] ^ prev13
-        out[off + 14] = dec[14] ^ prev14; out[off + 15] = dec[15] ^ prev15
-        prev0, prev1, prev2, prev3 = blk[0], blk[1], blk[2], blk[3]
-        prev4, prev5, prev6, prev7 = blk[4], blk[5], blk[6], blk[7]
-        prev8, prev9, prev10, prev11 = blk[8], blk[9], blk[10], blk[11]
-        prev12, prev13, prev14, prev15 = blk[12], blk[13], blk[14], blk[15]
-    return bytes(out)
-
-
-def _aes128_cbc_decrypt(data, key, iv):
-    """AES-128-CBC 解密（上游 padding none）。失败返回 b""。"""
-    data = bytes(data or b"")
-    key = bytes(key or b"")
-    iv = bytes(iv or b"")
-    if not data or len(data) % 16 or len(key) != 16 or len(iv) != 16:
-        return b""
-    backend = _aes_backend()
-    if backend == "java":
-        # Chaquopy：Java 侧 native AES，GIL 还会在此期间释放，多图并发不吃亏；
-        # 失败（个别 ROM 缺 provider）就回落到纯 Python，不能直接返回空图。
-        try:
-            from javax.crypto import Cipher
-            from javax.crypto.spec import SecretKeySpec, IvParameterSpec
-            c = Cipher.getInstance("AES/CBC/NoPadding")
-            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"),
-                   IvParameterSpec(iv))
-            out = c.doFinal(data)
-            if isinstance(out, (bytes, bytearray)):
-                return bytes(out)
-            return bytes(bytearray(out))     # jarray('b') 兜底
-        except Exception:
-            return _aes_pure_decrypt(data, key, iv)
-    try:
-        if backend == "cryptography":
-            from cryptography.hazmat.primitives.ciphers import (
-                Cipher, algorithms, modes)
-            d = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
-            return d.update(data) + d.finalize()
-        if backend == "crypto":
-            from Crypto.Cipher import AES
-            return AES.new(key, AES.MODE_CBC, iv).decrypt(data)
-    except Exception:
-        return _aes_pure_decrypt(data, key, iv)
-    return _aes_pure_decrypt(data, key, iv)
-
-
-# ==================== 自建封面 HTTP 服务 ====================
-# 为什么不再依赖宿主：AI 封面是 AES 密文，只能由爬虫解密后交给 App，而可选交付方式
-# 各有硬伤——data URI 在多数电视端图片库/播放器里不渲染（300KB 级 data URI 还会撞
-# URL 长度上限）；宿主 localProxy 要求 App 把 ?do=py 路由到 Python 爬虫，部分 32 位
-# 电视端根本没接这条路由，表现就是「别的分类有图、AI 栏目一张不出」。
-# 这里直接用标准库起一个只监听 127.0.0.1 的图片服务：App 拿到的就是一条普普通通的
-# 短 http 图片地址，和自己能出图的明文封面走完全相同的取图链路。
-_PIC_SRV = {"tried": False, "base": "", "spider": None}
-_PIC_SRV_LOCK = threading.Lock()
-
-
-def _pic_server_base(spider):
-    """惰性启动本地图片服务；成功返回 http://127.0.0.1:port，失败返回 ""。
-    spider 每次都刷新：宿主 destroy 后重建实例时，服务线程要取到新会话。"""
-    _PIC_SRV["spider"] = spider
-    if _PIC_SRV["tried"]:
-        return _PIC_SRV["base"]
-    with _PIC_SRV_LOCK:
-        if _PIC_SRV["tried"]:
-            return _PIC_SRV["base"]
-        _PIC_SRV["tried"] = True
-        try:
-            try:
-                from http.server import (BaseHTTPRequestHandler,
-                                         ThreadingHTTPServer)
-            except ImportError:      # Python 3.6 没有 ThreadingHTTPServer
-                import socketserver
-                from http.server import BaseHTTPRequestHandler, HTTPServer
-
-                class ThreadingHTTPServer(socketserver.ThreadingMixIn,
-                                          HTTPServer):
-                    daemon_threads = True
-
-            class _PicHandler(BaseHTTPRequestHandler):
-                server_version = "javdbui-pic"
-
-                def log_message(self, fmt, *args):
-                    pass                    # 电视端 stdout 很贵，别刷日志
-
-                def _serve(self, with_body):
-                    path = (self.path or "").split("?", 1)[0]
-                    body, mime = b"", ""
-                    if path.startswith("/pic/"):
-                        tok = path[len("/pic/"):]
-                        if tok.lower().endswith(".jpg"):   # 个别图片库认扩展名
-                            tok = tok[:-4]
-                        src = Spider._unpack_pic_token(tok)
-                        cur = _PIC_SRV.get("spider")
-                        if src and cur is not None:
-                            try:
-                                body, mime = cur._fetch_pic(src)
-                            except Exception:
-                                body, mime = b"", ""   # 单张失败只回 404，别打死线程
-                    if not body:
-                        self.send_error(404)
-                        return
-                    self.send_response(200)
-                    self.send_header("Content-Type", mime or "image/jpeg")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.send_header("Cache-Control", "public, max-age=1800")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
-                    if with_body:
-                        self.wfile.write(body)
-
-                def do_GET(self):
-                    self._serve(True)
-
-                def do_HEAD(self):
-                    self._serve(False)
-
-            httpd = ThreadingHTTPServer(("127.0.0.1", 0), _PicHandler)
-            httpd.daemon_threads = True
-            t = threading.Thread(target=httpd.serve_forever,
-                                 kwargs={"poll_interval": 0.2})
-            t.daemon = True
-            t.start()
-            base = "http://127.0.0.1:%d" % httpd.server_address[1]
-            # 回环自检：个别运行时会「绑定成功但连不上」，探到 404 才算服务活着。
-            # 必须绕开 http_proxy：配了系统代理又没写 no_proxy 时，urllib 会把
-            # 127.0.0.1 也丢给代理，探活会误判成「服务不可用」而白白退化。
-            alive = False
-            try:
-                import urllib.request as _urlreq
-                opener = _urlreq.build_opener(_urlreq.ProxyHandler({}))
-                opener.open(base + "/pic/__probe__", timeout=3)
-            except Exception as e:
-                alive = getattr(e, "code", None) == 404
-            if alive:
-                _PIC_SRV["base"] = base
-            else:
-                try:
-                    httpd.shutdown()
-                except Exception:
-                    pass
-                _PIC_SRV["base"] = ""
-        except Exception:
-            _PIC_SRV["base"] = ""       # 端口/权限受限 → 走后面的兜底
-        return _PIC_SRV["base"]
-
-
 def _shrink_pic(data, mime, max_w=720):
     """Android（Chaquopy）上把 1440x1920 的大封面原生降采样后再缓存/交付。
 
@@ -1008,6 +636,7 @@ class Spider:
         self._work_cache = {}     # id -> (ts, work dict)
         self._magnets_cache = {}  # code -> (ts, [link])
         self._dmm_cache = {}      # number -> (ts, [candidate])；空列表=确定无预览
+        self._cal_cache = {}      # date -> (ts, norm list)；TTL 300s，翻页复用
         self._search_cache = {}   # "kw|class|page" -> (ts, list, total)
         self._search_last = 0.0
         self._search_block_until = 0.0
@@ -1017,7 +646,6 @@ class Spider:
         self._off_last = ""
         self.preview_api = PREVIEW_API
         self.resolve_api = "/api/rv/v1/resolve"
-        self._api_action = ""
 
         # FANZA 有 Cloudflare：curl_cffi TLS 指纹优先；无指纹时用 okhttp 头，避免 Chrome UA 403
         self._plain_ua = False
@@ -1033,16 +661,6 @@ class Spider:
             self.s.headers.update(LIST_HEADERS_PLAIN)
             self._plain_ua = True
             self._apply_proxy()
-
-    def _has_impersonate(self):
-        return (creq is not None
-                and getattr(self.s, "impersonate", None) is not None)
-
-    def _api_headers(self):
-        """有 TLS 指纹用 Chrome 头；无指纹用 okhttp 头（Chrome UA 会 403）。"""
-        if self._has_impersonate():
-            return dict(LIST_HEADERS)
-        return dict(LIST_HEADERS_PLAIN)
 
     def getDependence(self):
         return []
@@ -1205,7 +823,6 @@ class Spider:
         """GET url → dict/list（失败返回 {} / []）。
         FANZA 有 Cloudflare：优先 curl_cffi TLS 指纹；无指纹用 okhttp 头，
         403/HTML 再换头重试一次，避免应用侧（无 curl_cffi）整页空列表。"""
-        self._api_action = ""
         t = timeout or self.timeout
         base = self._api_headers()
         if _to_text(self.cookie):
@@ -1271,13 +888,10 @@ class Spider:
                     return None, _to_text(e)
             return None, "retries_exhausted"
 
-        last_err = ""
         for hdrs in attempts_plan:
-            data, err = _do(hdrs)
+            data, _err = _do(hdrs)
             if data is not None:
                 return data if isinstance(data, dict) else {}
-            last_err = err
-        self._api_action = last_err
         return {}
 
     def _api_get(self, path, params=None, timeout=None):
@@ -1296,7 +910,50 @@ class Spider:
         """GET HOST + path（预览/resolve 等站点相对接口）"""
         return self._http_get(self.host + path, params=params, timeout=timeout)
 
+    def _site_get_raw(self, path, params=None, timeout=None):
+        """GET HOST + path → {status_code, text}（不解析 JSON）。
+        供需要 HTTP 状态码判定的调用方（如 _dmm_candidates 负缓存）。"""
+        return self._http_get(self.host + path, params=params, timeout=timeout,
+                              as_json=False)
+
     # ---------- work 对象 → vod item ----------
+    @staticmethod
+    def _work_duration(work):
+        """时长取值：FANZA 不在 work 顶层给 duration_sec，而在 versions[] 里
+        （网页端取法：当前版本 → 首个有值的版本）。统一返回秒，无值 0。"""
+        if not isinstance(work, dict):
+            return 0
+        d = _safe_int(work.get("duration_sec"), 0)
+        if d > 0:
+            return d
+        for v in work.get("versions") or []:
+            if isinstance(v, dict):
+                d = _safe_int(v.get("duration_sec"), 0)
+                if d > 0:
+                    return d
+        return 0
+
+    def _vid_meta_put(self, vid, meta):
+        """写 vid→meta：先删后写保证键序=访问序（dict 保序，首键即最旧）；
+        超 128 条淘汰最旧 1/4，防长会话浏览时无界增长。"""
+        self._vid_meta.pop(vid, None)
+        self._vid_meta[vid] = meta
+        if len(self._vid_meta) > 128:
+            for _ in range(max(1, len(self._vid_meta) // 4)):
+                if not self._vid_meta:
+                    break
+                self._vid_meta.pop(next(iter(self._vid_meta)), None)
+
+    def _lru_put(self, cache, key, val, cap=256):
+        """通用 LRU 写：先删后写（dict 保序，首键即最旧）；超 cap 淘汰最旧 1/4。"""
+        cache.pop(key, None)
+        cache[key] = val
+        if len(cache) > cap:
+            for _ in range(max(1, len(cache) // 4)):
+                if not cache:
+                    break
+                cache.pop(next(iter(cache)), None)
+
     def _movie_item(self, m):
         if not isinstance(m, dict):
             return None
@@ -1317,15 +974,18 @@ class Spider:
             remark_parts.append("可播")
         if m.get("playable_until"):
             remark_parts.append("限时")
-        self._vid_meta[mid] = {
+        # 网页「● 有源」徽章：lists/links 项带 has_source=true（lists/new 无此字段）
+        if m.get("has_source"):
+            remark_parts.append("有源")
+        self._vid_meta_put(mid, {
             "number": number,
             "title": title,
             "pic": pic,
-            "duration": _safe_int(m.get("duration_sec"), 0),
+            "duration": self._work_duration(m),
             "release_date": date,
             "content_class": _to_text(m.get("content_class") or ""),
             "playable": playable,
-        }
+        })
         return {
             "vod_id": mid,
             "vod_name": title,
@@ -1345,7 +1005,6 @@ class Spider:
         return out
 
     # 兼容旧名（部分路径仍调用）
-    _movies_to_list = None  # 占位，下方立即赋值
 
     def _proxy_pic(self, url):
         """FANZA 封面为明文 URL：仅在配置了 img 时加反代，否则原样返回。"""
@@ -1361,38 +1020,8 @@ class Spider:
             return p + quote(url, safe="")
         return url
 
-    def _pic_data_uri(self, url):
-        if not url:
-            return url
-        data, mime = self._fetch_pic(url)
-        if data:
-            return "data:%s;base64,%s" % (
-                mime or "image/jpeg",
-                base64.b64encode(data).decode("ascii"))
-        return url
-
     def _site_key(self):
         return _to_text(getattr(self, "_ext_site_key", "") or "")
-
-    @staticmethod
-    def _pic_proxy_base():
-        try:
-            from com.github.catvod import Proxy
-        except Exception:
-            return "proxy://do=py"
-        try:
-            port = int(Proxy.getPort() or 0)
-        except Exception:
-            port = 0
-        if port > 0:
-            return "http://127.0.0.1:%d/proxy?do=py" % port
-        try:
-            u = _to_text(Proxy.getUrl() or "")
-            if u.startswith(("http://", "https://")):
-                return u + ("&" if "?" in u else "?") + "do=py"
-        except Exception:
-            pass
-        return "proxy://do=py"
 
     def _movies_to_list(self, works):
         return self._works_to_list(works)
@@ -1400,10 +1029,11 @@ class Spider:
     # ---------- 类别（对齐网页端导航） ----------
     @staticmethod
     def _classes():
+        # 网页导航顺序与用名：AV 档案 → FC2 档案 → 无码档案（带空格）
         return [
-            {"type_id": "av",         "type_name": "AV档案"},
+            {"type_id": "av",         "type_name": "AV 档案"},
+            {"type_id": "fc2",        "type_name": "FC2 档案"},
             {"type_id": "uncensored", "type_name": "无码档案"},
-            {"type_id": "fc2",        "type_name": "FC2档案"},
             {"type_id": "calendar",   "type_name": "发售日历"},
         ]
 
@@ -1419,14 +1049,12 @@ class Spider:
 
     @staticmethod
     def _days_group():
-        """新作时间窗（网页 days 参数）"""
+        """新作时间窗（对齐网页 seg-tabs：仅 7/14/30，默认 7；今日/90 超出网页面）"""
         return {"key": "days", "name": "时间", "init": "7",
                 "value": [
-                    {"n": "今日", "v": "1"},
-                    {"n": "近7日", "v": "7"},
-                    {"n": "近14日", "v": "14"},
-                    {"n": "近30日", "v": "30"},
-                    {"n": "近90日", "v": "90"},
+                    {"n": "7天", "v": "7"},
+                    {"n": "14天", "v": "14"},
+                    {"n": "30天", "v": "30"},
                 ]}
 
     def homeContent(self, filter=None):
@@ -1437,15 +1065,22 @@ class Spider:
             classes.append(dict(c))
         tab_days = [self._tab_group("new"), self._days_group()]
         filters = {}
-        for tid in ("av", "uncensored", "fc2"):
+        for tid in ("av", "fc2", "uncensored"):
             if tid == "uncensored" and not self.enable_uncensored:
                 continue
-            filters[tid] = list(tab_days)
+            # 浅拷贝：各板块 filters 独立，避免 TVBox 改一处牵连全部
+            filters[tid] = [dict(x) for x in tab_days]
         # 发售日历：网页 /calendar?date=YYYY-MM-DD
         today = _today()
         date_vals = [{"n": "今日", "v": today}]
+        # 过去 14 天 + 未来 14 天（网页月历可选未来「预定发售」日；接口未来日期实测有数据）
+        # _shift_days 为减法：负数即未来
         for d in range(1, 15):
-            date_vals.append({"n": _shift_days(d), "v": _shift_days(d)})
+            s = _shift_days(d)
+            date_vals.append({"n": s, "v": s})
+        for d in range(1, 15):
+            s = _shift_days(-d)
+            date_vals.append({"n": "%s 预定" % s, "v": s})
         filters["calendar"] = [
             {"key": "date", "name": "日期", "init": today,
              "value": date_vals},
@@ -1465,16 +1100,6 @@ class Spider:
             lst = self._works_to_list(works)
         return {"list": lst[:50]}
 
-    @staticmethod
-    def _page_result(out, page, one_page=False):
-        """TVBox 分页结果：有数据才给下一页"""
-        if one_page:
-            return {"list": out, "page": 1, "pagecount": 1,
-                    "limit": len(out), "total": len(out)}
-        return {"list": out, "page": page,
-                "pagecount": page + 1 if out else page,
-                "limit": len(out), "total": len(out)}
-
     def _list_params(self, fs, page, limit=None):
         """筛选 → lists/new|links|playable 查询参数"""
         limit = limit or self.page_size
@@ -1490,6 +1115,7 @@ class Spider:
         else:
             path = "/v1/lists/new"
             # av 板块网页对「今日」用 since/until；其余用 days
+            # days==1：兼容旧 ext 直传 days=1（非 UI「今日」筛选也走 since/until）
             if days == 1:
                 today = _today()
                 params["since"] = today
@@ -1500,24 +1126,40 @@ class Spider:
 
     def _calendar_list(self, fs, page):
         """发售日历：/v1/calendar?date=YYYY-MM-DD
-        items 字段为 {cid,code,cover_url,title,work_id}，需映射成 work id。"""
+        items 字段为 {cid,code,cover_url,title,work_id}，需映射成 work id。
+        接口 total 被请求 limit 截断（limit=24→total=24，limit=500→真实 199），
+        按页递增请求会把 one_page 判定恒真、单日永远锁死 1 页 → 单次拉全（500）本地分页。"""
         date = _to_text(fs.get("date") or "") or _today()
         limit = self.page_size
-        data = self._api_get("/v1/calendar",
-                             {"date": date, "limit": limit * max(page, 1)})
-        works = data.get("items") or data.get("works") or []
-        norm = []
-        for w in works:
-            if not isinstance(w, dict):
-                continue
-            if not w.get("id") and w.get("work_id"):
-                w = dict(w)
-                w["id"] = w.get("work_id")
-            norm.append(w)
+        # 同 date 300s 内复用全量 norm：翻 page1/2/3 只产生 1 次网络请求
+        now = time.time()
+        hit = self._cal_cache.get(date)
+        if hit and now - hit[0] < 300:
+            norm = hit[1]
+        else:
+            data = self._api_get("/v1/calendar",
+                                 {"date": date, "limit": CALENDAR_FETCH_MAX})
+            works = data.get("items") or data.get("works") or []
+            norm = []
+            for w in works:
+                if not isinstance(w, dict):
+                    continue
+                if not w.get("id") and w.get("work_id"):
+                    w = dict(w)
+                    w["id"] = w.get("work_id")
+                norm.append(w)
+            self._cal_cache[date] = (now, norm)
+            if len(self._cal_cache) > 16:
+                self._cal_cache.pop(next(iter(self._cal_cache)), None)
+        total = len(norm)
         start = (page - 1) * limit
         chunk = norm[start:start + limit]
         out = self._works_to_list(chunk)
-        return self._page_result(out, page, one_page=(len(norm) <= start + limit))
+        if not out:
+            page = max(1, min(page, (total + limit - 1) // limit or 1))
+        return {"list": out, "page": page,
+                "pagecount": max(1, (total + limit - 1) // limit),
+                "limit": len(out), "total": total}
 
     def categoryContent(self, tid, pg=1, filter=None, extend=None):
         t = _to_text(tid)
@@ -1588,18 +1230,8 @@ class Spider:
             item["size_bytes"] = raw
             out.append(item)
         # 仅成功拿到 links 字段（含合法空列表）才缓存
-        self._magnets_cache[code] = (now, out)
+        self._lru_put(self._magnets_cache, code, (now, out))
         return out
-
-    def _work_magnets(self, mid):
-        """兼容旧名：按 work id 取磁力（先查缓存 meta 的 number/code）。"""
-        cache = self._vid_meta.get(_to_text(mid)) or {}
-        number = _to_text(cache.get("number") or "")
-        if not number:
-            # 作品详情拿 code
-            work = self._get_work(mid)
-            number = _to_text(work.get("code") or "")
-        return self._work_links(number)
 
     def _get_work(self, vid, force=False):
         """GET /v1/works/{id}，300s 缓存；失败返回 {}。"""
@@ -1614,16 +1246,16 @@ class Spider:
         work = data if isinstance(data, dict) else {}
         if work:
             # 顺手缓存列表期 meta
-            self._vid_meta[vid] = {
+            self._vid_meta_put(vid, {
                 "number": _to_text(work.get("code") or ""),
                 "title": _to_text(work.get("title") or ""),
                 "pic": self._proxy_pic(_to_text(work.get("cover_url") or "")),
-                "duration": _safe_int(work.get("duration_sec"), 0),
+                "duration": self._work_duration(work),
                 "release_date": _to_text(work.get("release_date") or ""),
                 "content_class": _to_text(work.get("content_class") or ""),
                 "playable": bool(work.get("playable")),
-            }
-            self._work_cache[vid] = (now, work)
+            })
+            self._lru_put(self._work_cache, vid, (now, work))
         return work
 
     def _get_work_by_code(self, code):
@@ -1644,59 +1276,83 @@ class Spider:
         ch = hit.get(ckey)
         if ch and now - ch[0] < 60:
             return ch[1]
+        # 按番号前缀定首选类（FC2-* 在 fc2 类，硬编码 av 必空）→ 未命中再跨类兜底
+        if ckey.startswith("fc2"):
+            classes = ["fc2", "av", "uncensored"]
+        else:
+            classes = ["av", "uncensored", "fc2"]
+        if not self.enable_uncensored:
+            classes = [c for c in classes if c != "uncensored"]
         work = {}
         try:
-            data = self._api_get("/v1/search",
-                                 {"q": code, "class": "av", "limit": 8})
-            for w in data.get("items") or []:
-                if not isinstance(w, dict):
-                    continue
-                if _to_text(w.get("code") or "").lower() != ckey:
-                    continue
-                wid = _to_text(w.get("id") or w.get("work_id") or "")
-                if wid:
-                    work = self._get_work(wid)
+            for cls in classes:
+                data = self._api_get("/v1/search",
+                                     {"q": code, "class": cls, "limit": 8})
+                for w in data.get("items") or []:
+                    if not isinstance(w, dict):
+                        continue
+                    if _to_text(w.get("code") or "").lower() != ckey:
+                        continue
+                    wid = _to_text(w.get("id") or w.get("work_id") or "")
+                    if wid:
+                        work = self._get_work(wid)
+                        break
+                if work:
                     break
         except Exception:
-            work = {}
+            pass
         if work:
-            hit[ckey] = (now, work)
+            self._lru_put(hit, ckey, (now, work))
         return work
 
     def _dmm_candidates(self, number):
-        """DMM 免费预告候选（存在性检查）。3600s 缓存；404=确定无预览。"""
+        """DMM 免费预告候选（存在性检查）。确定性结果缓存 3600s；
+        404/200无urls=确定无预览；网络失败等非确定空结果负缓存 60s，
+        二次进详情不再打 preview。"""
         number = _to_text(number).strip()
         if not number or self.s is None:
             return []
         now = time.time()
         hit = self._dmm_cache.get(number)
-        if hit and now - hit[0] < 3600:
-            return hit[1]
+        if hit:
+            ttl = hit[2] if len(hit) > 2 else 3600
+            if now - hit[0] < ttl:
+                return hit[1]
         out, definitive = [], False
         try:
-            data = self._site_get(self.preview_api, params={"code": number},
-                                  timeout=12)
-            if data and isinstance(data.get("urls"), list):
-                for c in data.get("urls") or []:
-                    if not isinstance(c, dict):
-                        continue
-                    u = _to_text(c.get("url") or "")
-                    if not u.startswith(("https://", "http://")):
-                        continue
-                    typ = _to_text(c.get("type") or "")
-                    if typ not in ("mp4", "hls"):
-                        typ = "hls" if ".m3u8" in u.lower() else "mp4"
-                    out.append({"url": u, "type": typ,
-                                "via": _to_text(c.get("via") or "")})
+            data = self._site_get_raw(self.preview_api, params={"code": number},
+                                      timeout=12)
+            status = _safe_int((data or {}).get("status_code"), 0)
+            text = _to_text((data or {}).get("text") or "")
+            body = {}
+            if text:
+                try:
+                    body = json.loads(text)
+                except Exception:
+                    body = {}
+            if status in (400, 404):
                 definitive = True
-            elif data.get("status_code") in (400, 404):
-                definitive = True
-            elif data.get("status_code") == 200 and not data.get("urls"):
+            elif status == 200 and isinstance(body, dict):
+                urls = body.get("urls")
+                if isinstance(urls, list):
+                    for c in urls:
+                        if not isinstance(c, dict):
+                            continue
+                        u = _to_text(c.get("url") or "")
+                        if not u.startswith(("https://", "http://")):
+                            continue
+                        typ = _to_text(c.get("type") or "")
+                        if typ not in ("mp4", "hls"):
+                            typ = "hls" if ".m3u8" in u.lower() else "mp4"
+                        out.append({"url": u, "type": typ,
+                                    "via": _to_text(c.get("via") or "")})
                 definitive = True
         except Exception:
             definitive = False
         if definitive:
-            self._dmm_cache[number] = (now, out)
+            self._lru_put(self._dmm_cache, number, (now, out, 3600))
+        elif not out:
+            self._lru_put(self._dmm_cache, number, (now, out, 60))
         return out
 
     def _probe_preview(self, number, work=None):
@@ -1730,9 +1386,22 @@ class Spider:
                     ok = r.status_code in (200, 206) and \
                         r.content[:32].lstrip().startswith(b"#EXTM3U")
                 else:
-                    r = self.s.head(c["url"], headers=headers, timeout=t,
-                                    verify=self.verify, allow_redirects=True)
-                    ok = r.status_code in (200, 206)
+                    # 部分 CDN 拒 HEAD（405/403）→ 回退 GET+Range 取前 1KB 验活
+                    ok = False
+                    try:
+                        r = self.s.head(c["url"], headers=headers, timeout=t,
+                                        verify=self.verify,
+                                        allow_redirects=True)
+                        ok = r.status_code in (200, 206)
+                    except Exception:
+                        ok = False
+                    if not ok:
+                        h2 = dict(headers)
+                        h2["Range"] = "bytes=0-1023"
+                        r = self.s.get(c["url"], headers=h2, timeout=t,
+                                       verify=self.verify,
+                                       allow_redirects=True)
+                        ok = r.status_code in (200, 206)
                 if ok:
                     return c["url"]
             except Exception:
@@ -1812,7 +1481,7 @@ class Spider:
         content_class = _to_text(work.get("content_class") or cache.get("content_class") or "av")
         playable = bool(work.get("playable") or cache.get("playable"))
         playable_until = _to_text(work.get("playable_until") or "")
-        dur = _safe_int(work.get("duration_sec") or cache.get("duration"), 0)
+        dur = self._work_duration(work) or _safe_int(cache.get("duration"), 0)
         desc = _to_text(work.get("description") or "")
 
         # 实体信息
@@ -1848,7 +1517,8 @@ class Spider:
         if date:
             info_lines.append("发行: %s" % date[:10])
         if dur:
-            info_lines.append("时长: %d分钟" % (dur // 60 if dur > 10000 else dur))
+            # duration_sec 恒为秒（网页端 Math.round(e/60) 分钟）→ 四舍五入转分，勿再按值域猜
+            info_lines.append("时长: %d分钟" % max(1, int(dur / 60.0 + 0.5)))
         if makers:
             info_lines.append("片商: %s" % "、".join(makers))
         if labels:
@@ -1883,7 +1553,7 @@ class Spider:
         if self.enable_offline_115:
             info_lines.append("115离线：提交到115云端，完成后自动直连播放 (v%s)" % VERSION)
 
-        # 播放源：預覽 → 在线 → 磁力 → 115离线
+        # 播放源：预览 → 在线 → 磁力 → 115离线
         # （网页端：预览置顶、可播给在线、磁力列表、115 为本插件转存；磁力/115 与 javdbui 同构）
         play_from = []
         play_url = []
@@ -1894,8 +1564,8 @@ class Spider:
         has_sample = bool(sample_mv.startswith(("http://", "https://"))
                           or sample_hls.startswith(("http://", "https://")))
         if number and (self._dmm_candidates(number) or has_sample):
-            play_from.append("預覽")
-            play_url.append("預覽$%s" % _sanitize_play(PREVIEW_PREFIX + number))
+            play_from.append("预览")
+            play_url.append("预览$%s" % _sanitize_play(PREVIEW_PREFIX + number))
 
         # 在线解析（伪链，playerContent 取 variants）
         if playable and number:
@@ -1975,13 +1645,13 @@ class Spider:
         now = time.time()
         hit = self._search_cache.get(ck)
         if hit and now - hit[0] < 300:
-            lst, total = hit[1], hit[2]
-            return {"list": lst, "page": page,
-                    "pagecount": self._search_pagecount(total, page),
+            lst, total, pagecount = hit[1], hit[2], hit[3]
+            return {"list": lst, "page": page, "pagecount": pagecount,
                     "limit": len(lst), "total": total}
 
-        # /v1/search 只认 limit，不支持 offset/page → 拉 page*limit 后切片
-        fetch_limit = self.search_limit * page
+        # /v1/search 只认 limit，不支持 offset/page → 拉 page*limit 后切片；
+        # 触顶 SEARCH_FETCH_MAX（500）防深页请求体积膨胀
+        fetch_limit = min(self.search_limit * page, SEARCH_FETCH_MAX)
         classes = ["av"]
         if self.enable_uncensored:
             classes.append("uncensored")
@@ -2010,18 +1680,25 @@ class Spider:
         start = (page - 1) * self.search_limit
         chunk = rows[start:start + self.search_limit]
         lst = self._works_to_list(chunk)
-        total = total_est or len(rows)
+        # 触顶 SEARCH_FETCH_MAX（500）时 total_est 含未抓取部分会虚高
+        # → total 取实际已抓行数；未触顶才用接口 total 估计
+        if self.search_limit * page >= SEARCH_FETCH_MAX:
+            total = len(rows)
+        else:
+            total = total_est or len(rows)
+        # 空 chunk = 没有下一页数据（fetch 触顶 500 或上游已空）→ 收口 pagecount，
+        # 否则 total 仍是全量估计、深页会一直报 page+1
+        pagecount = self._search_pagecount(total, page) if chunk else page
         if len(self._search_cache) > 64:
             self._search_cache.clear()
-        self._search_cache[ck] = (now, lst, total)
+        self._search_cache[ck] = (now, lst, total, pagecount)
         return {"list": lst, "page": page,
-                "pagecount": self._search_pagecount(total, page),
+                "pagecount": pagecount,
                 "limit": len(lst), "total": total}
 
-    @staticmethod
-    def _search_pagecount(total, page):
-        # search 无可靠 page 上限：有下一页数据就多给 1 页
-        return page + 1 if total > page * 30 else page
+    def _search_pagecount(self, total, page):
+        # search 无可靠 page 上限：有下一页数据就多给 1 页（用 self.search_limit，勿硬编码 30）
+        return page + 1 if total > page * self.search_limit else page
 
     # ==================== 115 离线 ====================
 
@@ -2111,18 +1788,34 @@ class Spider:
             return {}
 
     def _offline_find_task(self, info_hash, max_page=2):
-        for page in range(1, max_page + 1):
+        """按 info_hash 找离线任务。
+        max_page<=0：按响应 page_count 全页扫描（上限 OFFLINE_FIND_MAX_PAGES），
+        用于删除确认 / 已存在定位——任务在第 3 页外时小页数扫描会漏检、误判。"""
+        info_hash = _to_text(info_hash or "").strip().lower()
+        if not info_hash:
+            return None
+        cap = max_page
+        page = 1
+        while True:
+            if cap > 0 and page > cap:
+                break
+            if page > OFFLINE_FIND_MAX_PAGES:
+                break
             try:
                 res = self._offline_list(page)
             except Exception:
                 return None
+            if page == 1 and cap <= 0:
+                pc = _safe_int(res.get("page_count"), 0)
+                cap = min(pc, OFFLINE_FIND_MAX_PAGES) if pc > 0 else 1
             tasks = res.get("tasks") or res.get("list") or []
             if not tasks:
                 break
             for t in tasks:
                 h = (t.get("info_hash") or t.get("hash") or "").lower()
-                if h and h == info_hash.lower():
+                if h and h == info_hash:
                     return t
+            page += 1
         return None
 
     def _offline_task_del(self, info_hash):
@@ -2143,9 +1836,10 @@ class Spider:
             if not isinstance(out, dict):
                 return False
             if out.get("state") or _safe_int(out.get("errcode"), -1) == 0:
-                # 删后确认已不在列表（task_del 对不存在 hash 也可能回 suc）
+                # 删后确认已不在列表（task_del 对不存在 hash 也可能回 suc）；
+                # max_page=0 → 按 page_count 全页扫，任务在深页时小页数会漏检误判
                 try:
-                    return self._offline_find_task(info_hash) is None
+                    return self._offline_find_task(info_hash, max_page=0) is None
                 except Exception:
                     return True
         except Exception:
@@ -2400,7 +2094,7 @@ class Spider:
         syn = _to_text(self._off_syn.get(info_hash, "")) if info_hash else ""
         res["desc"] = (note + "\n\n" + syn) if syn else note
         try:
-            key = _to_text(getattr(self, "siteKey", ""))
+            key = self._site_key()
             q = "do=py" + ("&siteKey=%s" % quote(key) if key else "")
             url = self._offline_proxy_base() + q + "&k=offnote&v=%s" % quote(note)
             res["subs"] = [{"name": "115离线", "url": url, "lang": "zh",
@@ -3234,27 +2928,74 @@ class Spider:
                            "Accept": "*/*"},
             }
 
-        # 演员/片商/系列详情里点作品 → 作品 id 走 detail 拿磁力再播
+        # 演员/片商/系列详情里点作品 → 作品 id 走 detail 拿源再播。
+        # 源顺序：115离线 → 磁力 → 预览 → 在线；全失败走终兜底（带 msg，不再空 url 黑屏）
         if not vid.startswith(OFF_PREFIX_115) and len(vid) <= 12 \
                 and re.match(r"^[A-Za-z0-9]+$", vid):
             try:
                 d = self.detailContent([vid])
                 vod = (d.get("list") or [{}])[0]
-                play_url = _to_text(vod.get("vod_play_url") or "")
-                if play_url:
-                    # 取 115离线源的第一个条目
-                    sources = play_url.split("#")
-                    for ep in sources:
-                        if OFF_PREFIX_115 in ep:
-                            _, ep_id = ep.split("$", 1)
-                            magnet, title, label, number = _off_id_decode(
-                                ep_id[len(OFF_PREFIX_115):].split("?")[0])
-                            if magnet:
-                                return self._play_offline_safe(magnet, title, label, number)
-            except Exception:
-                pass
+                froms = _to_text(vod.get("vod_play_from") or "").split("$$$")
+                plays = _to_text(vod.get("vod_play_url") or "").split("$$$")
 
-        return {"parse": 0, "jx": 0, "playUrl": "", "url": "", "header": {}}
+                # ① 115 离线：decode 后直连提交/播放
+                for i, seg in enumerate(plays):
+                    src = froms[i] if i < len(froms) else ""
+                    if "115" not in src:
+                        continue
+                    for ep in seg.split("#"):
+                        if OFF_PREFIX_115 not in ep:
+                            continue
+                        _, ep_id = ep.split("$", 1)
+                        magnet, title, label, number = _off_id_decode(
+                            ep_id[len(OFF_PREFIX_115):].split("?")[0])
+                        if magnet:
+                            return self._play_offline_safe(
+                                magnet, title, label, number)
+
+                # ② 磁力：取第一个 magnet: 直接播
+                for i, seg in enumerate(plays):
+                    src = froms[i] if i < len(froms) else ""
+                    if "磁力" not in src:
+                        continue
+                    for ep in seg.split("#"):
+                        if "$" not in ep:
+                            continue
+                        u = unquote(ep.split("$", 1)[1])
+                        if u.startswith("magnet:"):
+                            m = _normalize_magnet(u)
+                            return {
+                                "parse": 0, "jx": 0, "playUrl": "",
+                                "url": m or u,
+                                "header": {"User-Agent": self.ua,
+                                           "Accept": "*/*"},
+                            }
+
+                # ③ 预览 / ④ 在线：把伪链交回 playerContent 前缀分支探测
+                #    （失败带 msg 返回，继续下一源；全失败落终兜底）
+                last_err = ""
+                for i, seg in enumerate(plays):
+                    src = froms[i] if i < len(froms) else ""
+                    if not (src in ("预览", "在线") or "预览" in src):
+                        continue
+                    for ep in seg.split("#"):
+                        if "$" not in ep:
+                            continue
+                        u = unquote(ep.split("$", 1)[1])
+                        if not u.startswith((PREVIEW_PREFIX, RESOLVE_PREFIX)):
+                            continue
+                        r = self.playerContent(flag, [u])
+                        if isinstance(r, dict) and r.get("url"):
+                            return r
+                        if r.get("msg"):
+                            last_err = _to_text(r.get("msg"))
+                if last_err:
+                    return _play_err("该作品暂无可播源（%s）" % last_err)
+            except Exception as e:
+                return _play_err("解析作品源失败（%s）" % _to_text(e))
+
+        return _play_err("无可用播放源（115离线/磁力/预览/在线均无），"
+                         "请到详情页确认源列表")
 
     @staticmethod
     def _parse_proxy_param(param):
