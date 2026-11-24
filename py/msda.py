@@ -323,6 +323,45 @@ def _magnet_label(g, idx):
     return " ".join(parts) or ("磁力%d" % (idx + 1))
 
 
+def _offline_episode_label(g, idx):
+    """115 离线选集显示名：[大小 格式 去码] 磁力文件名。
+    仅用于详情页展示；编入 off id 的功能标签仍走 _magnet_label。
+    格式只认容器词（mp4/mkv/...），h265/hevc 等编码词不算；
+    file_name 无容器词则不显示格式。去码 = tags 含 cracked 或
+    文件名含 破解/Mosaic/去码。展示名剥前导 [..] 块。"""
+    name = _to_text(g.get("name") or g.get("file_name") or "")
+    raw = _safe_int(g.get("size_bytes"), 0)
+    if raw <= 0:
+        try:
+            raw = int(float(g.get("size") or 0) * 1024 * 1024)
+        except Exception:
+            raw = 0
+    parts = []
+    if raw > 0:
+        if raw >= 1024 ** 3:
+            parts.append("%.1fG" % (raw / float(1024 ** 3)))
+        else:
+            parts.append("%.0fM" % (raw / float(1024 ** 2)))
+    m = re.search(
+        r"(?<![a-z0-9])(mp4|mkv|avi|mov|wmv|flv|ts|webm|rmvb|m2ts|m4v)(?![a-z0-9])",
+        name, re.I)
+    if m:
+        parts.append(m.group(1).lower())
+    tags = g.get("tags") or []
+    cracked = (isinstance(tags, (list, tuple)) and
+               any(_to_text(t).lower() == "cracked" for t in tags))
+    if not cracked:
+        cracked = bool(re.search(r"破解|mosaic|去码", name, re.I))
+    if cracked:
+        parts.append("去码")
+    show = re.sub(r"^(?:\s*\[[^\]]*\])+\s*", "", name).strip() or name
+    if parts and show:
+        return "[%s] %s" % (" ".join(parts), show)
+    if show:
+        return show
+    return _magnet_label(g, idx)
+
+
 # ==================== 日期工具 ====================
 
 def _today():
@@ -1598,7 +1637,8 @@ class Spider:
                 label = _magnet_label(g, i)
                 b64 = _off_id_encode(mag, title, label, number)
                 eps.append("%s$%s%s?t=%d" % (
-                    _sanitize_play(label), OFF_PREFIX_115, b64, int(time.time())))
+                    _sanitize_play(_offline_episode_label(g, i)),
+                    OFF_PREFIX_115, b64, int(time.time())))
             if eps:
                 play_from.append("115离线")
                 play_url.append("#".join(eps))
