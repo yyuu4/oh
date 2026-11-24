@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 # msda.py —— FANZA METADATA INDEX (fanza.fastcdn.dpdns.org) 爬虫
 # 参照 javdbui.py 结构：分类/筛选与网页端对齐；磁力 + 115 离线可播放。
 # 网页板块：AV档案(/) / 无码档案(/uncensored) / FC2档案(/fc2) / 发售日历(/calendar)
 # 列表页签：全部新作(lists/new) / 有磁链(lists/links) / 可播(lists/playable)
 # 数据 API：fanza-api.fastcdn.dpdns.org/v1/*；播放解析：站点 /api/rv/v1/resolve
 # 说明：Cloudflare 对普通 requests + Chrome UA 直接 403；优先 curl_cffi 指纹，无指纹时改 okhttp 头兜底。
+# v1.0.5 115 离线选集标签：显示名改 [大小 格式 去码] 磁力文件名（_offline_episode_label，仅展示、off id 的 l 仍走 _magnet_label 短标签）；格式只认容器词（mp4/mkv/avi/mov/wmv/flv/ts/webm/rmvb/m2ts/m4v），h265/hevc/avc 等编码词不算，file_name 无容器词则不显示格式；tags 含 cracked 或文件名含 破解/Mosaic/去码 → 括号内加「去码」；展示名剥前导 [..] 块。
 # v1.0.4 查验修复：①日历分页锁死 199（total 被 limit 截断）→ 单次拉 500 本地分页、total/pagecount 精确；②时长全链路缺失（duration_sec 在 versions[] 非顶层）→ _work_duration 取版本时长，恒秒转分废除 >10000 启发式（3664 分钟误显消失）；③FC2-* 反查硬编码 class=av 必空 → 按前缀选类+跨类兜底；④playerContent 裸番号分支只认 115 → 115→磁力→预览→在线 四级回退，终兜底带 msg 不再空 url 黑屏；⑤429 移出自动重试（对齐网页）；⑥task_del 删后确认 max_page=2 漏深页误判「已删」→ max_page=0 按 page_count 全页扫（上限 30 页）；⑦日历筛选补未来 14 天「预定」（接口实测有数据）；⑧has_source 消费为「有源」徽章；⑨分类名/顺序对齐网页（AV 档案→FC2 档案→无码档案）+ 筛选同步；⑩时间窗收敛 7/14/30；⑪删 _api_action 死字段；⑫_search_pagecount 用 search_limit、搜索 fetch 触顶 500、空页 pagecount 收口；⑬_vid_meta 超 128 淘汰最旧 1/4。
 # v1.0.3 115 离线可用性：①失败任务不再永久卡死——ac=task_del(hash[0]) 删旧后自动重提；②/v1/links 失败/error 不写 120s 空缓存；③等待超时可配 ext.offlinePollTimeout（默认 20s），文案改为「云端下载中非失败」；④详情标注无做种/源站无磁链。
 # v1.0.2 详情/磁力/115 对齐参照与网页：①size_bytes 误当 MB 致标签「7235174.40GB」→ 换算成 MB（6.90GB），115 命名不再带天文数字；②实体字段 name_ja（非 name）→ 演员/类别/简介恢复；③磁力只用 hash 重建+公共 tracker（去上游 dn=），115 用裸 btih，与 javdbui 同构；④vod_blurb 按 番号|日期|片商|导演|演员。
