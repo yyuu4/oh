@@ -1005,18 +1005,40 @@ class Spider:
         pic = self._proxy_pic(_to_text(m.get("cover_url") or ""))
         date = _to_text(m.get("release_date") or "")
         playable = bool(m.get("playable"))
+        has_source = bool(m.get("has_source"))
+        # playable_until 为毫秒时间戳（实测 1824694221058）；>1e11 判毫秒否则按秒
+        pu_ms = _safe_int(m.get("playable_until"), 0)
+        if pu_ms > 100000000000:
+            pu_sec = pu_ms / 1000.0
+        else:
+            pu_sec = float(pu_ms)
+        if playable and pu_ms > 0 and pu_ms <= int(time.time() * 1000):
+            playable = False        # 已过期：对齐网页，摘掉可播徽章
+        # 网页「● 可播」徽章 = (playable && 未过期) || has_source（磁力源也算可播）
+        badge = playable or has_source
         remark_parts = []
         if number:
             remark_parts.append(number)
         if date:
             remark_parts.append(date[:10])
-        if playable:
+        if badge:
             remark_parts.append("可播")
-        if m.get("playable_until"):
-            remark_parts.append("限时")
-        # 网页「● 有源」徽章：lists/links 项带 has_source=true（lists/new 无此字段）
-        if m.get("has_source"):
-            remark_parts.append("有源")
+        if playable and pu_ms > 0:
+            remark_parts.append("限时 %s" % time.strftime(
+                "%Y-%m-%d", time.localtime(pu_sec)))
+        # 网页卡片附带字段：version_count → ×N；first_link_at 实测已是日期串
+        vc = _safe_int(m.get("version_count"), 0)
+        if vc > 1:
+            remark_parts.append("×%d" % vc)
+        fl = _to_text(m.get("first_link_at") or "")
+        if fl:
+            remark_parts.append("磁链 %s" % fl[:10])
+        # main_svc 为来源站代号（digital/mono/fc2/uc_*），去 uc_ 前缀直出
+        svc = _to_text(m.get("main_svc") or "")
+        if svc.startswith("uc_"):
+            svc = svc[3:]
+        if svc:
+            remark_parts.append(svc)
         self._vid_meta_put(mid, {
             "number": number,
             "title": title,
@@ -1025,6 +1047,8 @@ class Spider:
             "release_date": date,
             "content_class": _to_text(m.get("content_class") or ""),
             "playable": playable,
+            "has_source": has_source,
+            "playable_until": pu_ms,
         })
         return {
             "vod_id": mid,
@@ -1097,30 +1121,99 @@ class Spider:
                     {"n": "30天", "v": "30"},
                 ]}
 
+    @staticmethod
+    def _tags_group():
+        """磁力标签（对齐网页 links 分区 tags=，8 键取自网页 Pe 数组）。
+        网页为多选逗号连接；本库无多选筛选先例 → 单选子集（客户端若传
+        逗号串也会原样透传）。仅 tab=links 生效，空=不过滤。"""
+        return {"key": "tags", "name": "磁力标签", "init": "",
+                "value": [
+                    {"n": "全部", "v": ""},
+                    {"n": "中字", "v": "zh_sub"},
+                    {"n": "无码", "v": "uncensored"},
+                    {"n": "破解", "v": "cracked"},
+                    {"n": "LTX破解", "v": "ltx"},
+                    {"n": "4K", "v": "4k"},
+                    {"n": "FHD", "v": "fhd"},
+                    {"n": "HD", "v": "hd"},
+                    {"n": "VR", "v": "vr"},
+                ]}
+
+    @staticmethod
+    def _ltx_group():
+        """LTX 破解（对齐网页 playable 分区 ltx=1）。仅 tab=playable 生效。"""
+        return {"key": "ltx", "name": "LTX", "init": "0",
+                "value": [
+                    {"n": "全部", "v": "0"},
+                    {"n": "仅LTX破解", "v": "1"},
+                ]}
+
+    def _calendar_days(self, today):
+        """有货日期 → TVBox date 筛选项。
+        GET /v1/calendar/days?limit=60 → {"days": [YYYY-MM-DD...], "total": N}
+        （实测降序、含今日与未来预定发售日，无货日不返回 = 网页月历灰掉）。
+        成功缓存 6h；失败负缓存 10min（避免每次首页都打一个必失败请求）。
+        失败/空 → 回退硬编码 今日±14 天。"""
+        now = time.time()
+        cache = getattr(self, "_cal_days_cache", None)
+        days = []
+        fresh = False
+        if cache:
+            ts, vals, ok = cache
+            if now - ts < (21600 if ok else 600):
+                days = list(vals)
+                fresh = True
+        if not fresh:
+            days = []
+            try:
+                data = self._api_get("/v1/calendar/days", {"limit": 60})
+                raw = data.get("days") if isinstance(data, dict) else None
+                if isinstance(raw, list):
+                    days = [_to_text(x).strip() for x in raw
+                            if _to_text(x or "").strip()]
+            except Exception:
+                days = []
+            self._cal_days_cache = (now, days, bool(days))
+        if not days:
+            # 回退：今日 + 过去 14 + 未来 14（_shift_days 为减法，负数即未来）
+            days = [today]
+            for d in range(1, 15):
+                days.append(_shift_days(d))
+            for d in range(1, 15):
+                days.append(_shift_days(-d))
+        # 今日置首 → 未来升序（标「预定」）→ 过去降序；去重保序
+        uniq, seen = [], set()
+        for d in days:
+            if d and d not in seen:
+                seen.add(d)
+                uniq.append(d)
+        vals = []
+        for d in sorted(x for x in uniq if x > today):
+            vals.append({"n": "%s 预定" % d, "v": d})
+        for d in sorted((x for x in uniq if x < today), reverse=True):
+            vals.append({"n": d, "v": d})
+        # 今日恒为首选（init=today 必须有对应项；无货日 _calendar_list 也能兜底）
+        vals.insert(0, {"n": "今日", "v": today})
+        return vals
+
     def homeContent(self, filter=None):
         classes = []
         for c in self._classes():
             if c["type_id"] == "uncensored" and not self.enable_uncensored:
                 continue
             classes.append(dict(c))
-        tab_days = [self._tab_group("new"), self._days_group()]
+        tab_days = [self._tab_group("new"), self._days_group(),
+                    self._tags_group(), self._ltx_group()]
         filters = {}
         for tid in ("av", "fc2", "uncensored"):
             if tid == "uncensored" and not self.enable_uncensored:
                 continue
             # 浅拷贝：各板块 filters 独立，避免 TVBox 改一处牵连全部
             filters[tid] = [dict(x) for x in tab_days]
-        # 发售日历：网页 /calendar?date=YYYY-MM-DD
+        # 发售日历：优先 /v1/calendar/days 只列有货日期（对齐网页月历），
+        # 失败回退硬编码 ±14 天
         today = _today()
-        date_vals = [{"n": "今日", "v": today}]
-        # 过去 14 天 + 未来 14 天（网页月历可选未来「预定发售」日；接口未来日期实测有数据）
-        # _shift_days 为减法：负数即未来
-        for d in range(1, 15):
-            s = _shift_days(d)
-            date_vals.append({"n": s, "v": s})
-        for d in range(1, 15):
-            s = _shift_days(-d)
-            date_vals.append({"n": "%s 预定" % s, "v": s})
+        date_vals = self._calendar_days(today)
         filters["calendar"] = [
             {"key": "date", "name": "日期", "init": today,
              "value": date_vals},
@@ -1134,8 +1227,11 @@ class Spider:
         works = data.get("items") or data.get("works") or []
         lst = self._works_to_list(works)
         if not lst:
+            # 空 q 直接 400（"q must be at least 2 characters (or use
+            # playable=1 to browse playable works)"）→ 兜底走 playable 浏览
             data = self._api_get("/v1/search",
-                                 {"q": "", "class": "av", "limit": 50})
+                                 {"q": "", "class": "av", "limit": 50,
+                                  "playable": 1})
             works = data.get("items") or data.get("works") or []
             lst = self._works_to_list(works)
         return {"list": lst[:50]}
@@ -1150,8 +1246,16 @@ class Spider:
             days = 7
         if tab == "links":
             path = "/v1/lists/links"
+            # 网页 links 分区 tags 多选逗号连接；本筛选为单选子集，
+            # 客户端若传逗号串也原样透传。空=不过滤。
+            tags = _to_text(fs.get("tags") or "").strip().lower()
+            if tags:
+                params["tags"] = tags
         elif tab == "playable":
             path = "/v1/lists/playable"
+            # 网页 playable 分区 ltx=1 仅 LTX 破解
+            if _to_text(fs.get("ltx") or "") == "1":
+                params["ltx"] = 1
         else:
             path = "/v1/lists/new"
             # av 板块网页对「今日」用 since/until；其余用 days
@@ -1250,6 +1354,20 @@ class Spider:
         # 接口失败 / {"error":...} / 非法响应：不写 120s 缓存，避免抖动后空窗两分钟
         if not isinstance(data, dict) or "error" in data or "links" not in data:
             return []
+        # 网页端磁力是异步抓取队列：status ∈ hit/cooldown/disabled/queued/pending/
+        # budget/queue_full/timeout/error。queued/pending 时 links 常为空但语义是
+        # 「正在抓取」，不能当「暂无磁力」；在途态也不写 120s 缓存（否则下次进来
+        # 两分钟内仍读到空）。状态与 other_works/refreshing 存 _links_meta 供详情消费。
+        status = _to_text(data.get("status") or "hit")
+        meta = getattr(self, "_links_meta", None)
+        if meta is None:
+            self._links_meta = {}
+            meta = self._links_meta
+        meta[code] = {
+            "status": status,
+            "other_works": _safe_int(data.get("other_works"), 0),
+            "refreshing": bool(data.get("refreshing")),
+        }
         links = data.get("links")
         out = []
         for g in links or []:
@@ -1269,8 +1387,9 @@ class Spider:
             item["size"] = (raw / (1024.0 * 1024)) if raw > 0 else 0
             item["size_bytes"] = raw
             out.append(item)
-        # 仅成功拿到 links 字段（含合法空列表）才缓存
-        self._lru_put(self._magnets_cache, code, (now, out))
+        # 仅稳定态缓存；在途/限流态（queued/pending/budget/queue_full/timeout）留待重查
+        if status in ("hit", "cooldown", "disabled"):
+            self._lru_put(self._magnets_cache, code, (now, out))
         return out
 
     def _get_work(self, vid, force=False):
@@ -1316,31 +1435,48 @@ class Spider:
         ch = hit.get(ckey)
         if ch and now - ch[0] < 60:
             return ch[1]
-        # 按番号前缀定首选类（FC2-* 在 fc2 类，硬编码 av 必空）→ 未命中再跨类兜底
-        if ckey.startswith("fc2"):
-            classes = ["fc2", "av", "uncensored"]
-        else:
-            classes = ["av", "uncensored", "fc2"]
-        if not self.enable_uncensored:
-            classes = [c for c in classes if c != "uncensored"]
+        # 优先网页同款 workByCode：GET /v1/works?code= 单次精确命中
+        # （服务端归一化番号：NOSKN106 → NOSKN-106，search 精确比对会漏）。
+        # 响应是列表包装 {count, items, ...}；items[0] 只有 15 字段，缺
+        # entities/sample_*/sources → 必须再 _get_work 拿全字段。
         work = {}
         try:
-            for cls in classes:
-                data = self._api_get("/v1/search",
-                                     {"q": code, "class": cls, "limit": 8})
-                for w in data.get("items") or []:
-                    if not isinstance(w, dict):
-                        continue
-                    if _to_text(w.get("code") or "").lower() != ckey:
-                        continue
-                    wid = _to_text(w.get("id") or w.get("work_id") or "")
-                    if wid:
-                        work = self._get_work(wid)
-                        break
-                if work:
-                    break
+            data = self._api_get("/v1/works", {"code": code})
+            items = data.get("items") if isinstance(data, dict) else None
+            w0 = (items[0] if isinstance(items, list) and items
+                  and isinstance(items[0], dict) else None)
+            if w0:
+                wid = _to_text(w0.get("id") or w0.get("work_id") or "")
+                if wid:
+                    work = self._get_work(wid) or w0
         except Exception:
-            pass
+            work = {}
+        if not work:
+            # 兜底：search 拿 id 再取详情。按番号前缀定首选类
+            # （FC2-* 在 fc2 类，硬编码 av 必空）→ 未命中再跨类兜底
+            if ckey.startswith("fc2"):
+                classes = ["fc2", "av", "uncensored"]
+            else:
+                classes = ["av", "uncensored", "fc2"]
+            if not self.enable_uncensored:
+                classes = [c for c in classes if c != "uncensored"]
+            try:
+                for cls in classes:
+                    data = self._api_get("/v1/search",
+                                         {"q": code, "class": cls, "limit": 8})
+                    for w in data.get("items") or []:
+                        if not isinstance(w, dict):
+                            continue
+                        if _to_text(w.get("code") or "").lower() != ckey:
+                            continue
+                        wid = _to_text(w.get("id") or w.get("work_id") or "")
+                        if wid:
+                            work = self._get_work(wid)
+                            break
+                    if work:
+                        break
+            except Exception:
+                pass
         if work:
             self._lru_put(hit, ckey, (now, work))
         return work
@@ -1520,7 +1656,20 @@ class Spider:
         date = _to_text(work.get("release_date") or cache.get("release_date") or "")
         content_class = _to_text(work.get("content_class") or cache.get("content_class") or "av")
         playable = bool(work.get("playable") or cache.get("playable"))
-        playable_until = _to_text(work.get("playable_until") or "")
+        # playable_until 为毫秒时间戳（实测 1824694221058）；>1e11 判毫秒否则按秒。
+        # 网页端只拿它做过期判定（playable_until > Date.now()），过期即摘可播徽章。
+        # works/{id} 可能不带该字段而列表期 meta 有 → 回退读 cache，避免过期误报可播
+        pu_ms = _safe_int(
+            work.get("playable_until") or cache.get("playable_until"), 0)
+        if pu_ms > 100000000000:
+            pu_sec = pu_ms / 1000.0
+        else:
+            pu_sec = float(pu_ms)
+        playable_until_txt = (
+            time.strftime("%Y-%m-%d %H:%M", time.localtime(pu_sec))
+            if pu_ms > 0 else "")
+        if playable and pu_ms > 0 and pu_ms <= int(time.time() * 1000):
+            playable = False        # 已过期：对齐网页，不再列「在线可播」源
         dur = self._work_duration(work) or _safe_int(cache.get("duration"), 0)
         desc = _to_text(work.get("description") or "")
 
@@ -1570,7 +1719,7 @@ class Spider:
         if genres:
             info_lines.append("类别: %s" % "、".join(genres))
         if playable:
-            until = ("至 %s" % playable_until[:16]) if playable_until else ""
+            until = ("至 %s" % playable_until_txt) if playable_until_txt else ""
             info_lines.append("在线可播%s" % until)
         if magnets:
             # 标注死链（seeders=0 / health=unknown），与「有做种」区分
@@ -1587,7 +1736,24 @@ class Spider:
             else:
                 info_lines.append("磁力 %d 条" % len(magnets))
         elif number:
-            info_lines.append("暂无磁力（源站未提供磁链）")
+            # 网页端磁力是异步队列：排队/限流 ≠ 真的「暂无」，按 status 分支文案
+            lm = (getattr(self, "_links_meta", None) or {}).get(number) or {}
+            st = _to_text(lm.get("status") or "")
+            if st in ("queued", "pending") or lm.get("refreshing"):
+                info_lines.append("磁力抓取中（网页端异步队列，稍后刷新）")
+            elif st in ("budget", "queue_full"):
+                info_lines.append("磁力抓取受限（额度/队列满，稍后重试）")
+            elif st == "timeout":
+                info_lines.append("磁力抓取超时（稍后重试）")
+            elif st == "cooldown":
+                info_lines.append("磁力抓取冷却中（稍后重试）")
+            elif st == "disabled":
+                info_lines.append("磁力服务未开放")
+            else:
+                msg = "暂无磁力（源站未提供磁链）"
+                if _safe_int(lm.get("other_works"), 0) > 0:
+                    msg += "；同番号其他作品有磁链"
+                info_lines.append(msg)
         if desc:
             info_lines.append(desc[:500])
         if self.enable_offline_115:
