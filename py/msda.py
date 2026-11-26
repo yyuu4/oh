@@ -17,6 +17,7 @@ import os
 import re
 import json
 import time
+import datetime
 import threading
 import html as html_mod
 import base64
@@ -367,12 +368,13 @@ def _offline_episode_label(g, idx):
 # ==================== 日期工具 ====================
 
 def _today():
-    return time.strftime("%Y-%m-%d")
+    # 固定 UTC+8（对齐网页浏览器时区；UTC 服务器凌晨 0-8 点不再差一天）
+    return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))
 
 
 def _shift_days(days):
     return time.strftime("%Y-%m-%d",
-                         time.localtime(time.time() - days * 86400))
+                         time.gmtime(time.time() - days * 86400 + 8 * 3600))
 
 
 # ==================== 115 加密工具 ====================
@@ -1138,12 +1140,9 @@ class Spider:
         # 网页「● 可播」徽章 = (playable && 未过期) || has_source（磁力源也算可播）
         badge = playable or has_source
         remark_parts = []
-        if number:
-            remark_parts.append(number)
-        if date:
-            remark_parts.append(date[:10])
+        # 徽章置首（海报角标优先可见）；番号已在 type_name，不再塞入 remarks
         if badge:
-            remark_parts.append("可播")
+            remark_parts.append("●可播")
         if playable and pu_ms > 0:
             remark_parts.append("限时 %s" % time.strftime(
                 "%Y-%m-%d", time.localtime(pu_sec)))
@@ -1160,6 +1159,9 @@ class Spider:
             svc = svc[3:]
         if svc:
             remark_parts.append(svc)
+        # 无徽章且无其他状态时保留日期兜底（有徽章时日期不再占首屏）
+        if not remark_parts and date:
+            remark_parts.append(date[:10])
         self._vid_meta_put(mid, {
             "number": number,
             "title": title,
@@ -1234,8 +1236,8 @@ class Spider:
 
     @staticmethod
     def _days_group():
-        """新作时间窗（对齐网页 seg-tabs：仅 7/14/30，默认 7；今日/90 超出网页面）"""
-        return {"key": "days", "name": "时间", "init": "7",
+        """新作时间窗（对齐网页 seg-tabs：仅 7/14/30，默认 7；仅 tab=new 生效）"""
+        return {"key": "days", "name": "时间（仅新作）", "init": "7",
                 "value": [
                     {"n": "7天", "v": "7"},
                     {"n": "14天", "v": "14"},
@@ -1243,11 +1245,21 @@ class Spider:
                 ]}
 
     @staticmethod
+    def _tag_flag_group(key, label):
+        """磁力标签 0/1 子筛选（网页多选逗号连接；TVBox 无多选先例 →
+        拆成 8 个独立 0/1 组，_list_params 收集 value=1 拼逗号串）。
+        仅 tab=links 生效。"""
+        return {"key": key, "name": "磁力·%s（仅有磁链）" % label,
+                "init": "0",
+                "value": [
+                    {"n": "否", "v": "0"},
+                    {"n": "是", "v": "1"},
+                ]}
+
+    @staticmethod
     def _tags_group():
-        """磁力标签（对齐网页 links 分区 tags=，8 键取自网页 Pe 数组）。
-        网页为多选逗号连接；本库无多选筛选先例 → 单选子集（客户端若传
-        逗号串也会原样透传）。仅 tab=links 生效，空=不过滤。"""
-        return {"key": "tags", "name": "磁力标签", "init": "",
+        """兼容旧单选 tags 筛选（value 仍为标签键）。新路径用 _tag_flags()。"""
+        return {"key": "tags", "name": "磁力标签（仅有磁链·单选）", "init": "",
                 "value": [
                     {"n": "全部", "v": ""},
                     {"n": "中字", "v": "zh_sub"},
@@ -1260,61 +1272,44 @@ class Spider:
                     {"n": "VR", "v": "vr"},
                 ]}
 
+    @classmethod
+    def _tag_flags(cls):
+        """8 个磁力标签 0/1 子筛选（对齐网页多选）。"""
+        keys = [("zh_sub", "中字"), ("uncensored", "无码"),
+                ("cracked", "破解"), ("ltx", "LTX破解"),
+                ("4k", "4K"), ("fhd", "FHD"), ("hd", "HD"), ("vr", "VR")]
+        return [cls._tag_flag_group("tag_%s" % k, lab) for k, lab in keys]
+
     @staticmethod
     def _ltx_group():
         """LTX 破解（对齐网页 playable 分区 ltx=1）。仅 tab=playable 生效。"""
-        return {"key": "ltx", "name": "LTX", "init": "0",
+        return {"key": "ltx", "name": "LTX（仅可播）", "init": "0",
                 "value": [
                     {"n": "全部", "v": "0"},
                     {"n": "仅LTX破解", "v": "1"},
                 ]}
 
     def _calendar_days(self, today):
-        """有货日期 → TVBox date 筛选项。
-        GET /v1/calendar/days?limit=60 → {"days": [YYYY-MM-DD...], "total": N}
-        （实测降序、含今日与未来预定发售日，无货日不返回 = 网页月历灰掉）。
-        成功缓存 6h；失败负缓存 10min（避免每次首页都打一个必失败请求）。
-        失败/空 → 回退硬编码 今日±14 天。"""
-        now = time.time()
-        cache = getattr(self, "_cal_days_cache", None)
-        days = []
-        fresh = False
-        if cache:
-            ts, vals, ok = cache
-            if now - ts < (21600 if ok else 600):
-                days = list(vals)
-                fresh = True
-        if not fresh:
-            days = []
-            try:
-                data = self._api_get("/v1/calendar/days", {"limit": 60})
-                raw = data.get("days") if isinstance(data, dict) else None
-                if isinstance(raw, list):
-                    days = [_to_text(x).strip() for x in raw
-                            if _to_text(x or "").strip()]
-            except Exception:
-                days = []
-            self._cal_days_cache = (now, days, bool(days))
-        if not days:
-            # 回退：今日 + 过去 14 + 未来 14（_shift_days 为减法，负数即未来）
-            days = [today]
-            for d in range(1, 15):
-                days.append(_shift_days(d))
-            for d in range(1, 15):
-                days.append(_shift_days(-d))
-        # 今日置首 → 未来升序（标「预定」）→ 过去降序；去重保序
-        uniq, seen = [], set()
-        for d in days:
-            if d and d not in seen:
-                seen.add(d)
-                uniq.append(d)
+        """网页日期带：today-15 ~ today+15 连续 31 天升序（对齐 cal-strip te()）。
+        不再请求 /v1/calendar/days（网页日历不用该接口，且返回的是有货日集合
+        与网页连续窗口不一致）。标签：今日 / MM-DD / MM-DD 预定。"""
+        try:
+            y, m, d = map(int, today.split("-"))
+            base = datetime.date(y, m, d)
+        except Exception:
+            base = datetime.date.today()
+            today = base.isoformat()
         vals = []
-        for d in sorted(x for x in uniq if x > today):
-            vals.append({"n": "%s 预定" % d, "v": d})
-        for d in sorted((x for x in uniq if x < today), reverse=True):
-            vals.append({"n": d, "v": d})
-        # 今日恒为首选（init=today 必须有对应项；无货日 _calendar_list 也能兜底）
-        vals.insert(0, {"n": "今日", "v": today})
+        for off in range(-15, 16):
+            day = base + datetime.timedelta(days=off)
+            ds = day.isoformat()
+            if ds == today:
+                n = "今日"
+            elif day > base:
+                n = "%s-%s 预定" % (day.month, day.day)
+            else:
+                n = "%s-%s" % (day.month, day.day)
+            vals.append({"n": n, "v": ds})
         return vals
 
     def homeContent(self, filter=None):
@@ -1323,21 +1318,29 @@ class Spider:
             if c["type_id"] == "uncensored" and not self.enable_uncensored:
                 continue
             classes.append(dict(c))
-        tab_days = [self._tab_group("new"), self._days_group(),
-                    self._tags_group(), self._ltx_group()]
+        tab_days = [self._tab_group("new"), self._days_group()]
+        tab_days.extend(self._tag_flags())   # 8×0/1 磁力标签（多选）
+        tab_days.append(self._ltx_group())
         filters = {}
         for tid in ("av", "fc2", "uncensored"):
             if tid == "uncensored" and not self.enable_uncensored:
                 continue
             # 浅拷贝：各板块 filters 独立，避免 TVBox 改一处牵连全部
             filters[tid] = [dict(x) for x in tab_days]
-        # 发售日历：优先 /v1/calendar/days 只列有货日期（对齐网页月历），
-        # 失败回退硬编码 ±14 天
+        # 发售日历：日期带 = 今日±15 连续 31 天（对齐网页 cal-strip）；
+        # 筛选 = 全部/可播/有磁力/可播+有磁力（对齐网页 filter-chip 可叠加）
         today = _today()
         date_vals = self._calendar_days(today)
         filters["calendar"] = [
             {"key": "date", "name": "日期", "init": today,
              "value": date_vals},
+            {"key": "cal", "name": "筛选", "init": "all",
+             "value": [
+                 {"n": "全部", "v": "all"},
+                 {"n": "可播", "v": "playable"},
+                 {"n": "有磁力", "v": "links"},
+                 {"n": "可播+有磁力", "v": "both"},
+             ]},
         ]
         return {"class": classes, "filters": filters}
 
@@ -1367,11 +1370,17 @@ class Spider:
             days = 7
         if tab == "links":
             path = "/v1/lists/links"
-            # 网页 links 分区 tags 多选逗号连接；本筛选为单选子集，
-            # 客户端若传逗号串也原样透传。空=不过滤。
-            tags = _to_text(fs.get("tags") or "").strip().lower()
-            if tags:
-                params["tags"] = tags
+            # 网页 links 分区 tags 多选逗号连接：收集 8 个 tag_* =1 的子筛选
+            tag_keys = ("zh_sub", "uncensored", "cracked", "ltx",
+                        "4k", "fhd", "hd", "vr")
+            selected = [k for k in tag_keys
+                        if _to_text(fs.get("tag_" + k) or "") == "1"]
+            # 兼容旧单选 tags / 直传逗号串
+            legacy = _to_text(fs.get("tags") or "").strip().lower()
+            if not selected and legacy:
+                params["tags"] = legacy
+            elif selected:
+                params["tags"] = ",".join(selected)
         elif tab == "playable":
             path = "/v1/lists/playable"
             # 网页 playable 分区 ltx=1 仅 LTX 破解
@@ -1390,37 +1399,47 @@ class Spider:
         return path, params
 
     def _calendar_list(self, fs, page):
-        """发售日历：/v1/calendar?date=YYYY-MM-DD
-        items 字段为 {cid,code,cover_url,title,work_id}，需映射成 work id。
-        接口 total 被请求 limit 截断（limit=24→total=24，limit=500→真实 199），
-        按页递增请求会把 one_page 判定恒真、单日永远锁死 1 页 → 单次拉全（500）本地分页。"""
+        """发售日历：/v1/lists/new?since=&until=（对齐网页 listNew，非 /v1/calendar）。
+        筛选 cal=all|playable|links|both → playable=1 / links=1 可叠加。
+        单日作品量小：按页拉全（接口单页上限 ~200，需循环）缓存完整列表，
+        本地按 36/页分页（翻 page1/2/3 只产生网络请求的必要次数；
+        缓存键 (date, cal) 不含 page）。total 取接口真实 total（非 len 截断值）。"""
         date = _to_text(fs.get("date") or "") or _today()
-        limit = self.page_size
-        # 同 date 300s 内复用全量 norm：翻 page1/2/3 只产生 1 次网络请求
+        cal = _to_text(fs.get("cal") or "all") or "all"
+        limit = 36
+        fetch_limit = 200   # 实测接口单页上限；>200 会被截断
+        cache_key = "%s|%s" % (date, cal)
         now = time.time()
-        hit = self._cal_cache.get(date)
+        hit = self._cal_cache.get(cache_key)
         if hit and now - hit[0] < 300:
-            norm = hit[1]
+            works, total = hit[1], hit[2]
         else:
-            data = self._api_get("/v1/calendar",
-                                 {"date": date, "limit": CALENDAR_FETCH_MAX})
-            works = data.get("items") or data.get("works") or []
-            norm = []
-            for w in works:
-                if not isinstance(w, dict):
-                    continue
-                if not w.get("id") and w.get("work_id"):
-                    w = dict(w)
-                    w["id"] = w.get("work_id")
-                norm.append(w)
-            self._cal_cache[date] = (now, norm)
+            params = {"since": date, "until": date, "limit": fetch_limit,
+                      "page": 1}
+            if cal in ("playable", "both"):
+                params["playable"] = 1
+            if cal in ("links", "both"):
+                params["links"] = 1
+            data = self._api_get("/v1/lists/new", params)
+            works = list(data.get("items") or data.get("works") or [])
+            total = _safe_int(data.get("total"), len(works))
+            # 接口单页截断时按页补齐（上限 10 页 = 2000 条，防失控）
+            pg = 1
+            while len(works) < total and pg < 10:
+                pg += 1
+                params["page"] = pg
+                data = self._api_get("/v1/lists/new", params)
+                chunk = data.get("items") or data.get("works") or []
+                if not chunk:
+                    break
+                works.extend(chunk)
+            self._cal_cache[cache_key] = (now, works, total)
             if len(self._cal_cache) > 16:
                 self._cal_cache.pop(next(iter(self._cal_cache)), None)
-        total = len(norm)
         start = (page - 1) * limit
-        chunk = norm[start:start + limit]
+        chunk = works[start:start + limit]
         out = self._works_to_list(chunk)
-        if not out:
+        if not out and total > 0:
             page = max(1, min(page, (total + limit - 1) // limit or 1))
         return {"list": out, "page": page,
                 "pagecount": max(1, (total + limit - 1) // limit),
@@ -1871,10 +1890,19 @@ class Spider:
         if self.enable_offline_115:
             info_lines.append("115离线：提交到115云端，完成后自动直连播放 (v%s)" % VERSION)
 
-        # 播放源：预览 → 在线 → 磁力 → 115离线
-        # （网页端：预览置顶、可播给在线、磁力列表、115 为本插件转存；磁力/115 与 javdbui 同构）
+        # 播放源：在线 → 预览 → 磁力 → 115离线
+        # （网页端默认页签「完整影片」置顶，不受 playable 门控：实测 resolve 对
+        #  playable=false 仍返回 HLS；playable 过期只影响 info 文案/徽章，不挡源。
+        #  磁力/115 与 javdbui 同构）
         play_from = []
         play_url = []
+
+        # 在线解析（伪链，playerContent 取 variants）：只要番号在就挂，
+        # 播放时 resolve 无源再报错回退——对齐网页「完整影片」页签始终可见
+        if number:
+            play_from.append("在线")
+            play_url.append("在线$%s" % _sanitize_play(
+                RESOLVE_PREFIX + "%s|%s" % (number, content_class)))
 
         # 预览（伪链，playerContent 探测）：DMM 候选或 work 自带样片
         sample_mv = _to_text(work.get("sample_movie_url") or "")
@@ -1884,12 +1912,6 @@ class Spider:
         if number and (self._dmm_candidates(number) or has_sample):
             play_from.append("预览")
             play_url.append("预览$%s" % _sanitize_play(PREVIEW_PREFIX + number))
-
-        # 在线解析（伪链，playerContent 取 variants）
-        if playable and number:
-            play_from.append("在线")
-            play_url.append("在线$%s" % _sanitize_play(
-                RESOLVE_PREFIX + "%s|%s" % (number, content_class)))
 
         # 磁力源（与 javdbui 一致：只用 hash 重建干净磁力，不带上游 dn=）
         if self.enable_magnet and magnets:
