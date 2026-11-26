@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 # msda.py —— FANZA METADATA INDEX (fanza.fastcdn.dpdns.org) 爬虫
 # 参照 javdbui.py 结构：分类/筛选与网页端对齐；磁力 + 115 离线可播放。
 # 网页板块：AV档案(/) / 无码档案(/uncensored) / FC2档案(/fc2) / 发售日历(/calendar)
 # 列表页签：全部新作(lists/new) / 有磁链(lists/links) / 可播(lists/playable)
 # 数据 API：fanza-api.fastcdn.dpdns.org/v1/*；播放解析：站点 /api/rv/v1/resolve
 # 说明：Cloudflare 对普通 requests + Chrome UA 直接 403；优先 curl_cffi 指纹，无指纹时改 okhttp 头兜底。
+# v1.0.6 在线 HLS data URI 落本机 .m3u8：_data_uri_to_text 完整解码校验 #EXTM3U，本地 ThreadingHTTPServer(/msda/<token>.m3u8) 交完整播放列表，修 OK影视 只播首分片；服务不可用回退 _play_err 不再取首分片。
 # v1.0.5 115 离线选集标签：显示名改 [大小 格式 去码] 磁力文件名（_offline_episode_label，仅展示、off id 的 l 仍走 _magnet_label 短标签）；格式只认容器词（mp4/mkv/avi/mov/wmv/flv/ts/webm/rmvb/m2ts/m4v），h265/hevc/avc 等编码词不算，file_name 无容器词则不显示格式；tags 含 cracked 或文件名含 破解/Mosaic/去码 → 括号内加「去码」；展示名剥前导 [..] 块。
 # v1.0.4 查验修复：①日历分页锁死 199（total 被 limit 截断）→ 单次拉 500 本地分页、total/pagecount 精确；②时长全链路缺失（duration_sec 在 versions[] 非顶层）→ _work_duration 取版本时长，恒秒转分废除 >10000 启发式（3664 分钟误显消失）；③FC2-* 反查硬编码 class=av 必空 → 按前缀选类+跨类兜底；④playerContent 裸番号分支只认 115 → 115→磁力→预览→在线 四级回退，终兜底带 msg 不再空 url 黑屏；⑤429 移出自动重试（对齐网页）；⑥task_del 删后确认 max_page=2 漏深页误判「已删」→ max_page=0 按 page_count 全页扫（上限 30 页）；⑦日历筛选补未来 14 天「预定」（接口实测有数据）；⑧has_source 消费为「有源」徽章；⑨分类名/顺序对齐网页（AV 档案→FC2 档案→无码档案）+ 筛选同步；⑩时间窗收敛 7/14/30；⑪删 _api_action 死字段；⑫_search_pagecount 用 search_limit、搜索 fetch 触顶 500、空页 pagecount 收口；⑬_vid_meta 超 128 淘汰最旧 1/4。
 # v1.0.3 115 离线可用性：①失败任务不再永久卡死——ac=task_del(hash[0]) 删旧后自动重提；②/v1/links 失败/error 不写 120s 空缓存；③等待超时可配 ext.offlinePollTimeout（默认 20s），文案改为「云端下载中非失败」；④详情标注无做种/源站无磁链。
@@ -623,6 +624,126 @@ def _shrink_pic(data, mime, max_w=720):
     except Exception:
         pass
     return data, mime
+
+
+# ==================== 本地 HLS 播放列表服务 ====================
+# 在线 resolve 返回的 data URI 是完整 M3U8（可达 128KB），播放器不认 data:，
+# 也绝不能只取首行分片（那只是 4 秒片段）。这里把它缓存到内存，用本机
+# ThreadingHTTPServer 交出真正的 .m3u8 地址；分片在列表里都是绝对 https，
+# 播放器自行拉取，无需代理分片。参照 javdbui.py 自建图片服务同款做法。
+_HLS_CACHE = {}            # token -> (ts, text)
+_HLS_CACHE_MAX = 8
+_HLS_TTL = 1800
+_HLS_SRV = {"base": "", "tried": False}
+_HLS_SRV_LOCK = threading.Lock()
+
+
+def _hls_put(text):
+    """缓存完整 m3u8 文本，返回 token（内容 sha1 前 16 位）。"""
+    tok = hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+    now = time.time()
+    for k in [k for k, (ts, _) in list(_HLS_CACHE.items())
+              if now - ts >= _HLS_TTL]:
+        _HLS_CACHE.pop(k, None)
+    if len(_HLS_CACHE) >= _HLS_CACHE_MAX and tok not in _HLS_CACHE:
+        oldest = min(_HLS_CACHE, key=lambda k: _HLS_CACHE[k][0])
+        _HLS_CACHE.pop(oldest, None)
+    _HLS_CACHE[tok] = (now, text)
+    return tok
+
+
+def _hls_server_base():
+    """懒启动 127.0.0.1 本地服务，返回 base（http://127.0.0.1:port）或 ""。"""
+    if _HLS_SRV["base"]:
+        return _HLS_SRV["base"]
+    if _HLS_SRV["tried"]:
+        return ""
+    with _HLS_SRV_LOCK:
+        if _HLS_SRV["base"]:
+            return _HLS_SRV["base"]
+        if _HLS_SRV["tried"]:
+            return ""
+        _HLS_SRV["tried"] = True
+        try:
+            try:
+                from http.server import (BaseHTTPRequestHandler,
+                                         ThreadingHTTPServer)
+            except ImportError:      # Python 3.6 没有 ThreadingHTTPServer
+                import socketserver
+                from http.server import BaseHTTPRequestHandler, HTTPServer
+
+                class ThreadingHTTPServer(socketserver.ThreadingMixIn,
+                                          HTTPServer):
+                    daemon_threads = True
+
+            class _HlsHandler(BaseHTTPRequestHandler):
+                server_version = "msda-hls"
+
+                def log_message(self, fmt, *args):
+                    pass                # 电视端 stdout 很贵，别刷日志
+
+                def _serve(self, with_body):
+                    path = (self.path or "").split("?", 1)[0]
+                    body = b""
+                    if path.startswith("/msda/") and path.endswith(".m3u8"):
+                        tok = path[len("/msda/"):-len(".m3u8")]
+                        ent = _HLS_CACHE.get(tok)
+                        if ent and time.time() - ent[0] < _HLS_TTL:
+                            body = ent[1].encode("utf-8")
+                    if not body:
+                        self.send_error(404)
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type",
+                                     "application/vnd.apple.mpegurl")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    if with_body:
+                        self.wfile.write(body)
+
+                def do_GET(self):
+                    self._serve(True)
+
+                def do_HEAD(self):
+                    self._serve(False)
+
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), _HlsHandler)
+            httpd.daemon_threads = True
+            t = threading.Thread(target=httpd.serve_forever,
+                                 kwargs={"poll_interval": 0.2})
+            t.daemon = True
+            t.start()
+            base = "http://127.0.0.1:%d" % httpd.server_address[1]
+            # 回环自检：绕开 http_proxy（配了代理没写 no_proxy 时
+            # 127.0.0.1 会被丢给代理，探活误判成服务不可用）。
+            alive = False
+            try:
+                import urllib.request as _urlreq
+                opener = _urlreq.build_opener(_urlreq.ProxyHandler({}))
+                opener.open(base + "/msda/__probe__.m3u8", timeout=3)
+            except Exception as e:
+                alive = getattr(e, "code", None) == 404
+            if alive:
+                _HLS_SRV["base"] = base
+            else:
+                try:
+                    httpd.shutdown()
+                except Exception:
+                    pass
+                _HLS_SRV["base"] = ""
+        except Exception:
+            _HLS_SRV["base"] = ""
+        return _HLS_SRV["base"]
+
+
+def _hls_local_url(text):
+    """完整 m3u8 文本 → 本地短 URL；服务不可用返回 ""。"""
+    base = _hls_server_base()
+    if not base:
+        return ""
+    return "%s/msda/%s.m3u8" % (base, _hls_put(text))
 
 
 # ==================== Spider ====================
@@ -1612,9 +1733,9 @@ class Spider:
             })
         return out
 
-    def _data_uri_to_url(self, u):
-        """data:application/vnd.apple.mpegurl,... → 解出 m3u8 文本里的首条 http 地址。
-        data URI 本体播放器不认，必须还原。"""
+    def _data_uri_to_text(self, u):
+        """data:application/vnd.apple.mpegurl,... → 解码后的完整文本。
+        非 data: 原样返回；失败返回 ""。"""
         u = _to_text(u)
         if not u.startswith("data:"):
             return u
@@ -1623,20 +1744,11 @@ class Spider:
                 return ""
             header, body = u.split(",", 1)
             if ";base64" in header:
-                text = base64.b64decode(body).decode("utf-8", "ignore")
-            else:
-                from urllib.parse import unquote as _un
-                text = _un(body)
-            # m3u8：取第一条绝对 http 行；否则整段当直链尝试
-            for line in text.splitlines():
-                line = line.strip()
-                if line.startswith(("http://", "https://")):
-                    return line
-            if text.strip().startswith(("http://", "https://")):
-                return text.strip()
+                return base64.b64decode(body).decode("utf-8", "ignore")
+            from urllib.parse import unquote as _un
+            return _un(body)
         except Exception:
             return ""
-        return ""
 
     # ---------- 详情 ----------
     def detailContent(self, ids):
@@ -3104,16 +3216,38 @@ class Spider:
             variants = self._resolve_variants(code, content_class)
             last_err = ""
             for v in variants:
-                u = self._data_uri_to_url(v.get("url") or "")
-                if not u:
+                text = self._data_uri_to_text(v.get("url") or "")
+                if not text:
                     last_err = "data URI 无法还原"
                     continue
-                if u.startswith(("http://", "https://")):
+                if text.lstrip().startswith("#EXTM3U"):
+                    # 完整 HLS 播放列表 → 落本机 .m3u8 服务，交整段给播放器
+                    u = _hls_local_url(text)
+                    if not u:
+                        last_err = "本地 m3u8 服务不可用"
+                        continue
                     return {
                         "parse": 0, "jx": 0, "playUrl": "", "url": u,
+                        "format": "application/x-mpegURL",
                         "header": {"User-Agent": self.ua,
                                    "Referer": self.host + "/", "Accept": "*/*"},
                     }
+                # 非播放列表：取首条 http 直链（原行为）
+                for line in text.splitlines():
+                    line = line.strip()
+                    if line.startswith(("http://", "https://")):
+                        return {
+                            "parse": 0, "jx": 0, "playUrl": "", "url": line,
+                            "header": {"User-Agent": self.ua,
+                                       "Referer": self.host + "/", "Accept": "*/*"},
+                        }
+                if text.strip().startswith(("http://", "https://")):
+                    return {
+                        "parse": 0, "jx": 0, "playUrl": "", "url": text.strip(),
+                        "header": {"User-Agent": self.ua,
+                                   "Referer": self.host + "/", "Accept": "*/*"},
+                    }
+                last_err = "无可用直链"
             return _play_err("在线解析暂不可用（%s），请改用磁力或115离线"
                              % (last_err or "无可用源"))
 
