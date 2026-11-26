@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.0.6"
+VERSION = "1.0.7"
 # msda.py —— FANZA METADATA INDEX (fanza.fastcdn.dpdns.org) 爬虫
 # 参照 javdbui.py 结构：分类/筛选与网页端对齐；磁力 + 115 离线可播放。
 # 网页板块：AV档案(/) / 无码档案(/uncensored) / FC2档案(/fc2) / 发售日历(/calendar)
 # 列表页签：全部新作(lists/new) / 有磁链(lists/links) / 可播(lists/playable)
 # 数据 API：fanza-api.fastcdn.dpdns.org/v1/*；播放解析：站点 /api/rv/v1/resolve
 # 说明：Cloudflare 对普通 requests + Chrome UA 直接 403；优先 curl_cffi 指纹，无指纹时改 okhttp 头兜底。
+# v1.0.7 在线源不再受 playable 门控（网页「完整影片」页签同此；实测 resolve 对 playable=false 仍返回 HLS）+ 源顺序恢复 预览→在线；分类筛选撤回 8×否/是 子筛选、恢复单选磁力标签组（对齐网页标签名）；发售日历改 lists/new since/until + 今日±15 连续 31 天 + 可播/有磁力四态筛选；vod_remarks 徽章置首 ●可播；_today/_shift_days 固定 UTC+8。
 # v1.0.6 在线 HLS data URI 落本机 .m3u8：_data_uri_to_text 完整解码校验 #EXTM3U，本地 ThreadingHTTPServer(/msda/<token>.m3u8) 交完整播放列表，修 OK影视 只播首分片；服务不可用回退 _play_err 不再取首分片。
 # v1.0.5 115 离线选集标签：显示名改 [大小 格式 去码] 磁力文件名（_offline_episode_label，仅展示、off id 的 l 仍走 _magnet_label 短标签）；格式只认容器词（mp4/mkv/avi/mov/wmv/flv/ts/webm/rmvb/m2ts/m4v），h265/hevc/avc 等编码词不算，file_name 无容器词则不显示格式；tags 含 cracked 或文件名含 破解/Mosaic/去码 → 括号内加「去码」；展示名剥前导 [..] 块。
 # v1.0.4 查验修复：①日历分页锁死 199（total 被 limit 截断）→ 单次拉 500 本地分页、total/pagecount 精确；②时长全链路缺失（duration_sec 在 versions[] 非顶层）→ _work_duration 取版本时长，恒秒转分废除 >10000 启发式（3664 分钟误显消失）；③FC2-* 反查硬编码 class=av 必空 → 按前缀选类+跨类兜底；④playerContent 裸番号分支只认 115 → 115→磁力→预览→在线 四级回退，终兜底带 msg 不再空 url 黑屏；⑤429 移出自动重试（对齐网页）；⑥task_del 删后确认 max_page=2 漏深页误判「已删」→ max_page=0 按 page_count 全页扫（上限 30 页）；⑦日历筛选补未来 14 天「预定」（接口实测有数据）；⑧has_source 消费为「有源」徽章；⑨分类名/顺序对齐网页（AV 档案→FC2 档案→无码档案）+ 筛选同步；⑩时间窗收敛 7/14/30；⑪删 _api_action 死字段；⑫_search_pagecount 用 search_limit、搜索 fetch 触顶 500、空页 pagecount 收口；⑬_vid_meta 超 128 淘汰最旧 1/4。
@@ -1245,21 +1246,10 @@ class Spider:
                 ]}
 
     @staticmethod
-    def _tag_flag_group(key, label):
-        """磁力标签 0/1 子筛选（网页多选逗号连接；TVBox 无多选先例 →
-        拆成 8 个独立 0/1 组，_list_params 收集 value=1 拼逗号串）。
-        仅 tab=links 生效。"""
-        return {"key": key, "name": "磁力·%s（仅有磁链）" % label,
-                "init": "0",
-                "value": [
-                    {"n": "否", "v": "0"},
-                    {"n": "是", "v": "1"},
-                ]}
-
-    @staticmethod
     def _tags_group():
-        """兼容旧单选 tags 筛选（value 仍为标签键）。新路径用 _tag_flags()。"""
-        return {"key": "tags", "name": "磁力标签（仅有磁链·单选）", "init": "",
+        """磁力标签单选（value=标签键；网页为多选，TVBox 无多选先例 →
+        单选子集，客户端若传逗号串 _list_params 也原样透传）。仅 tab=links 生效。"""
+        return {"key": "tags", "name": "磁力标签（仅有磁链）", "init": "",
                 "value": [
                     {"n": "全部", "v": ""},
                     {"n": "中字", "v": "zh_sub"},
@@ -1271,14 +1261,6 @@ class Spider:
                     {"n": "HD", "v": "hd"},
                     {"n": "VR", "v": "vr"},
                 ]}
-
-    @classmethod
-    def _tag_flags(cls):
-        """8 个磁力标签 0/1 子筛选（对齐网页多选）。"""
-        keys = [("zh_sub", "中字"), ("uncensored", "无码"),
-                ("cracked", "破解"), ("ltx", "LTX破解"),
-                ("4k", "4K"), ("fhd", "FHD"), ("hd", "HD"), ("vr", "VR")]
-        return [cls._tag_flag_group("tag_%s" % k, lab) for k, lab in keys]
 
     @staticmethod
     def _ltx_group():
@@ -1318,9 +1300,8 @@ class Spider:
             if c["type_id"] == "uncensored" and not self.enable_uncensored:
                 continue
             classes.append(dict(c))
-        tab_days = [self._tab_group("new"), self._days_group()]
-        tab_days.extend(self._tag_flags())   # 8×0/1 磁力标签（多选）
-        tab_days.append(self._ltx_group())
+        tab_days = [self._tab_group("new"), self._days_group(),
+                    self._tags_group(), self._ltx_group()]
         filters = {}
         for tid in ("av", "fc2", "uncensored"):
             if tid == "uncensored" and not self.enable_uncensored:
@@ -1370,17 +1351,10 @@ class Spider:
             days = 7
         if tab == "links":
             path = "/v1/lists/links"
-            # 网页 links 分区 tags 多选逗号连接：收集 8 个 tag_* =1 的子筛选
-            tag_keys = ("zh_sub", "uncensored", "cracked", "ltx",
-                        "4k", "fhd", "hd", "vr")
-            selected = [k for k in tag_keys
-                        if _to_text(fs.get("tag_" + k) or "") == "1"]
-            # 兼容旧单选 tags / 直传逗号串
-            legacy = _to_text(fs.get("tags") or "").strip().lower()
-            if not selected and legacy:
-                params["tags"] = legacy
-            elif selected:
-                params["tags"] = ",".join(selected)
+            # 单选 tags（UI 磁力标签组）；客户端若直传逗号串也原样透传
+            tags = _to_text(fs.get("tags") or "").strip().lower()
+            if tags:
+                params["tags"] = tags
         elif tab == "playable":
             path = "/v1/lists/playable"
             # 网页 playable 分区 ltx=1 仅 LTX 破解
@@ -1890,19 +1864,11 @@ class Spider:
         if self.enable_offline_115:
             info_lines.append("115离线：提交到115云端，完成后自动直连播放 (v%s)" % VERSION)
 
-        # 播放源：在线 → 预览 → 磁力 → 115离线
-        # （网页端默认页签「完整影片」置顶，不受 playable 门控：实测 resolve 对
-        #  playable=false 仍返回 HLS；playable 过期只影响 info 文案/徽章，不挡源。
-        #  磁力/115 与 javdbui 同构）
+        # 播放源：预览 → 在线 → 磁力 → 115离线
+        # （在线不受 playable 门控：实测 resolve 对 playable=false 仍返回 HLS；
+        #  playable 过期只影响 info 文案/徽章，不挡源。磁力/115 与 javdbui 同构）
         play_from = []
         play_url = []
-
-        # 在线解析（伪链，playerContent 取 variants）：只要番号在就挂，
-        # 播放时 resolve 无源再报错回退——对齐网页「完整影片」页签始终可见
-        if number:
-            play_from.append("在线")
-            play_url.append("在线$%s" % _sanitize_play(
-                RESOLVE_PREFIX + "%s|%s" % (number, content_class)))
 
         # 预览（伪链，playerContent 探测）：DMM 候选或 work 自带样片
         sample_mv = _to_text(work.get("sample_movie_url") or "")
@@ -1912,6 +1878,13 @@ class Spider:
         if number and (self._dmm_candidates(number) or has_sample):
             play_from.append("预览")
             play_url.append("预览$%s" % _sanitize_play(PREVIEW_PREFIX + number))
+
+        # 在线解析（伪链，playerContent 取 variants）：只要番号在就挂，
+        # 播放时 resolve 无源再报错回退——对齐网页「完整影片」页签始终可见
+        if number:
+            play_from.append("在线")
+            play_url.append("在线$%s" % _sanitize_play(
+                RESOLVE_PREFIX + "%s|%s" % (number, content_class)))
 
         # 磁力源（与 javdbui 一致：只用 hash 重建干净磁力，不带上游 dn=）
         if self.enable_magnet and magnets:
