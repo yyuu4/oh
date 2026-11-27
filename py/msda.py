@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.0.7"
+VERSION = "1.0.9"
 # msda.py —— FANZA METADATA INDEX (fanza.fastcdn.dpdns.org) 爬虫
 # 参照 javdbui.py 结构：分类/筛选与网页端对齐；磁力 + 115 离线可播放。
 # 网页板块：AV档案(/) / 无码档案(/uncensored) / FC2档案(/fc2) / 发售日历(/calendar)
 # 列表页签：全部新作(lists/new) / 有磁链(lists/links) / 可播(lists/playable)
 # 数据 API：fanza-api.fastcdn.dpdns.org/v1/*；播放解析：站点 /api/rv/v1/resolve
 # 说明：Cloudflare 对普通 requests + Chrome UA 直接 403；优先 curl_cffi 指纹，无指纹时改 okhttp 头兜底。
+# v1.0.9 验收修正：TLS verify 默认 True（ext.verify=false 显式关闭）；页签文案改回 filter-chip 的 有磁链/可播（v1.0.8 误用列表标题）；LTX 组名改回 LTX（同前误用标题）。115 cookie 默认保留（用户要求）。
+# v1.0.8 页签与 LTX 筛选文案对齐网页：有磁链→最新有磁链、可播→现在可播；LTX 组名 LTX（仅可播）→现在可播 · LTX。
 # v1.0.7 在线源不再受 playable 门控（网页「完整影片」页签同此；实测 resolve 对 playable=false 仍返回 HLS）+ 源顺序恢复 预览→在线；分类筛选撤回 8×否/是 子筛选、恢复单选磁力标签组（对齐网页标签名）；发售日历改 lists/new since/until + 今日±15 连续 31 天 + 可播/有磁力四态筛选；vod_remarks 徽章置首 ●可播；_today/_shift_days 固定 UTC+8。
 # v1.0.6 在线 HLS data URI 落本机 .m3u8：_data_uri_to_text 完整解码校验 #EXTM3U，本地 ThreadingHTTPServer(/msda/<token>.m3u8) 交完整播放列表，修 OK影视 只播首分片；服务不可用回退 _play_err 不再取首分片。
 # v1.0.5 115 离线选集标签：显示名改 [大小 格式 去码] 磁力文件名（_offline_episode_label，仅展示、off id 的 l 仍走 _magnet_label 短标签）；格式只认容器词（mp4/mkv/avi/mov/wmv/flv/ts/webm/rmvb/m2ts/m4v），h265/hevc/avc 等编码词不算，file_name 无容器词则不显示格式；tags 含 cracked 或文件名含 破解/Mosaic/去码 → 括号内加「去码」；展示名剥前导 [..] 块。
@@ -767,7 +769,7 @@ class Spider:
         self.img_proxy = IMG_PROXY
         self.proxy = PROXY
         self.lang = "zh"
-        self.verify = False
+        self.verify = True   # 默认校验 TLS；ext.verify=false 显式关闭
         self.img_proxy_off = False
         self._ext_site_key = ""
 
@@ -1227,7 +1229,8 @@ class Spider:
 
     @staticmethod
     def _tab_group(init="new"):
-        """列表页签：全部新作 / 有磁链 / 可播（对齐网页分区 tab）"""
+        """列表页签：全部新作 / 有磁链 / 可播（对齐网页 filter-chip 按钮文案；
+        最新有磁链/现在可播 是列表标题，不作页签名）"""
         return {"key": "tab", "name": "页签", "init": init,
                 "value": [
                     {"n": "全部新作", "v": "new"},
@@ -1264,8 +1267,8 @@ class Spider:
 
     @staticmethod
     def _ltx_group():
-        """LTX 破解（对齐网页 playable 分区 ltx=1）。仅 tab=playable 生效。"""
-        return {"key": "ltx", "name": "LTX（仅可播）", "init": "0",
+        """LTX 破解（对齐网页可播标签区 entity-pill 文案「LTX」）。仅 tab=playable 生效。"""
+        return {"key": "ltx", "name": "LTX", "init": "0",
                 "value": [
                     {"n": "全部", "v": "0"},
                     {"n": "仅LTX破解", "v": "1"},
