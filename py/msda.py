@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 # msda.py —— FANZA METADATA INDEX (fanza.fastcdn.dpdns.org) 爬虫
 # 参照 javdbui.py 结构：分类/筛选与网页端对齐；磁力 + 115 离线可播放。
 # 网页板块：AV档案(/) / 无码档案(/uncensored) / FC2档案(/fc2) / 发售日历(/calendar)
 # 列表页签：全部新作(lists/new) / 有磁链(lists/links) / 可播(lists/playable)
 # 数据 API：fanza-api.fastcdn.dpdns.org/v1/*；播放解析：站点 /api/rv/v1/resolve
 # 说明：Cloudflare 对普通 requests + Chrome UA 直接 403；优先 curl_cffi 指纹，无指纹时改 okhttp 头兜底。
+# v1.1.1 分类出图修复：正常图床直连；连接失败仅跳过该 host 的直连并自动回退显式/图片专用/本机代理（常见端口实测探测），成功线路缓存复用；单图 403/404/解码失败不再整 host 拉黑，冷却期也不再返回空 vod_pic；连接/读取超时拆为 4s/12s。
 # v1.1.0 出图根因修复：自建 127.0.0.1/pic/ 封面服务（vod_pic 短链，盒子只拉本机）+ _shrink_pic Pillow 兜底降采样 ≤720px + 图片 8s 短超时 + 连接层失败整 host 冷却 600s（heydouga/tokyo-hot 等不拖页）；磁盘缓存键 v3。
 # v1.0.9 验收修正：TLS verify 默认 True（ext.verify=false 显式关闭）；页签文案改回 filter-chip 的 有磁链/可播（v1.0.8 误用列表标题）；LTX 组名改回 LTX（同前误用标题）。115 cookie 默认保留（用户要求）。
 # v1.0.8 页签与 LTX 筛选文案对齐网页：有磁链→最新有磁链、可播→现在可播；LTX 组名 LTX（仅可播）→现在可播 · LTX。
@@ -50,8 +51,10 @@ except Exception:
 # 配置区
 # ===========================================================================
 # (1) 网页代理：只管「爬虫抓网页/下图片」，播放地址由 App 自己去取。
-# 默认留空（直连即可）；若直连被 Cloudflare 拦，可填 http://192.168.1.8:7890
+# 元数据接口直连可用，默认不强制走代理；若直连被 Cloudflare 拦可在 ext.proxy 覆盖。
 PROXY = ""
+# 图片专用回退代理：未设置 ext.proxy 时，在原图直连失败后启用，避免元数据 API 被代理出口 403。
+PIC_PROXY = "http://192.168.1.8:7144"
 
 # (2) 图片反代：图片显示不出来时再开（默认关闭）
 IMG_PROXY = ""
@@ -774,11 +777,15 @@ def _hls_local_url(text):
 # 根因：列表 vod_pic 直出 DMM 等海外原图（~1MB/张、无 Cache-Control），
 # 盒子一屏 24 张 ≈ 20MB 且部分图床 IPv6/超时 → 整栏白图。
 # 对齐 javdbui v1.5.6：vod_pic 改给 127.0.0.1 短链，本机取图+降采样+缓存。
-_PIC_DEAD = {}                 # host -> expire_ts（连接层失败后冷却，避免拖页）
-_PIC_DEAD_TTL = 600
+_PIC_DEAD = {}                 # host -> expire_ts（只跳过直连，不影响代理/缓存/URL 输出）
+_PIC_DEAD_TTL = 180
 _PIC_DEAD_LOCK = threading.Lock()
 _PIC_SRV = {"base": "", "tried": False, "spider": None}
 _PIC_SRV_LOCK = threading.Lock()
+# 显式 ext.proxy 永远优先；未配置时才在实际失败图片上探测常见本机代理端口。
+_PIC_AUTO_PROXY_PORTS = (7897, 7890, 10809, 10808, 1080)
+_PIC_AUTO_PROXY = {"active": "", "retry_after": 0.0}
+_PIC_PROXY_LOCK = threading.Lock()
 
 
 def _pic_host(url):
@@ -868,7 +875,7 @@ def _pic_server_base():
                     if path.startswith("/pic/") and path.endswith(".jpg"):
                         tok = path[len("/pic/"):-len(".jpg")]
                         url = _pic_unpack(tok)
-                        if url and not _pic_is_dead(url):
+                        if url:
                             sp = _PIC_SRV.get("spider")
                             try:
                                 if sp is not None:
@@ -877,8 +884,6 @@ def _pic_server_base():
                                     body, mime = b"", ""
                             except Exception:
                                 body, mime = b"", ""
-                            if not body:
-                                _pic_mark_dead(url)
                     if not body:
                         self.send_error(404)
                         return
@@ -926,13 +931,44 @@ def _pic_server_base():
 
 
 def _pic_local_url(url):
-    """原图 URL → 本机短链；服务不可用 / 图床已判死 → ""。"""
-    if not url or _pic_is_dead(url):
+    """原图 URL → 本机短链；直连冷却时仍保留 URL，由取图层切换代理。"""
+    if not url:
         return ""
     base = _pic_server_base()
     if not base:
         return ""
     return "%s/pic/%s.jpg" % (base, _pic_pack(url))
+
+
+def _pic_proxy_candidates(configured=""):
+    """显式代理 + 已验证线路优先；仅在冷却外追加常见本机代理候选。"""
+    with _PIC_PROXY_LOCK:
+        active = _PIC_AUTO_PROXY.get("active") or ""
+        allow_auto = time.time() >= float(
+            _PIC_AUTO_PROXY.get("retry_after") or 0)
+    out = []
+    for proxy in ([_norm_proxy(configured)] if configured else []) + [active]:
+        if proxy and proxy not in out:
+            out.append(proxy)
+    if allow_auto:
+        for port in _PIC_AUTO_PROXY_PORTS:
+            proxy = "http://127.0.0.1:%d" % port
+            if proxy not in out:
+                out.append(proxy)
+    return out, allow_auto
+
+
+def _pic_proxy_mark(proxy="", success=False):
+    """缓存可用线路；单线路失败只清自身，全部失败时暂停自动扫描 60 秒。"""
+    with _PIC_PROXY_LOCK:
+        if success and proxy:
+            _PIC_AUTO_PROXY["active"] = proxy
+            _PIC_AUTO_PROXY["retry_after"] = 0.0
+        elif proxy:
+            if _PIC_AUTO_PROXY.get("active") == proxy:
+                _PIC_AUTO_PROXY["active"] = ""
+        else:
+            _PIC_AUTO_PROXY["retry_after"] = time.time() + 60
 
 
 # ==================== Spider ====================
@@ -952,6 +988,7 @@ class Spider:
         self.cookie = ""
         self.img_proxy = IMG_PROXY
         self.proxy = PROXY
+        self.pic_proxy = PIC_PROXY
         self.lang = "zh"
         self.verify = True   # 默认校验 TLS；ext.verify=false 显式关闭
         self.img_proxy_off = False
@@ -1382,7 +1419,7 @@ class Spider:
 
     def _proxy_pic(self, url):
         """封面交付：img 反代（显式配置）→ 本机 /pic/ 短链 → 原图兜底。
-        死图床（连接层失败冷却中）直接留空，避免盒子再撞超时。"""
+        直连冷却只影响取图线路，不再清空 vod_pic。"""
         if not url:
             return ""
         url = _to_text(url)
@@ -1401,8 +1438,6 @@ class Spider:
         local = _pic_local_url(url)
         if local:
             return local
-        if _pic_is_dead(url):
-            return ""
         return url
 
     def _site_key(self):
@@ -3593,12 +3628,9 @@ class Spider:
         return [404, "text/plain", b"Not Found", {}]
 
     def _fetch_pic(self, url, max_raw=0):
-        """下载封面并解码 XOR/AES 加密（localProxy kind=image 用；带内存+磁盘缓存）。
-        - 缓存键去掉 ?auth_key= 查询串——cover 的 auth_key 会轮换，
-          带着它做键会导致每次冷启动都重新下载+重新解密。
-        - max_raw>0 时密文超限直接返回：AES-CBC padding-none 等长，
-          2MB PNG 解完也超预算，先跳过可省掉十几秒白解。"""
-        if not requests or not url.startswith(("http://", "https://")):
+        """下载、解码并降采样封面；直连失败自动回退到可用 HTTP 代理。"""
+        if not url.startswith(("http://", "https://")) \
+                or (self.s is None and not requests):
             return b"", ""
         cache = getattr(self, "_pic_cache", None)
         if not isinstance(cache, dict):
@@ -3608,20 +3640,15 @@ class Spider:
         hit = cache.get(ckey)
         now = time.time()
         if hit and now - hit[0] <= 1800:
-            # LRU touch
             del cache[ckey]
             cache[ckey] = hit
             return hit[1], hit[2]
-        # 磁盘缓存（跨重启；键=ckey 的 md5）。带 v3 后缀：v2 时代非 Android
-        # 未降采样存的是原图，换键后按 ≤720px 重下重存，老缓存自然废弃。
         dkey = hashlib.md5((ckey + "|v3").encode("utf-8")).hexdigest()
         dpath = os.path.join(PIC_DISK_DIR, dkey)
-        # 磁盘里存的是解码后的成品，与 max_raw 无关，命中即回
         try:
             if os.path.isfile(dpath):
                 with open(dpath, "rb") as f:
                     blob = f.read()
-                # 文件头 4 字节存 mime 长度+mime，其余为图片数据
                 if len(blob) > 4:
                     mlen = blob[0]
                     mime = blob[1:1 + mlen].decode("ascii", "ignore")
@@ -3631,39 +3658,75 @@ class Spider:
                         return body, mime
         except Exception:
             pass
+
         headers = {
             "User-Agent": WEB_UA,
             "Referer": self.host + "/",
-            "Accept": "image/*,*/*",
+            "Accept": "image/webp,image/*,*/*",
         }
-        sess = self.s
-        # 图片专用短超时：死图床（heydouga 等）不能拖死本机服务线程
-        img_t = min(float(self.timeout or 20), 8.0)
-        try:
-            if sess is None:
-                raise RuntimeError("no session")
-            r = sess.get(url, headers=headers, timeout=img_t,
-                         verify=self.verify)
-        except Exception:
-            # destroy 后会话被关 / 会话异常：临时直连兜底（自建图片服务不能因此断图）
+        # 连接快速失败、读取给慢图床留时间；两条线路独立，不再重复整页等待。
+        img_t = (4.0, 12.0)
+        raw, ctype = b"", ""
+        if not _pic_is_dead(url):
+            r = None
             try:
-                r = requests.get(url, headers=headers, timeout=img_t,
-                                 verify=self.verify)
+                if self.s is not None:
+                    r = self.s.get(url, headers=headers, timeout=img_t,
+                                   verify=self.verify)
+                elif requests is not None:
+                    r = requests.get(url, headers=headers, timeout=img_t,
+                                     verify=self.verify)
             except Exception:
-                # 连接层失败（超时/DNS/SSL/拒绝）→ 冷却整 host，列表期留空
-                _pic_mark_dead(url)
-                return b"", ""
-        if r.status_code != 200 or not r.content:
-            # HTTP 层失败不整 host 拉黑（可能是单张缺失/限流），只本张留空
+                # curl_cffi 与 requests 的 TLS/重定向实现不同，可换一次后端；
+                # 显式代理必须延续到 fallback，不能在异常后偷偷变回直连。
+                if self.s is not None and requests and self._has_impersonate():
+                    try:
+                        proxies = ({"http": self.proxy, "https": self.proxy}
+                                   if self.proxy else None)
+                        r = requests.get(url, headers=headers, timeout=img_t,
+                                         verify=self.verify, proxies=proxies)
+                    except Exception:
+                        r = None
+                if r is None:
+                    # 只跳过该 host 的直连，代理、缓存和 vod_pic 均不受影响。
+                    _pic_mark_dead(url)
+            if r is not None and r.status_code == 200 and r.content:
+                raw = r.content
+                ctype = _to_text(r.headers.get("Content-Type") or "")
+
+        if not raw and (requests or creq):
+            candidates, auto_tried = _pic_proxy_candidates(
+                self.proxy or self.pic_proxy)
+            for proxy in candidates:
+                r = None
+                try:
+                    if requests is not None:
+                        r = requests.get(
+                            url, headers=headers, timeout=img_t, verify=self.verify,
+                            proxies={"http": proxy, "https": proxy})
+                    elif creq is not None:
+                        r = creq.get(
+                            url, headers=headers, timeout=img_t, verify=self.verify,
+                            proxies={"http": proxy, "https": proxy},
+                            impersonate="chrome")
+                except Exception:
+                    _pic_proxy_mark(proxy)
+                    continue
+                if r is None or r.status_code != 200 or not r.content:
+                    continue
+                raw = r.content
+                ctype = _to_text(r.headers.get("Content-Type") or "")
+                _pic_proxy_mark(proxy, success=True)
+                break
+            if not raw and auto_tried:
+                _pic_proxy_mark()
+        if not raw:
             return b"", ""
-        raw = r.content
         if max_raw and len(raw) > max_raw:
-            # 密文等长于明文 → 解完也超限，不解直接留空
             return b"", ""
-        body, mime = self._decode_pic(
-            raw, _to_text(r.headers.get("Content-Type") or ""))
+
+        body, mime = self._decode_pic(raw, ctype)
         if body:
-            # 降采样（Android 原生 / Pillow），缓存里也存小图
             body, mime = _shrink_pic(body, mime)
             cache[ckey] = (now, body, mime)
             while len(cache) > 64:
@@ -3674,7 +3737,6 @@ class Spider:
                 mb = (mime or "image/jpeg").encode("ascii", "ignore")[:200]
                 with open(dpath, "wb") as f:
                     f.write(bytes([len(mb)]) + mb + body)
-                # 缓存不设上限会一路涨（盒子存储有限），每 64 张清一次最旧的
                 self._pic_writes = getattr(self, "_pic_writes", 0) + 1
                 if self._pic_writes % 64 == 0:
                     _prune_pic_cache()
