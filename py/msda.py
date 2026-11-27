@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-VERSION = "1.0.9"
+VERSION = "1.1.0"
 # msda.py —— FANZA METADATA INDEX (fanza.fastcdn.dpdns.org) 爬虫
 # 参照 javdbui.py 结构：分类/筛选与网页端对齐；磁力 + 115 离线可播放。
 # 网页板块：AV档案(/) / 无码档案(/uncensored) / FC2档案(/fc2) / 发售日历(/calendar)
 # 列表页签：全部新作(lists/new) / 有磁链(lists/links) / 可播(lists/playable)
 # 数据 API：fanza-api.fastcdn.dpdns.org/v1/*；播放解析：站点 /api/rv/v1/resolve
 # 说明：Cloudflare 对普通 requests + Chrome UA 直接 403；优先 curl_cffi 指纹，无指纹时改 okhttp 头兜底。
+# v1.1.0 出图根因修复：自建 127.0.0.1/pic/ 封面服务（vod_pic 短链，盒子只拉本机）+ _shrink_pic Pillow 兜底降采样 ≤720px + 图片 8s 短超时 + 连接层失败整 host 冷却 600s（heydouga/tokyo-hot 等不拖页）；磁盘缓存键 v3。
 # v1.0.9 验收修正：TLS verify 默认 True（ext.verify=false 显式关闭）；页签文案改回 filter-chip 的 有磁链/可播（v1.0.8 误用列表标题）；LTX 组名改回 LTX（同前误用标题）。115 cookie 默认保留（用户要求）。
 # v1.0.8 页签与 LTX 筛选文案对齐网页：有磁链→最新有磁链、可播→现在可播；LTX 组名 LTX（仅可播）→现在可播 · LTX。
 # v1.0.7 在线源不再受 playable 门控（网页「完整影片」页签同此；实测 resolve 对 playable=false 仍返回 HLS）+ 源顺序恢复 预览→在线；分类筛选撤回 8×否/是 子筛选、恢复单选磁力标签组（对齐网页标签名）；发售日历改 lists/new since/until + 今日±15 连续 31 天 + 可播/有磁力四态筛选；vod_remarks 徽章置首 ●可播；_today/_shift_days 固定 UTC+8。
@@ -589,15 +590,15 @@ def _set_cookie_text(set_cookie):
 
 
 def _shrink_pic(data, mime, max_w=720):
-    """Android（Chaquopy）上把 1440x1920 的大封面原生降采样后再缓存/交付。
+    """大封面降采样后再缓存/交付（Android 原生优先，Pillow 兜底）。
 
-    实测 AI 封面明文是 1440x1920，一张解码后的位图约 11MB；列表一屏十几张，
-    电视盒子的堆内存和解码器扛不住，典型表现就是「一栏封面全白」。电影封面
-    （c0 明文小图）没这个问题，所以只针对这张链路。非 Android 环境原样返回。
-    inSampleSize 只能取 2 的幂，1440 → 720（位图 2.7MB、JPEG ~80KB），
-    既压住内存又保留海报清晰度。
+    实测 DMM pl.jpg 约 2184×1464 / ~1MB，盒子一屏十几张解码即白图。
+    Android（Chaquopy）用 BitmapFactory inSampleSize（2 的幂）；
+    非 Android（Linux 自检/服务端）用 Pillow 缩到 ≤720px JPEG q82。
+    两边都失败则原样返回（不因降采样拖垮出图）。
     """
-    if not data or not mime.startswith("image/jpeg"):
+    if not data or not mime.startswith(("image/jpeg", "image/png",
+                                        "image/webp")):
         return data, mime
     try:
         from android.graphics import BitmapFactory, Bitmap
@@ -624,6 +625,24 @@ def _shrink_pic(data, mime, max_w=720):
             out = bytes(raw_out)
         except Exception:
             out = bytes(bytearray(raw_out))
+        if out:
+            return out, "image/jpeg"
+    except Exception:
+        pass
+    try:
+        from PIL import Image
+        import io as _io
+        im = Image.open(_io.BytesIO(data))
+        w, h = im.size
+        if w <= 0 or w <= max_w:
+            return data, mime
+        nh = max(1, int(h * (max_w / float(w))))
+        im = im.resize((max_w, nh), Image.LANCZOS)
+        if im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+        buf = _io.BytesIO()
+        im.save(buf, format="JPEG", quality=82)
+        out = buf.getvalue()
         if out:
             return out, "image/jpeg"
     except Exception:
@@ -749,6 +768,171 @@ def _hls_local_url(text):
     if not base:
         return ""
     return "%s/msda/%s.m3u8" % (base, _hls_put(text))
+
+
+# ==================== 本机封面图片服务 ====================
+# 根因：列表 vod_pic 直出 DMM 等海外原图（~1MB/张、无 Cache-Control），
+# 盒子一屏 24 张 ≈ 20MB 且部分图床 IPv6/超时 → 整栏白图。
+# 对齐 javdbui v1.5.6：vod_pic 改给 127.0.0.1 短链，本机取图+降采样+缓存。
+_PIC_DEAD = {}                 # host -> expire_ts（连接层失败后冷却，避免拖页）
+_PIC_DEAD_TTL = 600
+_PIC_DEAD_LOCK = threading.Lock()
+_PIC_SRV = {"base": "", "tried": False, "spider": None}
+_PIC_SRV_LOCK = threading.Lock()
+
+
+def _pic_host(url):
+    try:
+        return (url.split("://", 1)[1].split("/", 1)[0].split("?", 1)[0]
+                .lower())
+    except Exception:
+        return ""
+
+
+def _pic_mark_dead(url, ttl=None):
+    host = _pic_host(url)
+    if not host:
+        return
+    with _PIC_DEAD_LOCK:
+        _PIC_DEAD[host] = time.time() + (ttl if ttl is not None
+                                         else _PIC_DEAD_TTL)
+
+
+def _pic_is_dead(url):
+    host = _pic_host(url)
+    if not host:
+        return False
+    with _PIC_DEAD_LOCK:
+        exp = _PIC_DEAD.get(host)
+        if not exp:
+            return False
+        if time.time() >= exp:
+            _PIC_DEAD.pop(host, None)
+            return False
+        return True
+
+
+def _pic_pack(url):
+    """原图 URL → urlsafe base64（无 padding），与 _unpack_pic_token 对称。"""
+    return base64.urlsafe_b64encode(
+        _to_text(url).encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _pic_unpack(tok):
+    try:
+        s = _to_text(tok or "").strip()
+        if not s:
+            return ""
+        s = s.replace("-", "+").replace("_", "/")
+        s += "=" * (-len(s) % 4)
+        u = base64.b64decode(s).decode("utf-8", "ignore")
+        return u if u.startswith(("http://", "https://")) else ""
+    except Exception:
+        return ""
+
+
+def _pic_server_base():
+    """懒启动 127.0.0.1 封面服务，返回 base 或 ""（探活绕开系统 http_proxy）。"""
+    if _PIC_SRV["base"]:
+        return _PIC_SRV["base"]
+    if _PIC_SRV["tried"]:
+        return ""
+    with _PIC_SRV_LOCK:
+        if _PIC_SRV["base"]:
+            return _PIC_SRV["base"]
+        if _PIC_SRV["tried"]:
+            return ""
+        _PIC_SRV["tried"] = True
+        try:
+            try:
+                from http.server import (BaseHTTPRequestHandler,
+                                         ThreadingHTTPServer)
+            except ImportError:
+                import socketserver
+                from http.server import BaseHTTPRequestHandler, HTTPServer
+
+                class ThreadingHTTPServer(socketserver.ThreadingMixIn,
+                                          HTTPServer):
+                    daemon_threads = True
+
+            class _PicHandler(BaseHTTPRequestHandler):
+                server_version = "msda-pic"
+
+                def log_message(self, fmt, *args):
+                    pass
+
+                def _serve(self, with_body):
+                    path = (self.path or "").split("?", 1)[0]
+                    body = b""
+                    mime = "image/jpeg"
+                    if path.startswith("/pic/") and path.endswith(".jpg"):
+                        tok = path[len("/pic/"):-len(".jpg")]
+                        url = _pic_unpack(tok)
+                        if url and not _pic_is_dead(url):
+                            sp = _PIC_SRV.get("spider")
+                            try:
+                                if sp is not None:
+                                    body, mime = sp._fetch_pic(url)
+                                else:
+                                    body, mime = b"", ""
+                            except Exception:
+                                body, mime = b"", ""
+                            if not body:
+                                _pic_mark_dead(url)
+                    if not body:
+                        self.send_error(404)
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type",
+                                     mime or "image/jpeg")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "public, max-age=1800")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    if with_body:
+                        self.wfile.write(body)
+
+                def do_GET(self):
+                    self._serve(True)
+
+                def do_HEAD(self):
+                    self._serve(False)
+
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), _PicHandler)
+            httpd.daemon_threads = True
+            t = threading.Thread(target=httpd.serve_forever,
+                                 kwargs={"poll_interval": 0.2})
+            t.daemon = True
+            t.start()
+            base = "http://127.0.0.1:%d" % httpd.server_address[1]
+            alive = False
+            try:
+                import urllib.request as _urlreq
+                opener = _urlreq.build_opener(_urlreq.ProxyHandler({}))
+                opener.open(base + "/pic/__probe__.jpg", timeout=3)
+            except Exception as e:
+                alive = getattr(e, "code", None) == 404
+            if alive:
+                _PIC_SRV["base"] = base
+            else:
+                try:
+                    httpd.shutdown()
+                except Exception:
+                    pass
+                _PIC_SRV["base"] = ""
+        except Exception:
+            _PIC_SRV["base"] = ""
+        return _PIC_SRV["base"]
+
+
+def _pic_local_url(url):
+    """原图 URL → 本机短链；服务不可用 / 图床已判死 → ""。"""
+    if not url or _pic_is_dead(url):
+        return ""
+    base = _pic_server_base()
+    if not base:
+        return ""
+    return "%s/pic/%s.jpg" % (base, _pic_pack(url))
 
 
 # ==================== Spider ====================
@@ -1197,7 +1381,8 @@ class Spider:
     # 兼容旧名（部分路径仍调用）
 
     def _proxy_pic(self, url):
-        """FANZA 封面为明文 URL：仅在配置了 img 时加反代，否则原样返回。"""
+        """封面交付：img 反代（显式配置）→ 本机 /pic/ 短链 → 原图兜底。
+        死图床（连接层失败冷却中）直接留空，避免盒子再撞超时。"""
         if not url:
             return ""
         url = _to_text(url)
@@ -1208,6 +1393,16 @@ class Spider:
             if "{url}" in p:
                 return p.replace("{url}", quote(url, safe=""))
             return p + quote(url, safe="")
+        # 注册取图实例（本机服务异步来取时用）；失败不挡出图
+        try:
+            _PIC_SRV["spider"] = self
+        except Exception:
+            pass
+        local = _pic_local_url(url)
+        if local:
+            return local
+        if _pic_is_dead(url):
+            return ""
         return url
 
     def _site_key(self):
@@ -3417,9 +3612,9 @@ class Spider:
             del cache[ckey]
             cache[ckey] = hit
             return hit[1], hit[2]
-        # 磁盘缓存（跨重启；键=ckey 的 md5）。带 v2 后缀：旧版本缓存的是
-        # 1440x1920 原图，换键后自动重下重解成降采样小图，老缓存自然废弃。
-        dkey = hashlib.md5((ckey + "|v2").encode("utf-8")).hexdigest()
+        # 磁盘缓存（跨重启；键=ckey 的 md5）。带 v3 后缀：v2 时代非 Android
+        # 未降采样存的是原图，换键后按 ≤720px 重下重存，老缓存自然废弃。
+        dkey = hashlib.md5((ckey + "|v3").encode("utf-8")).hexdigest()
         dpath = os.path.join(PIC_DISK_DIR, dkey)
         # 磁盘里存的是解码后的成品，与 max_raw 无关，命中即回
         try:
@@ -3442,19 +3637,24 @@ class Spider:
             "Accept": "image/*,*/*",
         }
         sess = self.s
+        # 图片专用短超时：死图床（heydouga 等）不能拖死本机服务线程
+        img_t = min(float(self.timeout or 20), 8.0)
         try:
             if sess is None:
                 raise RuntimeError("no session")
-            r = sess.get(url, headers=headers, timeout=self.timeout,
+            r = sess.get(url, headers=headers, timeout=img_t,
                          verify=self.verify)
         except Exception:
             # destroy 后会话被关 / 会话异常：临时直连兜底（自建图片服务不能因此断图）
             try:
-                r = requests.get(url, headers=headers, timeout=self.timeout,
+                r = requests.get(url, headers=headers, timeout=img_t,
                                  verify=self.verify)
             except Exception:
+                # 连接层失败（超时/DNS/SSL/拒绝）→ 冷却整 host，列表期留空
+                _pic_mark_dead(url)
                 return b"", ""
         if r.status_code != 200 or not r.content:
+            # HTTP 层失败不整 host 拉黑（可能是单张缺失/限流），只本张留空
             return b"", ""
         raw = r.content
         if max_raw and len(raw) > max_raw:
@@ -3463,7 +3663,7 @@ class Spider:
         body, mime = self._decode_pic(
             raw, _to_text(r.headers.get("Content-Type") or ""))
         if body:
-            # Android 上把 1440x1920 的大封面降采样（缓存里也存小图）
+            # 降采样（Android 原生 / Pillow），缓存里也存小图
             body, mime = _shrink_pic(body, mime)
             cache[ckey] = (now, body, mime)
             while len(cache) > 64:
@@ -3561,6 +3761,11 @@ class Spider:
         try:
             if self.s115 is not None:
                 self.s115.close()
+        except Exception:
+            pass
+        try:
+            if _PIC_SRV.get("spider") is self:
+                _PIC_SRV["spider"] = None
         except Exception:
             pass
         return None
